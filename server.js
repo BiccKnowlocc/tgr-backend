@@ -13,6 +13,17 @@ app.use(express.json());
 app.use(express.static(__dirname));
 const PORT = process.env.PORT || 3000;
 
+	const cors = require("cors");
+
+app.use(cors({
+  origin: [
+    "https://tobermorygroceryrun.ca",
+    "https://www.tobermorygroceryrun.ca"
+  ],
+  methods: ["GET","POST","OPTIONS"],
+  allowedHeaders: ["Content-Type"],
+}));
+
 	const mongoose = require("mongoose");
 
 mongoose
@@ -498,6 +509,4 @@ app.listen(PORT, () => {
 });
 
 
-app.listen(PORT, () => {
-  console.log("Server running on port " + PORT);
-});
+
