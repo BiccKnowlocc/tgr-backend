@@ -57,13 +57,15 @@ passport.deserializeUser(async (id, done) => {
   }
 });
 
+//const BASE_URL = process.env.BASE_URL || "http://localhost:3000";
+
 // Google OAuth Strategy
 passport.use(
   new GoogleStrategy(
     {
       clientID: process.env.GOOGLE_CLIENT_ID,
       clientSecret: process.env.GOOGLE_CLIENT_SECRET,
-      callbackURL: "http://localhost:3000/auth/google/callback",
+      callbackURL: `${BASE_URL}/auth/google/callback`,
     },
     async (_accessToken, _refreshToken, profile, done) => {
       try {
@@ -73,7 +75,6 @@ passport.use(
         let user = await User.findOne({ email });
 
         if (!user) {
-          // New customer record created automatically
           user = await User.create({
             googleId: profile.id,
             email,
@@ -87,7 +88,6 @@ passport.use(
             orderHistory: [],
           });
         } else {
-          // Update basics
           user.googleId = profile.id;
           user.name = profile.displayName || user.name;
           user.photo = photo || user.photo;
