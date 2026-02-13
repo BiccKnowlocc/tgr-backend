@@ -1,11 +1,11 @@
+require("dotenv").config();
+
 const express = require("express");
 const session = require("express-session");
 const passport = require("passport");
 const GoogleStrategy = require("passport-google-oauth20").Strategy;
-const User = require("./models/User");
 
-
-require("dotenv").config();
+const BASE_URL = process.env.BASE_URL || "http://localhost:3000";
 
 const app = express();
 app.use(express.urlencoded({ extended: true }));
@@ -57,7 +57,7 @@ passport.deserializeUser(async (id, done) => {
   }
 });
 
-//const BASE_URL = process.env.BASE_URL || "http://localhost:3000";
+
 
 // Google OAuth Strategy
 passport.use(
