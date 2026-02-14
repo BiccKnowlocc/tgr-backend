@@ -13,6 +13,12 @@ const BASE_URL = process.env.BASE_URL || "http://localhost:3000";
 
 const app = express();
 
+// Fix common bad URL paste like: /https://tgr-backend.onrender.com/...
+app.get(/^\/https?:\/\/.*/i, (req, res) => {
+  return res.redirect("/");
+});
+
+
 // IMPORTANT for Render (cookies behind proxy)
 app.set("trust proxy", 1);
 
@@ -129,3 +135,8 @@ app.get("/", (req, res) => {
       <p>Email: ${req.user.email || ""}</p>
       <p><a href="/member">Go to Member Page</a></p>
       <p><a href="/logout">Logout</
+
+	const PORT = process.env.PORT || 3000;
+app.listen(PORT, "0.0.0.0", () => {
+  console.log("Server running on port " + PORT);
+});
