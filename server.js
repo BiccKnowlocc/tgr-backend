@@ -11,80 +11,14 @@ const User = require("./models/User");
 
 const app = express();
 
-	// ===== RUN DATE CALC (simple next-Sunday + deadlines) =====
-function computeNextRunDates() {
-  const today = new Date();
-  const day = today.getDay(); // 0=Sun
-  const daysUntilSunday = ((7 - day) % 7) || 7; // next Sunday (not today)
-  const runDate = new Date(today);
-  runDate.setDate(today.getDate() + daysUntilSunday);
-
-  const payDeadline = new Date(runDate);
-  payDeadline.setDate(runDate.getDate() - 2); // Friday before
-
-  const listDeadline = new Date(runDate);
-  listDeadline.setDate(runDate.getDate() - 1); // Saturday before
-
-  const followingRun = new Date(runDate);
-  followingRun.setDate(runDate.getDate() + 14);
-
-  return { runDate, payDeadline, listDeadline, followingRun };
-}
-
-// ===== SAVE ORDER TO USER HISTORY (AUTH REQUIRED) =====
-app.post("/api/orders", requireAuth, async (req, res) => {
-  try {
-    const p = req.body || {};
-
-    // Minimum required fields (match your form names)
-    const primaryStore = (p.primary_store || "").trim();
-    const groceryList = (p.grocery_list || "").trim();
-
-    if (!primaryStore) return res.status(400).json({ ok: false, error: "Missing primary_store" });
-    if (!groceryList) return res.status(400).json({ ok: false, error: "Missing grocery_list" });
-
-    const { runDate, payDeadline, listDeadline } = computeNextRunDates();
-
-    const order = {
-      createdAt: new Date(),
-      runDate,
-      payDeadline,
-      listDeadline,
-      primaryStore,
-      secondaryStore: p.secondary_store || "",
-      community: p.community || "",
-      streetAddress: p.street_address || "",
-      phone: p.phone || "",
-      groceryList,
-      notes: p.grocery_notes || "",
-      status: "submitted",
-      addOns: {
-        fastFood: p.addon_fast_food === "yes" || p.addon_fast_food === true,
-        liquor: p.addon_liquor === "yes" || p.addon_liquor === true,
-        printing: p.addon_printing === "yes" || p.addon_printing === true,
-        ride: p.addon_ride === "yes" || p.addon_ride === true,
-      },
-    };
-
-    const user = await User.findById(req.user._id);
-    if (!user) return res.status(404).json({ ok: false, error: "User not found" });
-
-    user.orderHistory = user.orderHistory || [];
-    user.orderHistory.unshift(order);
-    await user.save();
-
-    return res.json({ ok: true, order });
-  } catch (e) {
-    console.error("POST /api/orders error:", e);
-    return res.status(500).json({ ok: false, error: "Server error" });
-  }
-});
-
 // ===== CONFIG =====
 const BASE_URL = process.env.BASE_URL || "http://localhost:3000";
-const FRONTEND_ORIGINS = [
+
+const ALLOWED_ORIGINS = [
   "https://tobermorygroceryrun.ca",
   "https://www.tobermorygroceryrun.ca",
+  "http://localhost:8888",
+  "http://localhost:3000",
 ];
 
 // Render/Proxies (required for secure cookies on Render)
@@ -100,10 +34,14 @@ app.use(express.static(__dirname));
 // CORS for cross-site cookie auth (frontend -> backend)
 app.use(
   cors({
-    origin: FRONTEND_ORIGINS,
+    origin: function (origin, cb) {
+      if (!origin) return cb(null, true); // curl/postman
+      if (ALLOWED_ORIGINS.includes(origin)) return cb(null, true);
+      return cb(new Error("CORS blocked origin: " + origin));
+    },
+    credentials: true,
     methods: ["GET", "POST", "OPTIONS"],
     allowedHeaders: ["Content-Type"],
-    credentials: true,
   })
 );
 
@@ -122,14 +60,14 @@ mongoose
 // Later we’ll swap to Mongo-backed session store (connect-mongo).
 app.use(
   session({
-    name: "tgr.sid",
-    secret: process.env.SESSION_SECRET || "CHANGE_ME_IN_RENDER",
+    name: "tgr.sid", // IMPORTANT: set cookie name so logout clears the right one
+    secret: process.env.SESSION_SECRET || "change-me",
     resave: false,
     saveUninitialized: false,
     cookie: {
       httpOnly: true,
-      secure: true,      // Render is HTTPS
-      sameSite: "none",  // allow cross-site cookie from your Netlify domain
+      secure: true, // Render is https
+      sameSite: "none", // REQUIRED for cross-site cookies
       maxAge: 1000 * 60 * 60 * 24 * 14, // 14 days
     },
   })
@@ -150,6 +88,7 @@ passport.deserializeUser(async (id, done) => {
   }
 });
 
+// Google OAuth Strategy
 passport.use(
   new GoogleStrategy(
     {
@@ -200,6 +139,26 @@ function requireAuth(req, res, next) {
   return res.status(401).json({ ok: false, error: "Not logged in" });
 }
 
+// ===== RUN DATE CALC =====
+function computeNextRunDates() {
+  const today = new Date();
+  const day = today.getDay(); // 0=Sun
+  const daysUntilSunday = ((7 - day) % 7) || 7; // next Sunday (not today)
+  const runDate = new Date(today);
+  runDate.setDate(today.getDate() + daysUntilSunday);
+
+  const payDeadline = new Date(runDate);
+  payDeadline.setDate(runDate.getDate() - 2); // Friday before
+
+  const listDeadline = new Date(runDate);
+  listDeadline.setDate(runDate.getDate() - 1); // Saturday before
+
+  const followingRun = new Date(runDate);
+  followingRun.setDate(runDate.getDate() + 14);
+
+  return { runDate, payDeadline, listDeadline, followingRun };
+}
+
 // Fix common bad pasted path like /https://tgr-backend.onrender.com/...
 app.get(/^\/https?:\/\/.*/i, (req, res) => res.redirect("/"));
 
@@ -229,10 +188,7 @@ app.get(
 app.get(
   "/auth/google/callback",
   passport.authenticate("google", { failureRedirect: "/" }),
-  (req, res) => {
-    // After login, go to member portal
-    res.redirect("/member");
-  }
+  (req, res) => res.redirect("/member")
 );
 
 // Logout
@@ -262,30 +218,39 @@ app.get("/api/me", (req, res) => {
   });
 });
 
-// Save order into logged-in user's orderHistory
+// ===== ORDER HISTORY: SAVE ORDER (AUTH REQUIRED) =====
 app.post("/api/orders", requireAuth, async (req, res) => {
   try {
-    const payload = req.body || {};
-    const list = (payload.grocery_list || "").trim();
-    if (!list) return res.status(400).json({ ok: false, error: "Missing grocery list" });
+    const p = req.body || {};
+
+    const primaryStore = (p.primary_store || "").trim();
+    const groceryList = (p.grocery_list || "").trim();
+
+    if (!primaryStore) return res.status(400).json({ ok: false, error: "Missing primary_store" });
+    if (!groceryList) return res.status(400).json({ ok: false, error: "Missing grocery_list" });
+
+    const { runDate, payDeadline, listDeadline, followingRun } = computeNextRunDates();
 
     const order = {
       createdAt: new Date(),
-      runDate: payload.runDate || null,
-      primaryStore: payload.primary_store || "",
-      secondaryStore: payload.secondary_store || "",
-      community: payload.community || "",
-      streetAddress: payload.street_address || "",
-      phone: payload.phone || "",
-      groceryList: payload.grocery_list || "",
-      notes: payload.grocery_notes || "",
-      addOns: {
-        fastFood: !!payload.addon_fast_food,
-        liquor: !!payload.addon_liquor,
-        printing: !!payload.addon_printing,
-        ride: !!payload.addon_ride,
-      },
+      runDate,
+      payDeadline,
+      listDeadline,
+      followingRun,
+      primaryStore,
+      secondaryStore: p.secondary_store || "",
+      community: p.community || "",
+      streetAddress: p.street_address || "",
+      phone: p.phone || "",
+      groceryList,
+      notes: p.grocery_notes || "",
       status: "submitted",
+      addOns: {
+        fastFood: p.addon_fast_food === "yes" || p.addon_fast_food === true,
+        liquor: p.addon_liquor === "yes" || p.addon_liquor === true,
+        printing: p.addon_printing === "yes" || p.addon_printing === true,
+        ride: p.addon_ride === "yes" || p.addon_ride === true,
+      },
     };
 
     const user = await User.findById(req.user._id);
@@ -307,7 +272,6 @@ app.get("/api/orders", requireAuth, async (req, res) => {
   try {
     const user = await User.findById(req.user._id).lean();
     if (!user) return res.status(404).json({ ok: false, error: "User not found" });
-
     return res.json({ ok: true, orders: user.orderHistory || [] });
   } catch (e) {
     console.error("GET /api/orders error:", e);
@@ -315,26 +279,21 @@ app.get("/api/orders", requireAuth, async (req, res) => {
   }
 });
 
-// Member page (protected) - styled portal with tabs/buttons + auto run dates
+// ===== MEMBER PAGE (styled portal + auto run dates) =====
 app.get("/member", (req, res) => {
   if (!req.user) return res.redirect("/");
 
   const u = req.user;
+  const renewal = u.renewalDate ? new Date(u.renewalDate).toLocaleDateString("en-CA") : "N/A";
 
-  const renewal = u.renewalDate
-    ? new Date(u.renewalDate).toLocaleDateString("en-CA")
-    : "N/A";
-
-  // Defaults if arrays empty
   const perks = (u.perks && u.perks.length) ? u.perks : [
     "Priority booking on run days",
     "Reduced extra-store fees (based on tier)",
     "Faster issue resolution support",
-    "Members can request ‘card on file’ billing where available"
   ];
 
   const discounts = (u.discounts && u.discounts.length) ? u.discounts : [
-    "Member discounts apply to service/delivery fees (where applicable)"
+    "Member discounts apply to service/delivery fees (where applicable)",
   ];
 
   const orderRows = (u.orderHistory || [])
@@ -343,282 +302,220 @@ app.get("/member", (req, res) => {
     .map((o) => {
       const created = o.createdAt ? new Date(o.createdAt).toLocaleDateString("en-CA") : "";
       const run = o.runDate ? new Date(o.runDate).toLocaleDateString("en-CA") : "—";
-      const store = o.primaryStore || o.store || "—";
+      const store = o.primaryStore || "—";
       const status = o.status || "submitted";
-      const fees = (typeof o.totalFees === "number") ? `$${o.totalFees.toFixed(2)}` : "—";
-      const groceries = (typeof o.totalGroceries === "number") ? `$${o.totalGroceries.toFixed(2)}` : "—";
-
       return `
         <tr>
           <td>${created}</td>
           <td>${run}</td>
           <td>${store}</td>
           <td><span class="badge">${status}</span></td>
-          <td>${fees}</td>
-          <td>${groceries}</td>
-        </tr>
-      `;
+        </tr>`;
     })
     .join("");
 
-  // Optional Square links (set these env vars later if you want)
   const manageUrl = process.env.SQUARE_MANAGE_MEMBERSHIP_URL || "https://tobermorygroceryrun.ca/indexapp.html";
-  const cancelUrl = process.env.SQUARE_CANCEL_MEMBERSHIP_URL || "mailto:members@tobermorygroceryrun.ca?subject=Membership%20Cancellation%20Request";
+  const cancelUrl =
+    process.env.SQUARE_CANCEL_MEMBERSHIP_URL ||
+    "mailto:members@tobermorygroceryrun.ca?subject=Membership%20Cancellation%20Request";
 
   res.type("html").send(`<!DOCTYPE html>
-  <html lang="en">
-  <head>
-    <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>TGR Member Portal</title>
-    <style>
-      :root{
-        --bg:#0f1526; --card:#121a2e; --text:#ffffff;
-        --muted:rgba(255,255,255,.75); --line:rgba(255,255,255,.14);
-        --brand:#1f2a44; --accent:#e3342f; --soft:rgba(227,52,47,.12);
-      }
-      *{box-sizing:border-box}
-      body{margin:0;font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;background:var(--bg);color:var(--text);line-height:1.55}
-      header{background:var(--brand);border-bottom:1px solid var(--line);padding:14px 14px}
-      .wrap{max-width:980px;margin:0 auto;padding:0 14px}
-      .hdr{display:flex;align-items:center;gap:12px}
-      .logo{width:86px;height:auto;border-radius:12px;border:1px solid var(--line);background:rgba(255,255,255,.06);padding:6px}
-      h1{margin:0;font-size:1.25rem}
-      .sub{margin:2px 0 0;color:var(--muted);font-size:.95rem}
-      main{max-width:980px;margin:0 auto;padding:14px 14px 40px}
-      .grid{display:grid;grid-template-columns:1.3fr .7fr;gap:12px}
-      @media(max-width:900px){.grid{grid-template-columns:1fr}}
-      .card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:14px;box-shadow:0 12px 40px rgba(0,0,0,.35)}
-      .row{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
-      .pill{display:inline-block;padding:4px 10px;border-radius:999px;border:1px solid var(--line);font-size:.85rem;color:var(--muted)}
-      .badge{display:inline-block;padding:2px 8px;border-radius:999px;background:rgba(255,255,255,.07);border:1px solid var(--line);font-size:.82rem}
-      .btn{display:inline-flex;align-items:center;justify-content:center;gap:8px;padding:10px 14px;border-radius:999px;
-        border:1px solid rgba(255,255,255,.18);text-decoration:none;color:var(--text);font-weight:800}
-      .btn.primary{background:var(--accent);border-color:rgba(0,0,0,.15)}
-      .btn.ghost{background:transparent}
-      .btn:focus-visible{outline:2px solid #fff;outline-offset:2px}
-      .muted{color:var(--muted)}
-      .tabs{display:flex;gap:8px;flex-wrap:wrap;margin:10px 0 0}
-      .tab{border:1px solid var(--line);background:rgba(255,255,255,.06);color:var(--text);padding:8px 12px;border-radius:999px;
-        cursor:pointer;font-weight:800}
-      .tab[aria-selected="true"]{background:var(--soft);border-color:rgba(227,52,47,.5)}
-      .panel{display:none;margin-top:12px}
-      .panel.active{display:block}
-      ul{margin:8px 0 0 18px;padding:0}
-      li{margin:6px 0}
-      table{width:100%;border-collapse:collapse;margin-top:10px}
-      th,td{border-bottom:1px solid var(--line);padding:10px 8px;text-align:left;font-size:.95rem}
-      th{color:var(--muted);font-size:.85rem;text-transform:uppercase;letter-spacing:.06em}
-      footer{padding:14px 0 0;color:var(--muted);font-size:.9rem}
-      .warn{padding:10px 12px;border-radius:12px;border:1px solid rgba(227,52,47,.35);background:rgba(227,52,47,.10)}
-      .small{font-size:.9rem}
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>TGR Member Portal</title>
+<style>
+  :root{
+    --bg:#0f1526; --card:#121a2e; --text:#ffffff;
+    --muted:rgba(255,255,255,.75); --line:rgba(255,255,255,.14);
+    --brand:#1f2a44; --accent:#e3342f; --soft:rgba(227,52,47,.12);
+  }
+  *{box-sizing:border-box}
+  body{margin:0;font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;background:var(--bg);color:var(--text);line-height:1.55}
+  header{background:var(--brand);border-bottom:1px solid var(--line);padding:14px 14px}
+  .wrap{max-width:980px;margin:0 auto;padding:0 14px}
+  .hdr{display:flex;align-items:center;gap:12px}
+  .logo{width:86px;height:auto;border-radius:12px;border:1px solid var(--line);background:rgba(255,255,255,.06);padding:6px}
+  h1{margin:0;font-size:1.25rem}
+  .sub{margin:2px 0 0;color:var(--muted);font-size:.95rem}
+  main{max-width:980px;margin:0 auto;padding:14px 14px 40px}
+  .grid{display:grid;grid-template-columns:1.3fr .7fr;gap:12px}
+  @media(max-width:900px){.grid{grid-template-columns:1fr}}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:14px;box-shadow:0 12px 40px rgba(0,0,0,.35)}
+  .row{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
+  .pill{display:inline-block;padding:4px 10px;border-radius:999px;border:1px solid var(--line);font-size:.85rem;color:var(--muted)}
+  .badge{display:inline-block;padding:2px 8px;border-radius:999px;background:rgba(255,255,255,.07);border:1px solid var(--line);font-size:.82rem}
+  .btn{display:inline-flex;align-items:center;justify-content:center;gap:8px;padding:10px 14px;border-radius:999px;
+    border:1px solid rgba(255,255,255,.18);text-decoration:none;color:var(--text);font-weight:800}
+  .btn.primary{background:var(--accent);border-color:rgba(0,0,0,.15)}
+  .btn.ghost{background:transparent}
+  .muted{color:var(--muted)}
+  .tabs{display:flex;gap:8px;flex-wrap:wrap;margin:10px 0 0}
+  .tab{border:1px solid var(--line);background:rgba(255,255,255,.06);color:var(--text);padding:8px 12px;border-radius:999px;
+    cursor:pointer;font-weight:800}
+  .tab[aria-selected="true"]{background:var(--soft);border-color:rgba(227,52,47,.5)}
+  .panel{display:none;margin-top:12px}
+  .panel.active{display:block}
+  table{width:100%;border-collapse:collapse;margin-top:10px}
+  th,td{border-bottom:1px solid var(--line);padding:10px 8px;text-align:left;font-size:.95rem}
+  th{color:var(--muted);font-size:.85rem;text-transform:uppercase;letter-spacing:.06em}
+  .run-info > div{margin:6px 0}
+  hr{border:none;border-top:1px solid var(--line);margin:14px 0}
+</style>
+</head>
+<body>
+<header>
+  <div class="wrap">
+    <div class="hdr">
+      <img src="/tgr_logo_tight_512.png" class="logo" alt="TGR logo" />
+      <div>
+        <h1>Member Portal</h1>
+        <div class="sub">Signed in as ${u.email}</div>
+      </div>
+    </div>
+  </div>
+</header>
 
-      /* Run info */
-      .run-info{margin-top:8px}
-      .run-info > div{margin:6px 0}
-      .run-label{color:var(--muted);font-size:.92rem}
-      .run-value{font-weight:900}
-    </style>
-  </head>
-  <body>
-    <header>
-      <div class="wrap">
-        <div class="hdr">
-          <img src="/tgr_logo_tight_512.png" class="logo" alt="TGR logo" />
-          <div>
-            <h1>Member Portal</h1>
-            <div class="sub">Signed in as ${u.email}</div>
-          </div>
+<main>
+  <div class="grid">
+    <section class="card">
+      <div class="row" style="justify-content:space-between">
+        <div class="row" style="gap:8px">
+          <div class="pill">Name: <strong>${u.name || ""}</strong></div>
+          <div class="pill">Status: <strong>${u.membershipStatus || "inactive"}</strong></div>
+          <div class="pill">Level: <strong>${u.membershipLevel || "none"}</strong></div>
+          <div class="pill">Renewal: <strong>${renewal}</strong></div>
+        </div>
+        <div class="row">
+          <a class="btn ghost" href="/logout">Log out</a>
         </div>
       </div>
-    </header>
 
-    <main>
-      <div class="grid">
-        <section class="card">
-          <div class="row" style="justify-content:space-between">
-            <div class="row" style="gap:8px">
-              <div class="pill">Name: <strong>${u.name || ""}</strong></div>
-              <div class="pill">Status: <strong>${u.membershipStatus || "inactive"}</strong></div>
-              <div class="pill">Level: <strong>${u.membershipLevel || "none"}</strong></div>
-              <div class="pill">Renewal: <strong>${renewal}</strong></div>
-            </div>
-            <div class="row">
-              <a class="btn ghost" href="/logout">Log out</a>
-            </div>
-          </div>
-
-          <div class="tabs" role="tablist" aria-label="Portal sections">
-            <button class="tab" id="tab-membership" aria-selected="true" aria-controls="panel-membership" type="button">Membership</button>
-            <button class="tab" id="tab-perks" aria-selected="false" aria-controls="panel-perks" type="button">Perks & Discounts</button>
-            <button class="tab" id="tab-orders" aria-selected="false" aria-controls="panel-orders" type="button">Order History</button>
-          </div>
-
-          <div id="panel-membership" class="panel active" role="tabpanel" aria-labelledby="tab-membership">
-            <h2 style="margin:6px 0 0;font-size:1.05rem">Manage Membership</h2>
-            <p class="muted small" style="margin:6px 0 10px">
-              Use the buttons below to manage billing or request cancellation. Changes may take a short time to reflect on your account.
-            </p>
-
-            <div class="row">
-              <a class="btn primary" href="${manageUrl}" target="_blank" rel="noopener">Manage / Pay Membership</a>
-              <a class="btn ghost" href="${cancelUrl}" target="_blank" rel="noopener">Cancel / Request Cancellation</a>
-            </div>
-
-            <div style="margin-top:12px" class="warn small">
-              If you believe your membership level is wrong, email <strong>members@tobermorygroceryrun.ca</strong> and we will correct it.
-            </div>
-          </div>
-
-          <div id="panel-perks" class="panel" role="tabpanel" aria-labelledby="tab-perks">
-            <h2 style="margin:6px 0 0;font-size:1.05rem">Your Perks</h2>
-            <ul>${perks.map(p => `<li>${p}</li>`).join("")}</ul>
-
-            <h2 style="margin:14px 0 0;font-size:1.05rem">Your Discounts</h2>
-            <ul>${discounts.map(d => `<li>${d}</li>`).join("")}</ul>
-          </div>
-
-          <div id="panel-orders" class="panel" role="tabpanel" aria-labelledby="tab-orders">
-            <h2 style="margin:6px 0 0;font-size:1.05rem">Order History</h2>
-            <p class="muted small" style="margin:6px 0 8px">
-              This list shows orders submitted through the TGR system.
-            </p>
-
-            <table>
-              <thead>
-                <tr>
-                  <th>Submitted</th>
-                  <th>Run Date</th>
-                  <th>Store</th>
-                  <th>Status</th>
-                  <th>Fees</th>
-                  <th>Groceries</th>
-                </tr>
-              </thead>
-              <tbody>
-                ${orderRows || `<tr><td colspan="6" class="muted">No orders on file yet.</td></tr>`}
-              </tbody>
-            </table>
-          </div>
-        </section>
-
-        <aside class="card">
-          <h2 style="margin:0 0 8px;font-size:1.05rem">Upcoming Runs</h2>
-
-          <div class="run-info">
-            <div>
-              <div class="run-label">Next delivery Sunday</div>
-              <div class="run-value" id="mp-next-run">Calculating…</div>
-            </div>
-            <div>
-              <div class="run-label">Payment deadline (Friday)</div>
-              <div class="run-value"><span id="mp-pay-deadline">Calculating…</span> at 6:00 pm</div>
-            </div>
-            <div>
-              <div class="run-label">List deadline (Saturday)</div>
-              <div class="run-value"><span id="mp-list-deadline">Calculating…</span> at 6:00 pm</div>
-            </div>
-            <div>
-              <div class="run-label">Following run (2 weeks later)</div>
-              <div class="run-value" id="mp-following-run">Calculating…</div>
-            </div>
-          </div>
-
-          <div style="margin-top:12px" class="muted small">
-            Runs are every second Sunday, subject to weather, road conditions, and capacity.
-          </div>
-
-          <hr style="border:none;border-top:1px solid rgba(255,255,255,.14); margin:14px 0;" />
-
-          <h2 style="margin:0 0 8px;font-size:1.05rem">Quick Links</h2>
-          <div class="row" style="flex-direction:column;align-items:stretch">
-            <a class="btn primary" href="https://tobermorygroceryrun.ca/indexapp.html" target="_blank" rel="noopener">Place an Order</a>
-            <a class="btn ghost" href="https://tobermorygroceryrun.ca/terms.html" target="_blank" rel="noopener">Terms & Conditions</a>
-            <a class="btn ghost" href="mailto:orders@tobermorygroceryrun.ca">Email Orders</a>
-            <a class="btn ghost" href="mailto:members@tobermorygroceryrun.ca">Email Membership</a>
-          </div>
-
-          <footer>
-            <div>Need help? Email <strong>info@tobermorygroceryrun.ca</strong></div>
-          </footer>
-        </aside>
+      <div class="tabs" role="tablist">
+        <button class="tab" id="tab-membership" aria-selected="true" type="button">Membership</button>
+        <button class="tab" id="tab-perks" aria-selected="false" type="button">Perks & Discounts</button>
+        <button class="tab" id="tab-orders" aria-selected="false" type="button">Order History</button>
       </div>
-    </main>
 
-    <script>
-      // ===== Tabs =====
-      const tabs = [
-        { tab: "tab-membership", panel: "panel-membership" },
-        { tab: "tab-perks", panel: "panel-perks" },
-        { tab: "tab-orders", panel: "panel-orders" },
-      ];
+      <div id="panel-membership" class="panel active">
+        <p class="muted">Manage billing or request cancellation.</p>
+        <div class="row">
+          <a class="btn primary" href="${manageUrl}" target="_blank" rel="noopener">Manage / Pay Membership</a>
+          <a class="btn ghost" href="${cancelUrl}" target="_blank" rel="noopener">Cancel / Request Cancellation</a>
+        </div>
+      </div>
 
-      function selectTab(tabId){
-        tabs.forEach(({tab, panel}) => {
-          const t = document.getElementById(tab);
-          const p = document.getElementById(panel);
-          const active = (tab === tabId);
-          t.setAttribute("aria-selected", active ? "true" : "false");
-          p.classList.toggle("active", active);
-        });
-      }
+      <div id="panel-perks" class="panel">
+        <h3>Your Perks</h3>
+        <ul>${perks.map(p => `<li>${p}</li>`).join("")}</ul>
+        <h3>Your Discounts</h3>
+        <ul>${discounts.map(d => `<li>${d}</li>`).join("")}</ul>
+      </div>
 
-      tabs.forEach(({tab}) => {
-        document.getElementById(tab).addEventListener("click", () => selectTab(tab));
-      });
+      <div id="panel-orders" class="panel">
+        <h3>Order History</h3>
+        <table>
+          <thead><tr><th>Submitted</th><th>Run Date</th><th>Store</th><th>Status</th></tr></thead>
+          <tbody>
+            ${orderRows || `<tr><td colspan="4" class="muted">No orders on file yet.</td></tr>`}
+          </tbody>
+        </table>
+      </div>
+    </section>
 
-      // ===== Run date + deadlines (Next Sunday + following run 2 weeks later) =====
-      function fmt(d){
-        return d.toLocaleDateString("en-CA", { year:"numeric", month:"short", day:"numeric" });
-      }
+    <aside class="card">
+      <h3>Upcoming Runs</h3>
+      <div class="run-info">
+        <div><span class="muted">Next delivery Sunday:</span> <strong id="mp-next-run">Calculating…</strong></div>
+        <div><span class="muted">Payment deadline (Friday):</span> <strong><span id="mp-pay-deadline">Calculating…</span> 6:00 pm</strong></div>
+        <div><span class="muted">List deadline (Saturday):</span> <strong><span id="mp-list-deadline">Calculating…</span> 6:00 pm</strong></div>
+        <div><span class="muted">Following run (+2 weeks):</span> <strong id="mp-following-run">Calculating…</strong></div>
+      </div>
 
-      function computeNextRunInfo(){
-        const today = new Date();
-        const day = today.getDay(); // 0=Sun
-        const daysUntilSunday = ((7 - day) % 7) || 7; // next Sunday (not today)
-        const runDate = new Date(today);
-        runDate.setDate(today.getDate() + daysUntilSunday);
+      <hr />
 
-        const payDeadline = new Date(runDate);
-        payDeadline.setDate(runDate.getDate() - 2); // Friday before
+      <h3>Quick Links</h3>
+      <div class="row" style="flex-direction:column;align-items:stretch">
+        <a class="btn primary" href="https://tobermorygroceryrun.ca/indexapp.html" target="_blank" rel="noopener">Place an Order</a>
+        <a class="btn ghost" href="https://tobermorygroceryrun.ca/terms.html" target="_blank" rel="noopener">Terms & Conditions</a>
+        <a class="btn ghost" href="mailto:orders@tobermorygroceryrun.ca">Email Orders</a>
+        <a class="btn ghost" href="mailto:members@tobermorygroceryrun.ca">Email Membership</a>
+      </div>
+    </aside>
+  </div>
+</main>
 
-        const listDeadline = new Date(runDate);
-        listDeadline.setDate(runDate.getDate() - 1); // Saturday before
+<script>
+  const tabs = [
+    { tab: "tab-membership", panel: "panel-membership" },
+    { tab: "tab-perks", panel: "panel-perks" },
+    { tab: "tab-orders", panel: "panel-orders" },
+  ];
 
-        const followingRun = new Date(runDate);
-        followingRun.setDate(runDate.getDate() + 14); // two weeks later
+  function selectTab(tabId){
+    tabs.forEach(({tab, panel}) => {
+      const t = document.getElementById(tab);
+      const p = document.getElementById(panel);
+      const active = (tab === tabId);
+      t.setAttribute("aria-selected", active ? "true" : "false");
+      p.classList.toggle("active", active);
+    });
+  }
 
-        return {
-          runLabel: fmt(runDate),
-          payDeadlineLabel: fmt(payDeadline),
-          listDeadlineLabel: fmt(listDeadline),
-          followingRunLabel: fmt(followingRun)
-        };
-      }
+  tabs.forEach(({tab}) => {
+    document.getElementById(tab).addEventListener("click", () => selectTab(tab));
+  });
 
-      function updateRunUI(){
-        const info = computeNextRunInfo();
-        const a = document.getElementById("mp-next-run");
-        const b = document.getElementById("mp-pay-deadline");
-        const c = document.getElementById("mp-list-deadline");
-        const d = document.getElementById("mp-following-run");
+  function fmt(d){
+    return d.toLocaleDateString("en-CA", { year:"numeric", month:"short", day:"numeric" });
+  }
 
-        if (a) a.textContent = info.runLabel;
-        if (b) b.textContent = info.payDeadlineLabel;
-        if (c) c.textContent = info.listDeadlineLabel;
-        if (d) d.textContent = info.followingRunLabel;
-      }
+  function computeNextRunInfo(){
+    const today = new Date();
+    const day = today.getDay();
+    const daysUntilSunday = ((7 - day) % 7) || 7;
+    const runDate = new Date(today);
+    runDate.setDate(today.getDate() + daysUntilSunday);
 
-      document.addEventListener("DOMContentLoaded", () => {
-        updateRunUI();
-        // refresh hourly (in case someone leaves it open across midnight)
-        setInterval(updateRunUI, 60 * 60 * 1000);
-      });
-    </script>
-  </body>
-  </html>`);
+    const payDeadline = new Date(runDate);
+    payDeadline.setDate(runDate.getDate() - 2);
+
+    const listDeadline = new Date(runDate);
+    listDeadline.setDate(runDate.getDate() - 1);
+
+    const followingRun = new Date(runDate);
+    followingRun.setDate(runDate.getDate() + 14);
+
+    return {
+      runLabel: fmt(runDate),
+      payDeadlineLabel: fmt(payDeadline),
+      listDeadlineLabel: fmt(listDeadline),
+      followingRunLabel: fmt(followingRun)
+    };
+  }
+
+  function updateRunUI(){
+    const info = computeNextRunInfo();
+    const a = document.getElementById("mp-next-run");
+    const b = document.getElementById("mp-pay-deadline");
+    const c = document.getElementById("mp-list-deadline");
+    const d = document.getElementById("mp-following-run");
+
+    if (a) a.textContent = info.runLabel;
+    if (b) b.textContent = info.payDeadlineLabel;
+    if (c) c.textContent = info.listDeadlineLabel;
+    if (d) d.textContent = info.followingRunLabel;
+  }
+
+  document.addEventListener("DOMContentLoaded", () => {
+    updateRunUI();
+    setInterval(updateRunUI, 60 * 60 * 1000);
+  });
+</script>
+</body>
+</html>`);
 });
-
 
 // ===== ADMIN (OPTIONAL) =====
 function requireAdmin(req, res, next) {
