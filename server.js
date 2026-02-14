@@ -88,6 +88,26 @@ passport.deserializeUser(async (id, done) => {
   }
 });
 
+function safeReturnTo(url) {
+  try {
+    if (!url) return null;
+
+    // Only allow redirects back to your website
+    const allowed = [
+      "https://tobermorygroceryrun.ca",
+      "https://www.tobermorygroceryrun.ca"
+    ];
+
+    const u = new URL(url);
+    if (!allowed.includes(u.origin)) return null;
+
+    return u.toString();
+  } catch {
+    return null;
+  }
+}
+
+
 // Google OAuth Strategy
 passport.use(
   new GoogleStrategy(
@@ -162,6 +182,7 @@ function computeNextRunDates() {
 // Fix common bad pasted path like /https://tgr-backend.onrender.com/...
 app.get(/^\/https?:\/\/.*/i, (req, res) => res.redirect("/"));
 
+
 // ===== ROUTES =====
 app.get("/health", (req, res) => res.send("OK server is running"));
 
@@ -176,19 +197,52 @@ app.get("/", (req, res) => {
 });
 
 // Start login
-app.get(
-  "/auth/google",
-  passport.authenticate("google", {
-    scope: ["profile", "email"],
-    prompt: "select_account",
-  })
-);
+app.get("/auth/google", (req, res, next) => {
+  // Default return
+  const fallback = "https://tobermorygroceryrun.ca/?tab=order";
 
+  // Only allow returning to your own site
+  const allowedOrigins = new Set([
+    "https://tobermorygroceryrun.ca",
+    "https://www.tobermorygroceryrun.ca",
+  ]);
+
+  let returnTo = fallback;
+
+  try {
+    if (req.query.returnTo) {
+      const u = new URL(String(req.query.returnTo));
+      if (allowedOrigins.has(u.origin)) {
+        returnTo = u.toString();
+      }
+    }
+  } catch (e) {
+    // ignore bad URL; keep fallback
+  }
+
+  req.session.returnTo = returnTo;
+  next();
+}, passport.authenticate("google", {
+  scope: ["profile", "email"],
+  prompt: "select_account",
+}));
 // OAuth callback
 app.get(
   "/auth/google/callback",
   passport.authenticate("google", { failureRedirect: "/" }),
-  (req, res) => res.redirect("/member")
+  (req, res) => {
+    const rt = req.session.returnTo;
+    delete req.session.returnTo;
+    res.redirect(rt || "/member");
+  }
+);
+
+    // If returnTo is a full URL (your site), send them there.
+    // Otherwise, fallback to local route.
+    if (/^https?:\/\//i.test(returnTo)) return res.redirect(returnTo);
+
+    return res.redirect("/member");
+  }
 );
 
 // Logout
