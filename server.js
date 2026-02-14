@@ -11,6 +11,75 @@ const User = require("./models/User");
 
 const app = express();
 
+	// ===== RUN DATE CALC (simple next-Sunday + deadlines) =====
+function computeNextRunDates() {
+  const today = new Date();
+  const day = today.getDay(); // 0=Sun
+  const daysUntilSunday = ((7 - day) % 7) || 7; // next Sunday (not today)
+  const runDate = new Date(today);
+  runDate.setDate(today.getDate() + daysUntilSunday);
+
+  const payDeadline = new Date(runDate);
+  payDeadline.setDate(runDate.getDate() - 2); // Friday before
+
+  const listDeadline = new Date(runDate);
+  listDeadline.setDate(runDate.getDate() - 1); // Saturday before
+
+  const followingRun = new Date(runDate);
+  followingRun.setDate(runDate.getDate() + 14);
+
+  return { runDate, payDeadline, listDeadline, followingRun };
+}
+
+// ===== SAVE ORDER TO USER HISTORY (AUTH REQUIRED) =====
+app.post("/api/orders", requireAuth, async (req, res) => {
+  try {
+    const p = req.body || {};
+
+    // Minimum required fields (match your form names)
+    const primaryStore = (p.primary_store || "").trim();
+    const groceryList = (p.grocery_list || "").trim();
+
+    if (!primaryStore) return res.status(400).json({ ok: false, error: "Missing primary_store" });
+    if (!groceryList) return res.status(400).json({ ok: false, error: "Missing grocery_list" });
+
+    const { runDate, payDeadline, listDeadline } = computeNextRunDates();
+
+    const order = {
+      createdAt: new Date(),
+      runDate,
+      payDeadline,
+      listDeadline,
+      primaryStore,
+      secondaryStore: p.secondary_store || "",
+      community: p.community || "",
+      streetAddress: p.street_address || "",
+      phone: p.phone || "",
+      groceryList,
+      notes: p.grocery_notes || "",
+      status: "submitted",
+      addOns: {
+        fastFood: p.addon_fast_food === "yes" || p.addon_fast_food === true,
+        liquor: p.addon_liquor === "yes" || p.addon_liquor === true,
+        printing: p.addon_printing === "yes" || p.addon_printing === true,
+        ride: p.addon_ride === "yes" || p.addon_ride === true,
+      },
+    };
+
+    const user = await User.findById(req.user._id);
+    if (!user) return res.status(404).json({ ok: false, error: "User not found" });
+
+    user.orderHistory = user.orderHistory || [];
+    user.orderHistory.unshift(order);
+    await user.save();
+
+    return res.json({ ok: true, order });
+  } catch (e) {
+    console.error("POST /api/orders error:", e);
+    return res.status(500).json({ ok: false, error: "Server error" });
+  }
+});
+
 // ===== CONFIG =====
 const BASE_URL = process.env.BASE_URL || "http://localhost:3000";
 const FRONTEND_ORIGINS = [
