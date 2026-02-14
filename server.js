@@ -197,46 +197,29 @@ app.get("/", (req, res) => {
 });
 
 // Start login
+// Start login (supports returnTo)
 app.get("/auth/google", (req, res, next) => {
-  // Default return
-  const fallback = "https://tobermorygroceryrun.ca/?tab=order";
-
-  // Only allow returning to your own site
-  const allowedOrigins = new Set([
-    "https://tobermorygroceryrun.ca",
-    "https://www.tobermorygroceryrun.ca",
-  ]);
-
-  let returnTo = fallback;
-
-  try {
-    if (req.query.returnTo) {
-      const u = new URL(String(req.query.returnTo));
-      if (allowedOrigins.has(u.origin)) {
-        returnTo = u.toString();
-      }
-    }
-  } catch (e) {
-    // ignore bad URL; keep fallback
-  }
-
-  req.session.returnTo = returnTo;
+  // store where to send them after login
+  req.session.returnTo =
+    req.query.returnTo ||
+    req.session.returnTo ||
+    "https://tobermorygroceryrun.ca/?tab=order";
   next();
 }, passport.authenticate("google", {
   scope: ["profile", "email"],
   prompt: "select_account",
 }));
+
 // OAuth callback
 app.get(
   "/auth/google/callback",
   passport.authenticate("google", { failureRedirect: "/" }),
   (req, res) => {
-    const rt = req.session.returnTo;
+    const dest = req.session.returnTo || "https://tobermorygroceryrun.ca/?tab=order";
     delete req.session.returnTo;
-    res.redirect(rt || "/member");
+    res.redirect(dest);
   }
 );
-
     // If returnTo is a full URL (your site), send them there.
     // Otherwise, fallback to local route.
     if (/^https?:\/\//i.test(returnTo)) return res.redirect(returnTo);
