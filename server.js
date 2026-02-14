@@ -437,7 +437,7 @@ app.get("/member", (req, res) => {
 
       <h3>Quick Links</h3>
       <div class="row" style="flex-direction:column;align-items:stretch">
-        <a class="btn primary" href="https://tobermorygroceryrun.ca/indexapp.html?tab=order" target="_blank" rel="noopener">Place an Order</a>
+        <a class="btn primary" href="https://tobermorygroceryrun.ca/?tab=order" target="_blank" rel="noopener">Place an Order</a>
         <a class="btn ghost" href="https://tobermorygroceryrun.ca/terms.html" target="_blank" rel="noopener">Terms & Conditions</a>
         <a class="btn ghost" href="mailto:orders@tobermorygroceryrun.ca">Email Orders</a>
         <a class="btn ghost" href="mailto:members@tobermorygroceryrun.ca">Email Membership</a>
