@@ -341,14 +341,7 @@ app.post("/api/square/paylink", requireAuth, async (req, res) => {
       return res.status(400).json({ ok: false, error: "Missing/invalid orderId or amountCents" });
     }
 
-    // Better idempotency key (stable enough for retries)
     const idempotencyKey = `${orderId}-${Date.now()}`;
-
-    // If your Square SDK expects BigInt for money amounts, use BigInt(cents).
-    // If it expects a normal number, use cents.
-    
-	basePriceMoney: { amount: 1299, currency: "CAD" },
-
 
     const result = await square.checkoutApi.createPaymentLink({
       idempotencyKey,
@@ -358,7 +351,10 @@ app.post("/api/square/paylink", requireAuth, async (req, res) => {
           {
             name: `TGR Order ${orderId}`,
             quantity: "1",
-            basePriceMoney: { amount: amountValue, currency: "CAD" },
+            basePriceMoney: {
+              amount: cents,   // <-- THIS is where the amount belongs
+              currency: "CAD",
+            },
           },
         ],
       },
@@ -369,7 +365,9 @@ app.post("/api/square/paylink", requireAuth, async (req, res) => {
     });
 
     const url = result?.result?.paymentLink?.url;
-    if (!url) return res.status(500).json({ ok: false, error: "No payment link URL returned" });
+    if (!url) {
+      return res.status(500).json({ ok: false, error: "No payment link URL returned" });
+    }
 
     return res.json({ ok: true, url });
   } catch (e) {
@@ -377,7 +375,6 @@ app.post("/api/square/paylink", requireAuth, async (req, res) => {
     return res.status(500).json({ ok: false, error: "Square error creating payment link" });
   }
 });
-
 
 // ===== MEMBER PAGE (styled portal + auto run dates) =====
 app.get("/member", (req, res) => {
