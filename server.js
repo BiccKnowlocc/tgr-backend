@@ -347,7 +347,7 @@ app.post("/api/square/paylink", requireAuth, async (req, res) => {
     // If your Square SDK expects BigInt for money amounts, use BigInt(cents).
     // If it expects a normal number, use cents.
     
-	basePriceMoney: { amount: cents, currency: "CAD" },
+	basePriceMoney: { amount: 1299, currency: "CAD" },
 
 
     const result = await square.checkoutApi.createPaymentLink({
