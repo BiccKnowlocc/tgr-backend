@@ -196,35 +196,30 @@ app.get("/", (req, res) => {
   `);
 });
 
-// Start login
-// Start login (supports returnTo)
-app.get("/auth/google", (req, res, next) => {
-  // store where to send them after login
-  req.session.returnTo =
-    req.query.returnTo ||
-    req.session.returnTo ||
-    "https://tobermorygroceryrun.ca/?tab=order";
-  next();
-}, passport.authenticate("google", {
-  scope: ["profile", "email"],
-  prompt: "select_account",
-}));
+// Start login (stores where to return after Google login)
+app.get(
+  "/auth/google",
+  (req, res, next) => {
+    const returnTo =
+      req.query.returnTo || "https://tobermorygroceryrun.ca/?tab=order";
+    req.session.returnTo = returnTo;
+    next();
+  },
+  passport.authenticate("google", {
+    scope: ["profile", "email"],
+    prompt: "select_account",
+  })
+);
 
-// OAuth callback
+// OAuth callback (redirect back to returnTo)
 app.get(
   "/auth/google/callback",
   passport.authenticate("google", { failureRedirect: "/" }),
   (req, res) => {
-    const dest = req.session.returnTo || "https://tobermorygroceryrun.ca/?tab=order";
+    const dest =
+      req.session.returnTo || "https://tobermorygroceryrun.ca/?tab=order";
     delete req.session.returnTo;
-    res.redirect(dest);
-  }
-);
-    // If returnTo is a full URL (your site), send them there.
-    // Otherwise, fallback to local route.
-    if (/^https?:\/\//i.test(returnTo)) return res.redirect(returnTo);
-
-    return res.redirect("/member");
+    return res.redirect(dest);
   }
 );
 
