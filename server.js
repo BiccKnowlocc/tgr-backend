@@ -12,14 +12,16 @@ const User = require("./models/User");
 // ===== Square SDK =====
 const { Client, Environment } = require("square");
 
+const SQUARE_ENV = (process.env.SQUARE_ENV || "sandbox").toLowerCase(); // "sandbox" or "production"
 const square = new Client({
-  accessToken: process.env.EAAAl9c3M4LuK7qzIdgZ7VqQFV_KGs7Ueg0I9RY2Xg2xnski7r1IY4BQx6nlSVB7,
-  environment:
-    process.env.sandbox-sq0idb-uRwjtH6C15fk1vKl614NPw === "production"
-      ? Environment.Production
-      : Environment.Sandbox,
+  accessToken: process.env.SQUARE_ACCESS_TOKEN,
+  environment: SQUARE_ENV === "production" ? Environment.Production : Environment.Sandbox,
 });
 
+const SQUARE_LOCATION_ID = process.env.SQUARE_LOCATION_ID;
+
+// (optional) if you really need this env var, keep it, but the NAME is weird.
+// I'd recommend using something like SQUARE_WEBHOOK_SIGNATURE_KEY instead.
 const LDVQWYRC9BNE6 = process.env.LDVQWYRC9BNE6;
 
 const app = express();
