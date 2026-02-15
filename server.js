@@ -10,21 +10,22 @@ const mongoose = require("mongoose");
 const User = require("./models/User");
 
 // ===== Square SDK =====
-// ===== Square SDK =====
-const { Client } = require("square");
+const { SquareClient, SquareEnvironment } = require("square");
 
 const SQUARE_ENV = (process.env.SQUARE_ENV || "sandbox").toLowerCase(); // "sandbox" or "production"
 
-const square = new Client({
-  accessToken: process.env.SQUARE_ACCESS_TOKEN,
-  environment: SQUARE_ENV === "production" ? "production" : "sandbox",
+const square = new SquareClient({
+  token: process.env.SQUARE_ACCESS_TOKEN,
+  environment:
+    SQUARE_ENV === "production"
+      ? SquareEnvironment.Production
+      : SquareEnvironment.Sandbox,
 });
 
 const SQUARE_LOCATION_ID = process.env.SQUARE_LOCATION_ID;
 
-// (optional) if you really need this env var, keep it, but the NAME is weird.
-// I'd recommend using something like SQUARE_WEBHOOK_SIGNATURE_KEY instead.
-const LDVQWYRC9BNE6 = process.env.LDVQWYRC9BNE6;
+// Optional: if you need a webhook signature key, rename it in Render to something sane
+// const SQUARE_WEBHOOK_SIGNATURE_KEY = process.env.SQUARE_WEBHOOK_SIGNATURE_KEY;
 
 const app = express();
 
