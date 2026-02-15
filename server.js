@@ -206,22 +206,12 @@ app.get(/^\/https?:\/\/.*/i, (req, res) => res.redirect("/"));
 // ===== ROUTES =====
 app.get("/health", (req, res) => res.send("OK server is running"));
 
-app.get("/", (req, res) => {
-  if (req.user) return res.redirect("/member");
-  res.type("html").send(`
-    <h1>TGR Backend</h1>
-    <p><a href="/auth/google">Login with Google</a></p>
-    <p><a href="/health">Health Check</a></p>
-    <p>BASE_URL: ${BASE_URL}</p>
-  `);
-});
-
-// Start login (stores where to return after Google login)
 app.get(
   "/auth/google",
   (req, res, next) => {
     const returnTo = req.query.returnTo || "/member";
     req.session.returnTo = returnTo;
+    console.log("LOGIN START returnTo =", returnTo);
     next();
   },
   passport.authenticate("google", {
@@ -230,22 +220,16 @@ app.get(
   })
 );
 
-// OAuth callback (redirect back to returnTo)
 app.get(
   "/auth/google/callback",
   passport.authenticate("google", { failureRedirect: "/" }),
   (req, res) => {
+    console.log("CALLBACK returnTo =", req.session.returnTo);
     const returnTo = req.session.returnTo || "/member";
     delete req.session.returnTo;
-
-    // If returnTo is a full URL (your site), send them there.
-    if (/^https?:\/\//i.test(returnTo)) return res.redirect(returnTo);
-
-    // Otherwise treat it as a local route like "/member"
     return res.redirect(returnTo);
   }
 );
-
 // Logout (defaults back to homepage)
 app.get("/logout", (req, res) => {
   const fallback = "https://tobermorygroceryrun.ca/";
