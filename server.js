@@ -10,12 +10,14 @@ const mongoose = require("mongoose");
 const User = require("./models/User");
 
 // ===== Square SDK =====
-const { Client, Environment } = require("square");
+// ===== Square SDK =====
+const { Client } = require("square");
 
 const SQUARE_ENV = (process.env.SQUARE_ENV || "sandbox").toLowerCase(); // "sandbox" or "production"
+
 const square = new Client({
   accessToken: process.env.SQUARE_ACCESS_TOKEN,
-  environment: SQUARE_ENV === "production" ? Environment.Production : Environment.Sandbox,
+  environment: SQUARE_ENV === "production" ? "production" : "sandbox",
 });
 
 const SQUARE_LOCATION_ID = process.env.SQUARE_LOCATION_ID;
@@ -344,7 +346,9 @@ app.post("/api/square/paylink", requireAuth, async (req, res) => {
 
     // If your Square SDK expects BigInt for money amounts, use BigInt(cents).
     // If it expects a normal number, use cents.
-    const amountValue = BigInt(cents);
+    
+	basePriceMoney: { amount: cents, currency: "CAD" },
+
 
     const result = await square.checkoutApi.createPaymentLink({
       idempotencyKey,
