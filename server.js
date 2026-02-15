@@ -9,6 +9,19 @@ const mongoose = require("mongoose");
 
 const User = require("./models/User");
 
+// ===== Square SDK =====
+const { Client, Environment } = require("square");
+
+const square = new Client({
+  accessToken: process.env.EAAAl9c3M4LuK7qzIdgZ7VqQFV_KGs7Ueg0I9RY2Xg2xnski7r1IY4BQx6nlSVB7,
+  environment:
+    process.env.sandbox-sq0idb-uRwjtH6C15fk1vKl614NPw === "production"
+      ? Environment.Production
+      : Environment.Sandbox,
+});
+
+const LDVQWYRC9BNE6 = process.env.LDVQWYRC9BNE6;
+
 const app = express();
 
 // ===== CONFIG =====
@@ -311,6 +324,54 @@ app.get("/api/orders", requireAuth, async (req, res) => {
     return res.status(500).json({ ok: false, error: "Server error" });
   }
 });
+
+// Create a Square hosted checkout link for an order (final amount)
+// POST /api/square/paylink
+// body: { orderId, amountCents, note }
+app.post("/api/square/paylink", requireAuth, async (req, res) => {
+  try {
+    const { orderId, amountCents, note } = req.body || {};
+
+    const cents = parseInt(amountCents, 10);
+    if (!orderId || !Number.isFinite(cents) || cents <= 0) {
+      return res.status(400).json({ ok: false, error: "Missing/invalid orderId or amountCents" });
+    }
+
+    // Better idempotency key (stable enough for retries)
+    const idempotencyKey = `${orderId}-${Date.now()}`;
+
+    // If your Square SDK expects BigInt for money amounts, use BigInt(cents).
+    // If it expects a normal number, use cents.
+    const amountValue = BigInt(cents);
+
+    const result = await square.checkoutApi.createPaymentLink({
+      idempotencyKey,
+      order: {
+        locationId: SQUARE_LOCATION_ID,
+        lineItems: [
+          {
+            name: `TGR Order ${orderId}`,
+            quantity: "1",
+            basePriceMoney: { amount: amountValue, currency: "CAD" },
+          },
+        ],
+      },
+      checkoutOptions: {
+        redirectUrl: "https://tobermorygroceryrun.ca/?tab=home",
+      },
+      description: note || `Payment for TGR order ${orderId}`,
+    });
+
+    const url = result?.result?.paymentLink?.url;
+    if (!url) return res.status(500).json({ ok: false, error: "No payment link URL returned" });
+
+    return res.json({ ok: true, url });
+  } catch (e) {
+    console.error("Square paylink error:", e);
+    return res.status(500).json({ ok: false, error: "Square error creating payment link" });
+  }
+});
+
 
 // ===== MEMBER PAGE (styled portal + auto run dates) =====
 app.get("/member", (req, res) => {
