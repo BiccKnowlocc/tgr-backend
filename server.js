@@ -197,31 +197,32 @@ app.get("/", (req, res) => {
 });
 
 // Start login (stores where to return after Google login)
-app.get(
-  "/auth/google",
-  (req, res, next) => {
-    const returnTo =
-      req.query.returnTo || "https://tobermorygroceryrun.ca/?tab=order";
-    req.session.returnTo = returnTo;
-    next();
-  },
-  passport.authenticate("google", {
-    scope: ["profile", "email"],
-    prompt: "select_account",
-  })
-);
+app.get("/auth/google", (req, res, next) => {
+  // Default behavior: after login go to the member portal
+  const returnTo = req.query.returnTo || "/member";
+  req.session.returnTo = returnTo;
+  next();
+}, passport.authenticate("google", {
+  scope: ["profile", "email"],
+  prompt: "select_account",
+}));
 
 // OAuth callback (redirect back to returnTo)
 app.get(
   "/auth/google/callback",
   passport.authenticate("google", { failureRedirect: "/" }),
   (req, res) => {
-    const dest =
-      req.session.returnTo || "https://tobermorygroceryrun.ca/?tab=order";
+    const returnTo = req.session.returnTo || "/member";
     delete req.session.returnTo;
-    return res.redirect(dest);
+
+    // If returnTo is a full URL (your site), send them there.
+    if (/^https?:\/\//i.test(returnTo)) return res.redirect(returnTo);
+
+    // Otherwise treat it as a local route like "/member"
+    return res.redirect(returnTo);
   }
 );
+
 
 // Logout
 app.get("/logout", (req, res) => {
@@ -470,6 +471,7 @@ app.get("/member", (req, res) => {
       <h3>Quick Links</h3>
       <div class="row" style="flex-direction:column;align-items:stretch">
         <a class="btn primary" href="https://tobermorygroceryrun.ca/?tab=order" target="_blank" rel="noopener">Place an Order</a>
+	<a class="btn ghost" href="https://tobermorygroceryrun.ca/" target="_blank" rel="noopener">Open Main App</a>
         <a class="btn ghost" href="https://tobermorygroceryrun.ca/terms.html" target="_blank" rel="noopener">Terms & Conditions</a>
         <a class="btn ghost" href="mailto:orders@tobermorygroceryrun.ca">Email Orders</a>
         <a class="btn ghost" href="mailto:members@tobermorygroceryrun.ca">Email Membership</a>
