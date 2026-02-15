@@ -24,24 +24,7 @@ const square = new SquareClient({
 
 const SQUARE_LOCATION_ID = process.env.SQUARE_LOCATION_ID;
 
-// Optional: if you need a webhook signature key, rename it in Render to something sane
-// const SQUARE_WEBHOOK_SIGNATURE_KEY = process.env.SQUARE_WEBHOOK_SIGNATURE_KEY;
-
 const app = express();
-
-//========ADMIN ACCESS===========
-
-const ADMIN_EMAILS = (process.env.ADMIN_EMAILS || "")
-  .split(",")
-  .map(s => s.trim().toLowerCase())
-  .filter(Boolean);
-
-function requireAdmin(req, res, next) {
-  if (!req.user) return res.status(401).json({ ok: false, error: "Not logged in" });
-  const email = (req.user.email || "").toLowerCase();
-  if (!ADMIN_EMAILS.includes(email)) return res.status(403).json({ ok: false, error: "Forbidden" });
-  next();
-}
 
 // ===== CONFIG =====
 const BASE_URL = process.env.BASE_URL || "http://localhost:3000";
@@ -55,8 +38,6 @@ const ALLOWED_ORIGINS = [
 
 // Render/Proxies (required for secure cookies on Render)
 app.set("trust proxy", 1);
-
-	
 
 // ===== MIDDLEWARE =====
 app.use(express.urlencoded({ extended: true }));
@@ -90,8 +71,6 @@ mongoose
   .catch((err) => console.error("MongoDB connection error:", err));
 
 // ===== SESSIONS =====
-// NOTE: MemoryStore warning is OK for testing.
-// Later we’ll swap to Mongo-backed session store (connect-mongo).
 app.use(
   session({
     name: "tgr.sid", // IMPORTANT: set cookie name so logout clears the right one
@@ -121,26 +100,6 @@ passport.deserializeUser(async (id, done) => {
     done(e);
   }
 });
-
-function safeReturnTo(url) {
-  try {
-    if (!url) return null;
-
-    // Only allow redirects back to your website
-    const allowed = [
-      "https://tobermorygroceryrun.ca",
-      "https://www.tobermorygroceryrun.ca"
-    ];
-
-    const u = new URL(url);
-    if (!allowed.includes(u.origin)) return null;
-
-    return u.toString();
-  } catch {
-    return null;
-  }
-}
-
 
 // Google OAuth Strategy
 passport.use(
@@ -193,6 +152,34 @@ function requireAuth(req, res, next) {
   return res.status(401).json({ ok: false, error: "Not logged in" });
 }
 
+// Admin list comes from Render env var: ADMIN_EMAILS="you@gmail.com,other@gmail.com"
+const ADMIN_EMAILS = (process.env.ADMIN_EMAILS || "")
+  .split(",")
+  .map((s) => s.trim().toLowerCase())
+  .filter(Boolean);
+
+function isAdminUser(req) {
+  const email = (req.user?.email || "").toLowerCase();
+  return ADMIN_EMAILS.includes(email);
+}
+
+// For API endpoints: return JSON
+function requireAdminApi(req, res, next) {
+  if (!req.user) return res.status(401).json({ ok: false, error: "Not logged in" });
+  if (!isAdminUser(req)) return res.status(403).json({ ok: false, error: "Forbidden" });
+  return next();
+}
+
+// For HTML pages: redirect to Google login then return to page
+function requireAdminPage(req, res, next) {
+  if (!req.user) {
+    const returnTo = encodeURIComponent(req.originalUrl || "/admin");
+    return res.redirect(`/auth/google?returnTo=${returnTo}`);
+  }
+  if (!isAdminUser(req)) return res.status(403).send("Forbidden");
+  return next();
+}
+
 // ===== RUN DATE CALC =====
 function computeNextRunDates() {
   const today = new Date();
@@ -216,7 +203,6 @@ function computeNextRunDates() {
 // Fix common bad pasted path like /https://tgr-backend.onrender.com/...
 app.get(/^\/https?:\/\/.*/i, (req, res) => res.redirect("/"));
 
-
 // ===== ROUTES =====
 app.get("/health", (req, res) => res.send("OK server is running"));
 
@@ -231,15 +217,18 @@ app.get("/", (req, res) => {
 });
 
 // Start login (stores where to return after Google login)
-app.get("/auth/google", (req, res, next) => {
-  // Default behavior: after login go to the member portal
-  const returnTo = req.query.returnTo || "/member";
-  req.session.returnTo = returnTo;
-  next();
-}, passport.authenticate("google", {
-  scope: ["profile", "email"],
-  prompt: "select_account",
-}));
+app.get(
+  "/auth/google",
+  (req, res, next) => {
+    const returnTo = req.query.returnTo || "/member";
+    req.session.returnTo = returnTo;
+    next();
+  },
+  passport.authenticate("google", {
+    scope: ["profile", "email"],
+    prompt: "select_account",
+  })
+);
 
 // OAuth callback (redirect back to returnTo)
 app.get(
@@ -257,8 +246,7 @@ app.get(
   }
 );
 
-
-// Logout
+// Logout (defaults back to homepage)
 app.get("/logout", (req, res) => {
   const fallback = "https://tobermorygroceryrun.ca/";
   const returnToRaw = req.query.returnTo || fallback;
@@ -270,7 +258,7 @@ app.get("/logout", (req, res) => {
     const allowed = ["tobermorygroceryrun.ca", "www.tobermorygroceryrun.ca"];
     if (allowed.includes(host)) returnTo = u.toString();
   } catch {
-    // if it's not a valid URL, keep fallback
+    // keep fallback
   }
 
   req.logout(() => {
@@ -280,6 +268,7 @@ app.get("/logout", (req, res) => {
     });
   });
 });
+
 // Who am I (for frontend checks)
 app.get("/api/me", (req, res) => {
   if (!req.user) return res.json({ ok: true, loggedIn: false });
@@ -305,8 +294,10 @@ app.post("/api/orders", requireAuth, async (req, res) => {
     const primaryStore = (p.primary_store || "").trim();
     const groceryList = (p.grocery_list || "").trim();
 
-    if (!primaryStore) return res.status(400).json({ ok: false, error: "Missing primary_store" });
-    if (!groceryList) return res.status(400).json({ ok: false, error: "Missing grocery_list" });
+    if (!primaryStore)
+      return res.status(400).json({ ok: false, error: "Missing primary_store" });
+    if (!groceryList)
+      return res.status(400).json({ ok: false, error: "Missing grocery_list" });
 
     const { runDate, payDeadline, listDeadline, followingRun } = computeNextRunDates();
 
@@ -358,14 +349,14 @@ app.get("/api/orders", requireAuth, async (req, res) => {
   }
 });
 
-// ===== ADMIN: ALL ORDERS (ACROSS ALL USERS) =====
-app.get("/api/admin/orders", requireAdmin, async (req, res) => {
+// ===== ADMIN API: ALL ORDERS (ACROSS ALL USERS) =====
+app.get("/api/admin/orders", requireAdminApi, async (req, res) => {
   try {
     const users = await User.find({}, { email: 1, name: 1, orderHistory: 1 }).lean();
 
     const orders = [];
     for (const u of users) {
-      for (const o of (u.orderHistory || [])) {
+      for (const o of u.orderHistory || []) {
         orders.push({
           userId: u._id,
           userEmail: u.email,
@@ -388,73 +379,25 @@ app.get("/api/admin/orders", requireAdmin, async (req, res) => {
   }
 });
 
-// ===== ADMIN: SINGLE ORDER DETAIL =====
-app.get("/api/admin/orders/:userId/:orderId", requireAdmin, async (req, res) => {
+// ===== ADMIN API: SINGLE ORDER DETAIL =====
+app.get("/api/admin/orders/:userId/:orderId", requireAdminApi, async (req, res) => {
   try {
     const { userId, orderId } = req.params;
 
     const user = await User.findById(userId).lean();
     if (!user) return res.status(404).json({ ok: false, error: "User not found" });
 
-    const order = (user.orderHistory || []).find(o => String(o._id) === String(orderId));
+    const order = (user.orderHistory || []).find((o) => String(o._id) === String(orderId));
     if (!order) return res.status(404).json({ ok: false, error: "Order not found" });
 
     return res.json({
       ok: true,
       user: { id: user._id, email: user.email, name: user.name },
-      order
+      order,
     });
   } catch (e) {
     console.error("GET /api/admin/orders/:userId/:orderId error:", e);
     return res.status(500).json({ ok: false, error: "Server error" });
-  }
-});
-
-
-// Create a Square hosted checkout link for an order (final amount)
-// POST /api/square/paylink
-// body: { orderId, amountCents, note }
-app.post("/api/square/paylink", requireAuth, async (req, res) => {
-  try {
-    const { orderId, amountCents, note } = req.body || {};
-
-    const cents = parseInt(amountCents, 10);
-    if (!orderId || !Number.isFinite(cents) || cents <= 0) {
-      return res.status(400).json({ ok: false, error: "Missing/invalid orderId or amountCents" });
-    }
-
-    const idempotencyKey = `${orderId}-${Date.now()}`;
-
-    const result = await square.checkoutApi.createPaymentLink({
-      idempotencyKey,
-      order: {
-        locationId: SQUARE_LOCATION_ID,
-        lineItems: [
-          {
-            name: `TGR Order ${orderId}`,
-            quantity: "1",
-            basePriceMoney: {
-              amount: cents,   // <-- THIS is where the amount belongs
-              currency: "CAD",
-            },
-          },
-        ],
-      },
-      checkoutOptions: {
-        redirectUrl: "https://tobermorygroceryrun.ca/?tab=home",
-      },
-      description: note || `Payment for TGR order ${orderId}`,
-    });
-
-    const url = result?.result?.paymentLink?.url;
-    if (!url) {
-      return res.status(500).json({ ok: false, error: "No payment link URL returned" });
-    }
-
-    return res.json({ ok: true, url });
-  } catch (e) {
-    console.error("Square paylink error:", e);
-    return res.status(500).json({ ok: false, error: "Square error creating payment link" });
   }
 });
 
@@ -465,13 +408,13 @@ app.get("/member", (req, res) => {
   const u = req.user;
   const renewal = u.renewalDate ? new Date(u.renewalDate).toLocaleDateString("en-CA") : "N/A";
 
-  const perks = (u.perks && u.perks.length) ? u.perks : [
+  const perks = u.perks && u.perks.length ? u.perks : [
     "Priority booking on run days",
     "Reduced extra-store fees (based on tier)",
     "Faster issue resolution support",
   ];
 
-  const discounts = (u.discounts && u.discounts.length) ? u.discounts : [
+  const discounts = u.discounts && u.discounts.length ? u.discounts : [
     "Member discounts apply to service/delivery fees (where applicable)",
   ];
 
@@ -493,7 +436,8 @@ app.get("/member", (req, res) => {
     })
     .join("");
 
-  const manageUrl = process.env.SQUARE_MANAGE_MEMBERSHIP_URL || "https://tobermorygroceryrun.ca/indexapp.html";
+  const manageUrl =
+    process.env.SQUARE_MANAGE_MEMBERSHIP_URL || "https://tobermorygroceryrun.ca/indexapp.html";
   const cancelUrl =
     process.env.SQUARE_CANCEL_MEMBERSHIP_URL ||
     "mailto:members@tobermorygroceryrun.ca?subject=Membership%20Cancellation%20Request";
@@ -587,9 +531,9 @@ app.get("/member", (req, res) => {
 
       <div id="panel-perks" class="panel">
         <h3>Your Perks</h3>
-        <ul>${perks.map(p => `<li>${p}</li>`).join("")}</ul>
+        <ul>${perks.map((p) => `<li>${p}</li>`).join("")}</ul>
         <h3>Your Discounts</h3>
-        <ul>${discounts.map(d => `<li>${d}</li>`).join("")}</ul>
+        <ul>${discounts.map((d) => `<li>${d}</li>`).join("")}</ul>
       </div>
 
       <div id="panel-orders" class="panel">
@@ -617,7 +561,7 @@ app.get("/member", (req, res) => {
       <h3>Quick Links</h3>
       <div class="row" style="flex-direction:column;align-items:stretch">
         <a class="btn primary" href="https://tobermorygroceryrun.ca/?tab=order" target="_blank" rel="noopener">Place an Order</a>
-	<a class="btn ghost" href="https://tobermorygroceryrun.ca/" target="_blank" rel="noopener">Open Main App</a>
+        <a class="btn ghost" href="https://tobermorygroceryrun.ca/" target="_blank" rel="noopener">Open Main App</a>
         <a class="btn ghost" href="https://tobermorygroceryrun.ca/terms.html" target="_blank" rel="noopener">Terms & Conditions</a>
         <a class="btn ghost" href="mailto:orders@tobermorygroceryrun.ca">Email Orders</a>
         <a class="btn ghost" href="mailto:members@tobermorygroceryrun.ca">Email Membership</a>
@@ -697,12 +641,8 @@ app.get("/member", (req, res) => {
 </html>`);
 });
 
-app.get("/admin", (req, res) => {
-  if (!req.user) return res.redirect("/auth/google?returnTo=/admin");
-
-  const email = (req.user.email || "").toLowerCase();
-  if (!ADMIN_EMAILS.includes(email)) return res.status(403).send("Forbidden");
-
+// ===== ADMIN HTML PAGES =====
+app.get("/admin", requireAdminPage, (req, res) => {
   res.type("html").send(`
 <!doctype html>
 <html>
@@ -717,6 +657,7 @@ app.get("/admin", (req, res) => {
     th{background:#f5f5f5;}
     a{font-weight:700;}
     .top{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:10px;}
+    .muted{opacity:.75;font-weight:500;}
   </style>
 </head>
 <body>
@@ -724,6 +665,7 @@ app.get("/admin", (req, res) => {
     <h2 style="margin:0;">Admin Orders</h2>
     <a href="/member">Member</a>
     <a href="/logout?returnTo=https%3A%2F%2Ftobermorygroceryrun.ca%2F">Logout</a>
+    <span class="muted">Signed in as: ${(req.user.email || "")}</span>
   </div>
 
   <div id="out">Loading…</div>
@@ -736,11 +678,11 @@ app.get("/admin", (req, res) => {
         document.getElementById("out").textContent = data.error || "Error loading orders";
         return;
       }
-      const rows = data.orders.map(o => {
+      const rows = (data.orders || []).map(o => {
         const viewUrl = "/admin/order?userId=" + encodeURIComponent(o.userId) + "&orderId=" + encodeURIComponent(o.orderId);
         return \`
           <tr>
-            <td>\${new Date(o.createdAt).toLocaleString()}</td>
+            <td>\${o.createdAt ? new Date(o.createdAt).toLocaleString() : ""}</td>
             <td>\${o.userName || ""}</td>
             <td>\${o.userEmail || ""}</td>
             <td>\${o.community || ""}</td>
@@ -749,6 +691,7 @@ app.get("/admin", (req, res) => {
             <td><a href="\${viewUrl}">View</a></td>
           </tr>\`;
       }).join("");
+
       document.getElementById("out").innerHTML = \`
         <table>
           <thead>
@@ -756,7 +699,7 @@ app.get("/admin", (req, res) => {
               <th>Created</th><th>Name</th><th>Email</th><th>Community</th><th>Store</th><th>Status</th><th></th>
             </tr>
           </thead>
-          <tbody>\${rows}</tbody>
+          <tbody>\${rows || '<tr><td colspan="7" class="muted">No orders found.</td></tr>'}</tbody>
         </table>\`;
     }
     load();
@@ -766,11 +709,7 @@ app.get("/admin", (req, res) => {
   `);
 });
 
-app.get("/admin/order", (req, res) => {
-  if (!req.user) return res.redirect("/auth/google?returnTo=/admin");
-  const email = (req.user.email || "").toLowerCase();
-  if (!ADMIN_EMAILS.includes(email)) return res.status(403).send("Forbidden");
-
+app.get("/admin/order", requireAdminPage, (req, res) => {
   res.type("html").send(`
 <!doctype html>
 <html>
@@ -782,6 +721,7 @@ app.get("/admin/order", (req, res) => {
     body{font-family:system-ui,Segoe UI,Arial,sans-serif;margin:16px;}
     pre{white-space:pre-wrap;background:#f6f6f6;border:1px solid #ddd;padding:10px;border-radius:8px;}
     a{font-weight:700;}
+    .muted{opacity:.75;font-weight:500;}
   </style>
 </head>
 <body>
@@ -795,13 +735,19 @@ app.get("/admin/order", (req, res) => {
     const orderId = params.get("orderId");
 
     async function load(){
+      if(!userId || !orderId){
+        document.getElementById("out").textContent = "Missing userId or orderId in URL.";
+        return;
+      }
       const r = await fetch("/api/admin/orders/" + encodeURIComponent(userId) + "/" + encodeURIComponent(orderId), { credentials:"include" });
       const data = await r.json().catch(()=>({}));
       if(!r.ok || data.ok===false){
         document.getElementById("out").textContent = data.error || "Error";
         return;
       }
-      document.getElementById("out").innerHTML = "<pre>" + JSON.stringify(data, null, 2) + "</pre>";
+      document.getElementById("out").innerHTML =
+        "<div class='muted'>" + (data.user?.email || "") + "</div>" +
+        "<pre>" + JSON.stringify(data.order, null, 2) + "</pre>";
     }
     load();
   </script>
@@ -810,19 +756,13 @@ app.get("/admin/order", (req, res) => {
   `);
 });
 
-
-// ===== ADMIN (OPTIONAL) =====
-function requireAdmin(req, res, next) {
-  if (req.query.key && process.env.ADMIN_KEY && req.query.key === process.env.ADMIN_KEY) return next();
-  return res.status(401).send("Unauthorized.");
-}
-
-app.get("/admin/users", requireAdmin, async (req, res) => {
+// ===== ADMIN UTIL ROUTES (optional, email-based auth) =====
+app.get("/admin/users", requireAdminPage, async (req, res) => {
   const users = await User.find().sort({ createdAt: -1 }).limit(200).lean();
   res.json(users);
 });
 
-app.get("/admin/set-membership", requireAdmin, async (req, res) => {
+app.get("/admin/set-membership", requireAdminPage, async (req, res) => {
   const { email, level, status, renewal } = req.query;
 
   if (!email) return res.status(400).send("Missing email.");
@@ -835,7 +775,11 @@ app.get("/admin/set-membership", requireAdmin, async (req, res) => {
     renewalDate: renewal ? new Date(renewal) : null,
   };
 
-  const user = await User.findOneAndUpdate({ email: email.toLowerCase() }, update, { new: true });
+  const user = await User.findOneAndUpdate(
+    { email: email.toLowerCase() },
+    update,
+    { new: true }
+  );
   if (!user) return res.status(404).send("User not found.");
 
   res.send(`
