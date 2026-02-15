@@ -206,31 +206,56 @@ app.get(/^\/https?:\/\/.*/i, (req, res) => res.redirect("/"));
 // ===== ROUTES =====
 app.get("/health", (req, res) => res.send("OK server is running"));
 
+function safeReturnToPath(p) {
+  // Allow only local paths like "/admin" or "/member"
+  if (!p || typeof p !== "string") return "/member";
+  if (!p.startsWith("/")) return "/member";
+  // Optional: restrict to only these:
+  const allowed = ["/member", "/admin", "/admin/order"];
+  if (!allowed.includes(p.split("?")[0])) return "/member";
+  return p;
+}
+
 app.get(
   "/auth/google",
   (req, res, next) => {
-    const returnTo = req.query.returnTo || "/member";
-    req.session.returnTo = returnTo;
-    console.log("LOGIN START returnTo =", returnTo);
+    const returnTo = safeReturnToPath(req.query.returnTo || "/member");
+
+    // Put returnTo into "state" so we don't rely on sessions surviving OAuth redirect
+    const state = Buffer.from(JSON.stringify({ returnTo }), "utf8").toString("base64url");
+
+    console.log("LOGIN START returnTo =", returnTo, "state =", state);
+
+    // stash it on req for passport options
+    req._oauthState = state;
     next();
   },
-  passport.authenticate("google", {
-    scope: ["profile", "email"],
-    prompt: "select_account",
-  })
+  (req, res, next) => {
+    passport.authenticate("google", {
+      scope: ["profile", "email"],
+      prompt: "select_account",
+      state: req._oauthState,
+    })(req, res, next);
+  }
 );
 
 app.get(
   "/auth/google/callback",
   passport.authenticate("google", { failureRedirect: "/" }),
   (req, res) => {
-    console.log("CALLBACK returnTo =", req.session.returnTo);
-    const returnTo = req.session.returnTo || "/member";
-    delete req.session.returnTo;
+    let returnTo = "/member";
+
+    try {
+      if (req.query.state) {
+        const decoded = JSON.parse(Buffer.from(String(req.query.state), "base64url").toString("utf8"));
+        returnTo = safeReturnToPath(decoded.returnTo);
+      }
+    } catch {}
+
+    console.log("CALLBACK state returnTo =", returnTo);
     return res.redirect(returnTo);
   }
-);
-// Logout (defaults back to homepage)
+);// Logout (defaults back to homepage)
 app.get("/logout", (req, res) => {
   const fallback = "https://tobermorygroceryrun.ca/";
   const returnToRaw = req.query.returnTo || fallback;
