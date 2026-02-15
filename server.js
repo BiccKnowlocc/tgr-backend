@@ -29,6 +29,20 @@ const SQUARE_LOCATION_ID = process.env.SQUARE_LOCATION_ID;
 
 const app = express();
 
+//========ADMIN ACCESS===========
+
+const ADMIN_EMAILS = (process.env.ADMIN_EMAILS || "")
+  .split(",")
+  .map(s => s.trim().toLowerCase())
+  .filter(Boolean);
+
+function requireAdmin(req, res, next) {
+  if (!req.user) return res.status(401).json({ ok: false, error: "Not logged in" });
+  const email = (req.user.email || "").toLowerCase();
+  if (!ADMIN_EMAILS.includes(email)) return res.status(403).json({ ok: false, error: "Forbidden" });
+  next();
+}
+
 // ===== CONFIG =====
 const BASE_URL = process.env.BASE_URL || "http://localhost:3000";
 
@@ -41,6 +55,8 @@ const ALLOWED_ORIGINS = [
 
 // Render/Proxies (required for secure cookies on Render)
 app.set("trust proxy", 1);
+
+	
 
 // ===== MIDDLEWARE =====
 app.use(express.urlencoded({ extended: true }));
@@ -244,14 +260,26 @@ app.get(
 
 // Logout
 app.get("/logout", (req, res) => {
+  const fallback = "https://tobermorygroceryrun.ca/";
+  const returnToRaw = req.query.returnTo || fallback;
+
+  let returnTo = fallback;
+  try {
+    const u = new URL(returnToRaw);
+    const host = u.hostname.toLowerCase();
+    const allowed = ["tobermorygroceryrun.ca", "www.tobermorygroceryrun.ca"];
+    if (allowed.includes(host)) returnTo = u.toString();
+  } catch {
+    // if it's not a valid URL, keep fallback
+  }
+
   req.logout(() => {
     req.session.destroy(() => {
       res.clearCookie("tgr.sid");
-      res.redirect("/");
+      res.redirect(returnTo);
     });
   });
 });
-
 // Who am I (for frontend checks)
 app.get("/api/me", (req, res) => {
   if (!req.user) return res.json({ ok: true, loggedIn: false });
@@ -329,6 +357,59 @@ app.get("/api/orders", requireAuth, async (req, res) => {
     return res.status(500).json({ ok: false, error: "Server error" });
   }
 });
+
+// ===== ADMIN: ALL ORDERS (ACROSS ALL USERS) =====
+app.get("/api/admin/orders", requireAdmin, async (req, res) => {
+  try {
+    const users = await User.find({}, { email: 1, name: 1, orderHistory: 1 }).lean();
+
+    const orders = [];
+    for (const u of users) {
+      for (const o of (u.orderHistory || [])) {
+        orders.push({
+          userId: u._id,
+          userEmail: u.email,
+          userName: u.name,
+          orderId: o._id,
+          createdAt: o.createdAt,
+          runDate: o.runDate,
+          community: o.community,
+          primaryStore: o.primaryStore,
+          status: o.status,
+        });
+      }
+    }
+
+    orders.sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
+    return res.json({ ok: true, orders });
+  } catch (e) {
+    console.error("GET /api/admin/orders error:", e);
+    return res.status(500).json({ ok: false, error: "Server error" });
+  }
+});
+
+// ===== ADMIN: SINGLE ORDER DETAIL =====
+app.get("/api/admin/orders/:userId/:orderId", requireAdmin, async (req, res) => {
+  try {
+    const { userId, orderId } = req.params;
+
+    const user = await User.findById(userId).lean();
+    if (!user) return res.status(404).json({ ok: false, error: "User not found" });
+
+    const order = (user.orderHistory || []).find(o => String(o._id) === String(orderId));
+    if (!order) return res.status(404).json({ ok: false, error: "Order not found" });
+
+    return res.json({
+      ok: true,
+      user: { id: user._id, email: user.email, name: user.name },
+      order
+    });
+  } catch (e) {
+    console.error("GET /api/admin/orders/:userId/:orderId error:", e);
+    return res.status(500).json({ ok: false, error: "Server error" });
+  }
+});
+
 
 // Create a Square hosted checkout link for an order (final amount)
 // POST /api/square/paylink
@@ -615,6 +696,120 @@ app.get("/member", (req, res) => {
 </body>
 </html>`);
 });
+
+app.get("/admin", (req, res) => {
+  if (!req.user) return res.redirect("/auth/google?returnTo=/admin");
+
+  const email = (req.user.email || "").toLowerCase();
+  if (!ADMIN_EMAILS.includes(email)) return res.status(403).send("Forbidden");
+
+  res.type("html").send(`
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>TGR Admin – Orders</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <style>
+    body{font-family:system-ui,Segoe UI,Arial,sans-serif;margin:16px;}
+    table{width:100%;border-collapse:collapse;}
+    th,td{border-bottom:1px solid #ddd;padding:8px;text-align:left;font-size:14px;}
+    th{background:#f5f5f5;}
+    a{font-weight:700;}
+    .top{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:10px;}
+  </style>
+</head>
+<body>
+  <div class="top">
+    <h2 style="margin:0;">Admin Orders</h2>
+    <a href="/member">Member</a>
+    <a href="/logout?returnTo=https%3A%2F%2Ftobermorygroceryrun.ca%2F">Logout</a>
+  </div>
+
+  <div id="out">Loading…</div>
+
+  <script>
+    async function load(){
+      const r = await fetch("/api/admin/orders", { credentials:"include" });
+      const data = await r.json().catch(()=>({}));
+      if(!r.ok || data.ok===false){
+        document.getElementById("out").textContent = data.error || "Error loading orders";
+        return;
+      }
+      const rows = data.orders.map(o => {
+        const viewUrl = "/admin/order?userId=" + encodeURIComponent(o.userId) + "&orderId=" + encodeURIComponent(o.orderId);
+        return \`
+          <tr>
+            <td>\${new Date(o.createdAt).toLocaleString()}</td>
+            <td>\${o.userName || ""}</td>
+            <td>\${o.userEmail || ""}</td>
+            <td>\${o.community || ""}</td>
+            <td>\${o.primaryStore || ""}</td>
+            <td>\${o.status || ""}</td>
+            <td><a href="\${viewUrl}">View</a></td>
+          </tr>\`;
+      }).join("");
+      document.getElementById("out").innerHTML = \`
+        <table>
+          <thead>
+            <tr>
+              <th>Created</th><th>Name</th><th>Email</th><th>Community</th><th>Store</th><th>Status</th><th></th>
+            </tr>
+          </thead>
+          <tbody>\${rows}</tbody>
+        </table>\`;
+    }
+    load();
+  </script>
+</body>
+</html>
+  `);
+});
+
+app.get("/admin/order", (req, res) => {
+  if (!req.user) return res.redirect("/auth/google?returnTo=/admin");
+  const email = (req.user.email || "").toLowerCase();
+  if (!ADMIN_EMAILS.includes(email)) return res.status(403).send("Forbidden");
+
+  res.type("html").send(`
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>TGR Admin – Order</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <style>
+    body{font-family:system-ui,Segoe UI,Arial,sans-serif;margin:16px;}
+    pre{white-space:pre-wrap;background:#f6f6f6;border:1px solid #ddd;padding:10px;border-radius:8px;}
+    a{font-weight:700;}
+  </style>
+</head>
+<body>
+  <a href="/admin">← Back to all orders</a>
+  <h2>Order Detail</h2>
+  <div id="out">Loading…</div>
+
+  <script>
+    const params = new URLSearchParams(location.search);
+    const userId = params.get("userId");
+    const orderId = params.get("orderId");
+
+    async function load(){
+      const r = await fetch("/api/admin/orders/" + encodeURIComponent(userId) + "/" + encodeURIComponent(orderId), { credentials:"include" });
+      const data = await r.json().catch(()=>({}));
+      if(!r.ok || data.ok===false){
+        document.getElementById("out").textContent = data.error || "Error";
+        return;
+      }
+      document.getElementById("out").innerHTML = "<pre>" + JSON.stringify(data, null, 2) + "</pre>";
+    }
+    load();
+  </script>
+</body>
+</html>
+  `);
+});
+
 
 // ===== ADMIN (OPTIONAL) =====
 function requireAdmin(req, res, next) {
