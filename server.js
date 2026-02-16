@@ -389,154 +389,111 @@ app.get("/admin", requireAdminPage, (req, res) => {
 });
 
 app.get("/admin/order", requireAdminPage, (req, res) => {
-  res.type("html").send(`
-<!doctype html>
-<html>
-<head>
-  <meta charset="utf-8" />
-  <title>TGR Admin – Order</title>
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <style>
-    body{font-family:system-ui,Segoe UI,Arial,sans-serif;margin:16px;}
-    pre{white-space:pre-wrap;background:#f6f6f6;border:1px solid #ddd;padding:10px;border-radius:8px;}
-    a{font-weight:700;}
-  </style>
-</head>
-<body>
-  <a href="/admin">← Back to all orders</a>
-  <h2>Order Detail</h2>
-  <div id="out">Loading…</div>
-
- <script>
-  (function () {
-    const out = document.getElementById("out");
-    const log = (msg) => {
-      out.innerHTML = (out.innerHTML || "") + "<div style='margin:6px 0;opacity:.85'>" + msg + "</div>";
-    };
-
-    window.onerror = function (message, source, lineno, colno, error) {
-      log("<strong style='color:#b00'>JS ERROR:</strong> " + String(message) +
-          " <span style='opacity:.7'>(line " + lineno + ":" + colno + ")</span>");
-      if (error && error.stack) {
-        log("<pre style='white-space:pre-wrap;background:#f6f6f6;border:1px solid #ddd;padding:10px;border-radius:8px;'>" +
-            String(error.stack).slice(0, 2000) + "</pre>");
-      }
-    };
-
-    window.onunhandledrejection = function (e) {
-      log("<strong style='color:#b00'>PROMISE REJECTION:</strong> " + String(e.reason || e));
-    };
-
-    function esc(s) {
-      return String(s ?? "").replace(/[&<>"']/g, (c) => ({
-        "&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"
-      }[c]));
-    }
-
-    async function fetchTextWithTimeout(url, ms) {
-      const c = new AbortController();
-      const t = setTimeout(() => c.abort(), ms);
-      try {
-        const r = await fetch(url, { credentials: "include", signal: c.signal });
-        const text = await r.text();
-        return { r, text };
-      } finally {
-        clearTimeout(t);
-      }
-    }
-
-    async function load() {
-      out.innerHTML = "";
-      log("Script started ✅");
-
-      const params = new URLSearchParams(location.search);
-      const userId = params.get("userId");
-      const orderId = params.get("orderId");
-
-      log("URL params: userId=" + esc(userId) + " orderId=" + esc(orderId));
-
-      if (!userId || !orderId || userId === "undefined" || orderId === "undefined") {
-        log("<strong style='color:#b00'>Missing/invalid userId or orderId in the URL.</strong>");
-        return;
-      }
-
-      const url = "/api/admin/orders/" + encodeURIComponent(userId) + "/" + encodeURIComponent(orderId);
-      log("Fetching: " + esc(url));
-
-      let r, text;
-      try {
-        ({ r, text } = await fetchTextWithTimeout(url, 10000));
-      } catch (e) {
-        log("<strong style='color:#b00'>Fetch failed:</strong> " + esc(String(e)));
-        return;
-      }
-
-      log("Response status: " + r.status);
-
-      if (!r.ok) {
-        log("<strong style='color:#b00'>Non-OK response:</strong>");
-        log("<pre style='white-space:pre-wrap;background:#f6f6f6;border:1px solid #ddd;padding:10px;border-radius:8px;'>" +
-            esc(text.slice(0, 2000)) + "</pre>");
-        return;
-      }
-
-      let data;
-      try {
-        data = JSON.parse(text);
-      } catch {
-        log("<strong style='color:#b00'>Expected JSON but got:</strong>");
-        log("<pre style='white-space:pre-wrap;background:#f6f6f6;border:1px solid #ddd;padding:10px;border-radius:8px;'>" +
-            esc(text.slice(0, 2000)) + "</pre>");
-        return;
-      }
-
-      if (data.ok === false) {
-        log("<strong style='color:#b00'>API said ok=false:</strong> " + esc(data.error || "Unknown error"));
-        return;
-      }
-
-      const o = data.order || {};
-      const add = o.addOns || {};
-      const addOnsText = [
-        add.fastFood ? "Fast Food" : null,
-        add.liquor ? "Liquor" : null,
-        add.printing ? "Printing" : null,
-        add.ride ? "Ride" : null,
-      ].filter(Boolean).join(", ") || "None";
-
-      // Replace the debug log with the real UI
-      out.innerHTML =
-        "<div style='margin:8px 0;opacity:.75'>" +
-          "<div><strong>" + esc((data.user && data.user.name) ? data.user.name : "") + "</strong> (" + esc((data.user && data.user.email) ? data.user.email : "") + ")</div>" +
-          "<div>Submitted: " + (o.createdAt ? esc(new Date(o.createdAt).toLocaleString()) : "") + "</div>" +
-          "<div>Run Date: " + (o.runDate ? esc(new Date(o.runDate).toLocaleDateString()) : "") + "</div>" +
-        "</div>" +
-        "<h3>Stores</h3>" +
-        "<div><strong>Primary:</strong> " + esc(o.primaryStore || "") + "</div>" +
-        "<div><strong>Secondary:</strong> " + esc(o.secondaryStore || "") + "</div>" +
-        "<h3>Add-ons</h3>" +
-        "<div>" + esc(addOnsText) + "</div>" +
-        "<h3>Delivery</h3>" +
-        "<div><strong>Community:</strong> " + esc(o.community || "") + "</div>" +
-        "<div><strong>Address:</strong> " + esc(o.streetAddress || "") + "</div>" +
-        "<div><strong>Phone:</strong> " + esc(o.phone || "") + "</div>" +
-        "<h3>Grocery List</h3>" +
-        "<pre style='white-space:pre-wrap;background:#f6f6f6;border:1px solid #ddd;padding:10px;border-radius:8px;'>" +
-          esc(o.groceryList || "") +
-        "</pre>" +
-        "<h3>Drop-off / Notes</h3>" +
-        "<pre style='white-space:pre-wrap;background:#f6f6f6;border:1px solid #ddd;padding:10px;border-radius:8px;'>" +
-          esc(o.notes || "") +
-        "</pre>";
-    }
-
-    load();
-  })();
-</script>
-</body>
-</html>
-  `);
+  res.type("html").send(
+'<!doctype html>' +
+'<html>' +
+'<head>' +
+'  <meta charset="utf-8" />' +
+'  <title>TGR Admin – Order</title>' +
+'  <meta name="viewport" content="width=device-width, initial-scale=1" />' +
+'  <style>' +
+'    body{font-family:system-ui,Segoe UI,Arial,sans-serif;margin:16px;}' +
+'    pre{white-space:pre-wrap;background:#f6f6f6;border:1px solid #ddd;padding:10px;border-radius:8px;}' +
+'    a{font-weight:700;}' +
+'    .muted{opacity:.75;}' +
+'  </style>' +
+'</head>' +
+'<body>' +
+'  <a href="/admin">← Back to all orders</a>' +
+'  <h2>Order Detail</h2>' +
+'  <div id="out">Loading…</div>' +
+'' +
+'  <script>' +
+'    (function(){' +
+'      var out = document.getElementById("out");' +
+'      function esc(s){' +
+'        return String(s == null ? "" : s).replace(/[&<>"\\\']/g, function(c){' +
+'          return ({"&":"&amp;","<":"&lt;",">":"&gt;","\\"":"&quot;","\\\'":"&#39;"}[c]) || c;' +
+'        });' +
+'      }' +
+'' +
+'      window.onerror = function(msg, src, line, col){' +
+'        out.innerHTML = "<div style=\\"color:#b00\\"><strong>JS error:</strong> " + esc(msg) +' +
+'          " <span class=\\"muted\\">(line " + line + ":" + col + ")</span></div>";' +
+'      };' +
+'' +
+'      var params = new URLSearchParams(location.search);' +
+'      var userId = params.get("userId");' +
+'      var orderId = params.get("orderId");' +
+'' +
+'      if(!userId || !orderId || userId === "undefined" || orderId === "undefined"){' +
+'        out.textContent = "Missing userId or orderId in URL.";' +
+'        return;' +
+'      }' +
+'' +
+'      var url = "/api/admin/orders/" + encodeURIComponent(userId) + "/" + encodeURIComponent(orderId);' +
+'' +
+'      fetch(url, { credentials: "include" })' +
+'        .then(function(r){' +
+'          return r.text().then(function(t){ return { r:r, t:t }; });' +
+'        })' +
+'        .then(function(x){' +
+'          if(!x.r.ok){' +
+'            out.innerHTML = "<div style=\\"color:#b00\\"><strong>API error " + x.r.status + ":</strong></div>" +' +
+'              "<pre>" + esc(x.t.slice(0, 2000)) + "</pre>";' +
+'            return;' +
+'          }' +
+'          var data;' +
+'          try { data = JSON.parse(x.t); } catch(e) {' +
+'            out.innerHTML = "<div style=\\"color:#b00\\"><strong>Expected JSON, got:</strong></div>" +' +
+'              "<pre>" + esc(x.t.slice(0, 2000)) + "</pre>";' +
+'            return;' +
+'          }' +
+'          if(data && data.ok === false){' +
+'            out.textContent = data.error || "Unknown error";' +
+'            return;' +
+'          }' +
+'' +
+'          var o = (data && data.order) ? data.order : {};' +
+'          var add = o.addOns || {};' +
+'          var addOnsText = [];' +
+'          if(add.fastFood) addOnsText.push("Fast Food");' +
+'          if(add.liquor) addOnsText.push("Liquor");' +
+'          if(add.printing) addOnsText.push("Printing");' +
+'          if(add.ride) addOnsText.push("Ride");' +
+'          var addOnsStr = addOnsText.length ? addOnsText.join(", ") : "None";' +
+'' +
+'          var name = (data.user && data.user.name) ? data.user.name : "";' +
+'          var email = (data.user && data.user.email) ? data.user.email : "";' +
+'' +
+'          out.innerHTML =' +
+'            "<div class=\\"muted\\" style=\\"margin:8px 0\\">" +' +
+'              "<div><strong>" + esc(name) + "</strong> (" + esc(email) + ")</div>" +' +
+'              "<div>Submitted: " + (o.createdAt ? esc(new Date(o.createdAt).toLocaleString()) : "") + "</div>" +' +
+'              "<div>Run Date: " + (o.runDate ? esc(new Date(o.runDate).toLocaleDateString()) : "") + "</div>" +' +
+'            "</div>" +' +
+'            "<h3>Stores</h3>" +' +
+'            "<div><strong>Primary:</strong> " + esc(o.primaryStore || "") + "</div>" +' +
+'            "<div><strong>Secondary:</strong> " + esc(o.secondaryStore || "") + "</div>" +' +
+'            "<h3>Add-ons</h3><div>" + esc(addOnsStr) + "</div>" +' +
+'            "<h3>Delivery</h3>" +' +
+'            "<div><strong>Community:</strong> " + esc(o.community || "") + "</div>" +' +
+'            "<div><strong>Address:</strong> " + esc(o.streetAddress || "") + "</div>" +' +
+'            "<div><strong>Phone:</strong> " + esc(o.phone || "") + "</div>" +' +
+'            "<h3>Grocery List</h3><pre>" + esc(o.groceryList || "") + "</pre>" +' +
+'            "<h3>Drop-off / Notes</h3><pre>" + esc(o.notes || "") + "</pre>";' +
+'        })' +
+'        .catch(function(e){' +
+'          out.innerHTML = "<div style=\\"color:#b00\\"><strong>Fetch failed:</strong> " + esc(String(e)) + "</div>";' +
+'        });' +
+'    })();' +
+'  </script>' +
+'</body>' +
+'</html>'
+  );
 });
+
+
 // A simpler “picklist” page: just stores + grocery list + notes (easy to scan)
 app.get("/admin/picklist", requireAdminPage, (req, res) => {
   res.type("html").send(`<!doctype html>
