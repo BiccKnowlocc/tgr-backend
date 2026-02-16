@@ -332,7 +332,7 @@ app.get("/admin", requireAdminPage, (req, res) => {
 
   <script>
     async function load(){
-      const r = await fetch("/api/admin/orders", { credentials:"include" });
+      const r = await fetch("/api/admin/orders/full", { credentials:"include" });
       const data = await r.json().catch(()=>({}));
       if(!r.ok || data.ok===false){
         document.getElementById("out").textContent = data.error || "Error loading orders";
@@ -639,6 +639,8 @@ app.get("/api/admin/orders", requireAdminApi, async (req, res) => {
   }
 });
 
+
+
 // ===== ADMIN API: SINGLE ORDER DETAIL =====
 app.get("/api/admin/orders/:userId/:orderId", requireAdminApi, async (req, res) => {
   try {
@@ -939,18 +941,21 @@ app.get("/admin", requireAdminPage, (req, res) => {
         return;
       }
       const rows = (data.orders || []).map(o => {
-        const viewUrl = "/admin/order?userId=" + encodeURIComponent(o.userId) + "&orderId=" + encodeURIComponent(o.orderId);
-        return \`
-          <tr>
-            <td>\${o.createdAt ? new Date(o.createdAt).toLocaleString() : ""}</td>
-            <td>\${o.userName || ""}</td>
-            <td>\${o.userEmail || ""}</td>
-            <td>\${o.community || ""}</td>
-            <td>\${o.primaryStore || ""}</td>
-            <td>\${o.status || ""}</td>
-            <td><a href="\${viewUrl}">View</a></td>
-          </tr>\`;
-      }).join("");
+  const viewUrl =
+    "/admin/order?userId=" + encodeURIComponent(String(o.userId)) +
+    "&orderId=" + encodeURIComponent(String(o.orderId));
+
+  return `
+    <tr>
+      <td>${o.createdAt ? new Date(o.createdAt).toLocaleString() : ""}</td>
+      <td>${o.userName || ""}</td>
+      <td>${o.userEmail || ""}</td>
+      <td>${o.community || ""}</td>
+      <td>${o.primaryStore || ""}</td>
+      <td>${o.status || ""}</td>
+      <td><a href="${viewUrl}">View</a></td>
+    </tr>`;
+}).join("");
 
       document.getElementById("out").innerHTML = \`
         <table>
@@ -973,85 +978,77 @@ app.get("/admin/order", requireAdminPage, (req, res) => {
   res.type("html").send(`
 <!doctype html>
 <html>
-<head>
-  <meta charset="utf-8" />
-  <title>TGR Admin – Order</title>
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <style>
-    body{font-family:system-ui,Segoe UI,Arial,sans-serif;margin:16px;}
-    pre{white-space:pre-wrap;background:#f6f6f6;border:1px solid #ddd;padding:10px;border-radius:8px;}
-    a{font-weight:700;}
-    .muted{opacity:.75;font-weight:500;}
-  </style>
-</head>
+<head> ... </head>
 <body>
   <a href="/admin">← Back to all orders</a>
   <h2>Order Detail</h2>
   <div id="out">Loading…</div>
 
   <script>
-    const params = new URLSearchParams(location.search);
-    const userId = params.get("userId");
-    const orderId = params.get("orderId");
+    // ✅ PASTE STEP 2 RIGHT HERE (replace your existing script contents)
 
     async function load(){
-      if(!userId || !orderId){
-        document.getElementById("out").textContent = "Missing userId or orderId in URL.";
+      const out = document.getElementById("out");
+
+      const params = new URLSearchParams(location.search);
+      const userId = params.get("userId");
+      const orderId = params.get("orderId");
+
+      if (!userId || !orderId) {
+        out.textContent = "Missing userId or orderId in the URL.";
         return;
       }
-      const r = await fetch("/api/admin/orders/" + encodeURIComponent(userId) + "/" + encodeURIComponent(orderId), { credentials:"include" });
-      const data = await r.json().catch(()=>({}));
-      if(!r.ok || data.ok===false){
-        document.getElementById("out").textContent = data.error || "Error";
+
+      const url = "/api/admin/orders/" + encodeURIComponent(userId) + "/" + encodeURIComponent(orderId);
+
+      let r, text;
+      try {
+        r = await fetch(url, { credentials: "include" });
+        text = await r.text();
+      } catch (e) {
+        out.textContent = "Network error calling admin API: " + String(e);
         return;
       }
-  const o = data.order || {};
 
-// --- ADD-ONS formatting ---
-const a = o.addOns || {};
-const addOnList = []
-  .concat(a.fastFood ? ["Fast food"] : [])
-  .concat(a.liquor ? ["Liquor"] : [])
-  .concat(a.printing ? ["Printing"] : [])
-  .concat(a.ride ? ["Ride"] : []);
-const addOnsText = addOnList.length ? addOnList.join(", ") : "None";
+      if (!r.ok) {
+        out.textContent = "API error " + r.status + ": " + text;
+        return;
+      }
 
-const html =
-  '<div style="margin:8px 0;opacity:.75">' +
-    '<div><strong>' + (data.user && data.user.name ? data.user.name : "") + '</strong> (' + (data.user && data.user.email ? data.user.email : "") + ')</div>' +
-    '<div>Submitted: ' + (o.createdAt ? new Date(o.createdAt).toLocaleString() : "") + '</div>' +
-    '<div>Run Date: ' + (o.runDate ? new Date(o.runDate).toLocaleDateString() : "") + '</div>' +
-  '</div>' +
+      let data;
+      try {
+        data = JSON.parse(text);
+      } catch {
+        out.textContent = "Expected JSON, got:\n\n" + text.slice(0, 500);
+        return;
+      }
 
-  '<h3>Stores</h3>' +
-  '<div><strong>Primary:</strong> ' + (o.primaryStore || "") + '</div>' +
-  '<div><strong>Secondary:</strong> ' + (o.secondaryStore || "") + '</div>' +
+      if (data.ok === false) {
+        out.textContent = data.error || "Unknown error";
+        return;
+      }
 
-  '<h3>Delivery</h3>' +
-  '<div><strong>Community:</strong> ' + (o.community || "") + '</div>' +
-  '<div><strong>Address:</strong> ' + (o.streetAddress || "") + '</div>' +
-  '<div><strong>Phone:</strong> ' + (o.phone || "") + '</div>' +
+      const o = data.order || {};
+      out.innerHTML =
+        "<h3>" + (data.user?.name || "") + " (" + (data.user?.email || "") + ")</h3>" +
+        "<div><strong>Primary store:</strong> " + (o.primaryStore || "") + "</div>" +
+        "<div><strong>Secondary store:</strong> " + (o.secondaryStore || "") + "</div>" +
+        "<h3>Grocery list</h3>" +
+        "<pre style='white-space:pre-wrap;background:#f6f6f6;border:1px solid #ddd;padding:10px;border-radius:8px;'>" +
+          (o.groceryList || "") +
+        "</pre>" +
+        "<h3>Notes</h3>" +
+        "<pre style='white-space:pre-wrap;background:#f6f6f6;border:1px solid #ddd;padding:10px;border-radius:8px;'>" +
+          (o.notes || "") +
+        "</pre>";
+    }
 
-  '<h3>Grocery List</h3>' +
-  '<pre style="white-space:pre-wrap;background:#f6f6f6;border:1px solid #ddd;padding:10px;border-radius:8px;">' +
-    (o.groceryList || "") +
-  '</pre>' +
-
-  '<h3>Notes</h3>' +
-  '<pre style="white-space:pre-wrap;background:#f6f6f6;border:1px solid #ddd;padding:10px;border-radius:8px;">' +
-    (o.notes || "") +
-  '</pre>';
-
-document.getElementById("out").innerHTML = html;
-    
-
-	
+    load();
   </script>
 </body>
 </html>
   `);
 });
-
 // ===== ADMIN UTIL ROUTES (optional, email-based auth) =====
 app.get("/admin/users", requireAdminPage, async (req, res) => {
   const users = await User.find().sort({ createdAt: -1 }).limit(200).lean();
@@ -1133,19 +1130,56 @@ app.get("/admin/packing", requireAdminPage, (req, res) => {
       }
 
       document.getElementById("out").innerHTML = list.map(o => {
-        const created = o.createdAt ? new Date(o.createdAt).toLocaleString() : "";
-        const run = o.runDate ? new Date(o.runDate).toLocaleDateString() : "";
-        return \`
-          <div class="card">
-            <div class="muted">\${created} • Run: <strong>\${run}</strong></div>
-            <div><strong>\${o.userName || ""}</strong> — \${o.community || ""}</div>
-            <div><strong>Primary:</strong> \${o.primaryStore || ""}</div>
-            <div><strong>Secondary:</strong> \${o.secondaryStore || ""}</div>
-            <h4 style="margin:10px 0 6px;">Grocery List</h4>
-            <pre>\${o.groceryList || ""}</pre>
-          </div>
-        \`;
-      }).join("");
+  const created = o.createdAt ? new Date(o.createdAt).toLocaleString() : "";
+  const run = o.runDate ? new Date(o.runDate).toLocaleDateString() : "";
+
+  const addOns = o.addOns || {};
+  const addOnLabels = [];
+  if (addOns.fastFood) addOnLabels.push("Fast Food");
+  if (addOns.liquor) addOnLabels.push("Liquor");
+  if (addOns.printing) addOnLabels.push("Printing");
+  if (addOns.ride) addOnLabels.push("Ride");
+
+  const addOnsText = addOnLabels.length ? addOnLabels.join(", ") : "None";
+
+  const safe = (v) => (v == null ? "" : String(v));
+
+  return `
+    <div class="card">
+      <div class="muted">${created} • Run: <strong>${run}</strong></div>
+
+      <div style="margin:6px 0;">
+        <strong>${safe(o.userName)}</strong>
+        <span class="muted">(${safe(o.userEmail)})</span>
+        — ${safe(o.community)}
+      </div>
+
+      <div><strong>Primary:</strong> ${safe(o.primaryStore)}</div>
+      <div><strong>Secondary:</strong> ${safe(o.secondaryStore)}</div>
+
+      <div style="margin-top:8px;">
+        <div><strong>Address:</strong> ${safe(o.streetAddress)}</div>
+        <div><strong>Phone:</strong> ${safe(o.phone)}</div>
+      </div>
+
+      <div style="margin-top:8px;">
+        <strong>Add-ons:</strong> ${addOnsText}
+      </div>
+
+      <h4 style="margin:12px 0 6px;">Grocery List</h4>
+      <pre>${safe(o.groceryList)}</pre>
+
+      <h4 style="margin:12px 0 6px;">Drop-off / Notes</h4>
+      <pre>${safe(o.notes)}</pre>
+
+      <div style="margin-top:10px;">
+        <a href="/admin/order?userId=${encodeURIComponent(o.userId)}&orderId=${encodeURIComponent(o.orderId)}">
+          View full order →
+        </a>
+      </div>
+    </div>
+  `;
+}).join("");
     }
     load();
   </script>
@@ -1154,6 +1188,47 @@ app.get("/admin/packing", requireAdminPage, (req, res) => {
   `);
 });
 
+
+// ===== ADMIN: PACKING LIST (FULL ORDER FIELDS) =====
+app.get("/api/admin/orders/full", requireAdminApi, async (req, res) => {
+  try {
+    const users = await User.find({}, { email: 1, name: 1, orderHistory: 1 }).lean();
+
+    const orders = [];
+    for (const u of users) {
+      for (const o of (u.orderHistory || [])) {
+        orders.push({
+          userId: u._id,
+          userEmail: u.email,
+          userName: u.name,
+          orderId: o._id,
+
+          createdAt: o.createdAt,
+          runDate: o.runDate,
+
+          community: o.community,
+          streetAddress: o.streetAddress,
+          phone: o.phone,
+
+          primaryStore: o.primaryStore,
+          secondaryStore: o.secondaryStore,
+
+          groceryList: o.groceryList,
+          notes: o.notes,
+
+          addOns: o.addOns || {},
+          status: o.status,
+        });
+      }
+    }
+
+    orders.sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
+    return res.json({ ok: true, orders });
+  } catch (e) {
+    console.error("GET /api/admin/orders/full error:", e);
+    return res.status(500).json({ ok: false, error: "Server error" });
+  }
+});
 
 
 // ===== START SERVER =====
