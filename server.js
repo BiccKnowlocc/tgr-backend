@@ -390,122 +390,107 @@ app.get("/admin", requireAdminPage, (req, res) => {
 
 app.get("/admin/order", requireAdminPage, (req, res) => {
   res.type("html").send(
-'<!doctype html>' +
-'<html>' +
-'<head>' +
-'  <meta charset="utf-8" />' +
-'  <title>TGR Admin – Order</title>' +
-'  <meta name="viewport" content="width=device-width, initial-scale=1" />' +
-'  <style>' +
-'    body{font-family:system-ui,Segoe UI,Arial,sans-serif;margin:16px;}' +
-'    pre{white-space:pre-wrap;background:#f6f6f6;border:1px solid #ddd;padding:10px;border-radius:8px;}' +
-'    a{font-weight:700;}' +
-'    .muted{opacity:.75;}' +
-'  </style>' +
-'</head>' +
-'<body>' +
-'  <a href="/admin">← Back to all orders</a>' +
-'  <h2>Order Detail</h2>' +
-'  <div id="out">Loading…</div>' +
-'' +
-' <script>
-  function esc(s){
-    return String(s ?? "").replace(/[&<>"']/g, function(c){
-      return ({ "&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;" })[c];
-    });
-  }
-
-  function pick(ord, camel, snake){
-    const a = ord && ord[camel];
-    if (a !== undefined && a !== null && String(a).trim() !== "") return a;
-    const b = ord && ord[snake];
-    if (b !== undefined && b !== null && String(b).trim() !== "") return b;
-    return "";
-  }
-
-  async function load(){
-    const out = document.getElementById("out");
-
-    const params = new URLSearchParams(location.search);
-    const userId = params.get("userId");
-    const orderId = params.get("orderId");
-
-    if(!userId || !orderId){
-      out.textContent = "Missing userId or orderId in URL.";
-      return;
-    }
-
-    let r, data;
-    try {
-      r = await fetch("/api/admin/orders/" + encodeURIComponent(userId) + "/" + encodeURIComponent(orderId), {
-        credentials: "include"
-      });
-      data = await r.json().catch(function(){ return {}; });
-    } catch (e) {
-      out.textContent = "Network error: " + String(e);
-      return;
-    }
-
-    if(!r.ok || data.ok === false){
-      out.textContent = (data && data.error) ? data.error : ("Error " + r.status);
-      return;
-    }
-
-    const o = data.order || {};
-
-    const primaryStore   = pick(o, "primaryStore", "primary_store");
-    const secondaryStore = pick(o, "secondaryStore", "secondary_store");
-    const groceryList    = pick(o, "groceryList", "grocery_list");
-    const community      = pick(o, "community", "community");
-    const streetAddress  = pick(o, "streetAddress", "street_address");
-    const phone          = pick(o, "phone", "phone");
-    const notes          = pick(o, "notes", "grocery_notes");
-
-    const add = o.addOns || o.addons || {};
-    const addOnsText = [
-      add.fastFood ? "Fast Food" : null,
-      add.liquor ? "Liquor" : null,
-      add.printing ? "Printing" : null,
-      add.ride ? "Ride" : null
-    ].filter(Boolean).join(", ") || "None";
-
-    out.innerHTML =
-      "<div style='margin:8px 0;opacity:.75'>" +
-        "<div><strong>" + esc((data.user && data.user.name) ? data.user.name : "") + "</strong> (" + esc((data.user && data.user.email) ? data.user.email : "") + ")</div>" +
-        "<div>Submitted: " + esc(o.createdAt ? new Date(o.createdAt).toLocaleString() : "") + "</div>" +
-        "<div>Run Date: " + esc(o.runDate ? new Date(o.runDate).toLocaleDateString() : "") + "</div>" +
-      "</div>" +
-
-      "<h3>Stores</h3>" +
-      "<div><strong>Primary:</strong> " + esc(primaryStore) + "</div>" +
-      "<div><strong>Secondary:</strong> " + esc(secondaryStore) + "</div>" +
-
-      "<h3>Add-ons</h3>" +
-      "<div>" + esc(addOnsText) + "</div>" +
-
-      "<h3>Delivery</h3>" +
-      "<div><strong>Community:</strong> " + esc(community) + "</div>" +
-      "<div><strong>Address:</strong> " + esc(streetAddress) + "</div>" +
-      "<div><strong>Phone:</strong> " + esc(phone) + "</div>" +
-
-      "<h3>Grocery List</h3>" +
-      "<pre style='white-space:pre-wrap;background:#f6f6f6;border:1px solid #ddd;padding:10px;border-radius:8px;'>" +
-        esc(groceryList) +
-      "</pre>" +
-
-      "<h3>Drop-off / Notes</h3>" +
-      "<pre style='white-space:pre-wrap;background:#f6f6f6;border:1px solid #ddd;padding:10px;border-radius:8px;'>" +
-        esc(notes) +
-      "</pre>";
-  }
-
-  load();
-</script>
-'</body>' +
-'</html>'
+    '<!doctype html>' +
+    '<html>' +
+    '<head>' +
+    '  <meta charset="utf-8" />' +
+    '  <title>TGR Admin – Order</title>' +
+    '  <meta name="viewport" content="width=device-width, initial-scale=1" />' +
+    '  <style>' +
+    '    body{font-family:system-ui,Segoe UI,Arial,sans-serif;margin:16px;}' +
+    '    pre{white-space:pre-wrap;background:#f6f6f6;border:1px solid #ddd;padding:10px;border-radius:8px;}' +
+    '    a{font-weight:700;}' +
+    '    .muted{opacity:.75;}' +
+    '  </style>' +
+    '</head>' +
+    '<body>' +
+    '  <a href="/admin">← Back to all orders</a>' +
+    '  <h2>Order Detail</h2>' +
+    '  <div id="out">Loading…</div>' +
+    '' +
+    '  <script>' +
+    '    function esc(s){' +
+    '      return String(s ?? "").replace(/[&<>"\\\']/g, function(c){' +
+    '        return ({ "&":"&amp;","<":"&lt;",">":"&gt;","\\"":"&quot;","\\\'":"&#39;" })[c];' +
+    '      });' +
+    '    }' +
+    '' +
+    '    async function load(){' +
+    '      const out = document.getElementById("out");' +
+    '      const params = new URLSearchParams(location.search);' +
+    '      const userId = params.get("userId");' +
+    '      const orderId = params.get("orderId");' +
+    '' +
+    '      if(!userId || !orderId){' +
+    '        out.textContent = "Missing userId or orderId in URL.";' +
+    '        return;' +
+    '      }' +
+    '' +
+    '      let r, text;' +
+    '      try {' +
+    '        r = await fetch("/api/admin/orders/" + encodeURIComponent(userId) + "/" + encodeURIComponent(orderId), { credentials:"include" });' +
+    '        text = await r.text();' +
+    '      } catch (e) {' +
+    '        out.textContent = "Network error: " + String(e);' +
+    '        return;' +
+    '      }' +
+    '' +
+    '      if(!r.ok){' +
+    '        out.textContent = "API error " + r.status + ": " + text.slice(0, 800);' +
+    '        return;' +
+    '      }' +
+    '' +
+    '      let data = {};' +
+    '      try { data = JSON.parse(text); } catch { data = { _raw: text }; }' +
+    '' +
+    '      if(data.ok === false){' +
+    '        out.textContent = data.error || "Error";' +
+    '        return;' +
+    '      }' +
+    '' +
+    '      const o = data.order || {};' +
+    '      const add = o.addOns || o.addons || {};' +
+    '      const addOnsText = [' +
+    '        add.fastFood ? "Fast Food" : null,' +
+    '        add.liquor ? "Liquor" : null,' +
+    '        add.printing ? "Printing" : null,' +
+    '        add.ride ? "Ride" : null' +
+    '      ].filter(Boolean).join(", ") || "None";' +
+    '' +
+    '      var html = "";' +
+    '      html += "<div class=\\"muted\\" style=\\"margin:8px 0\\">";' +
+    '      html += "<div><strong>" + esc((data.user && data.user.name) ? data.user.name : "") + "</strong> (" + esc((data.user && data.user.email) ? data.user.email : "") + ")</div>";' +
+    '      html += "<div>Submitted: " + esc(o.createdAt ? new Date(o.createdAt).toLocaleString() : "") + "</div>";' +
+    '      html += "<div>Run Date: " + esc(o.runDate ? new Date(o.runDate).toLocaleDateString() : "") + "</div>";' +
+    '      html += "</div>";' +
+    '' +
+    '      html += "<h3>Stores</h3>";' +
+    '      html += "<div><strong>Primary:</strong> " + esc(o.primaryStore || o.primary_store || "") + "</div>";' +
+    '      html += "<div><strong>Secondary:</strong> " + esc(o.secondaryStore || o.secondary_store || "") + "</div>";' +
+    '' +
+    '      html += "<h3>Add-ons</h3>";' +
+    '      html += "<div>" + esc(addOnsText) + "</div>";' +
+    '' +
+    '      html += "<h3>Delivery</h3>";' +
+    '      html += "<div><strong>Community:</strong> " + esc(o.community || "") + "</div>";' +
+    '      html += "<div><strong>Address:</strong> " + esc(o.streetAddress || o.street_address || "") + "</div>";' +
+    '      html += "<div><strong>Phone:</strong> " + esc(o.phone || "") + "</div>";' +
+    '' +
+    '      html += "<h3>Grocery List</h3>";' +
+    '      html += "<pre>" + esc(o.groceryList || o.grocery_list || "") + "</pre>";' +
+    '' +
+    '      html += "<h3>Drop-off / Notes</h3>";' +
+    '      html += "<pre>" + esc(o.notes || o.grocery_notes || "") + "</pre>";' +
+    '' +
+    '      out.innerHTML = html;' +
+    '    }' +
+    '' +
+    '    load();' +
+    '  </script>' +
+    '</body>' +
+    '</html>'
   );
 });
-
 
 // A simpler “picklist” page: just stores + grocery list + notes (easy to scan)
 app.get("/admin/picklist", requireAdminPage, (req, res) => {
@@ -534,141 +519,138 @@ app.get("/admin/picklist", requireAdminPage, (req, res) => {
 
   <div id="out">Loading…</div>
 
- <script>
-  function esc(s){
-    return String(s ?? "").replace(/[&<>"']/g, function(c){
-      return ({ "&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;" })[c];
-    });
-  }
-
-  function pick(ord, camel, snake){
-    const a = ord && ord[camel];
-    if (a !== undefined && a !== null && String(a).trim() !== "") return a;
-    const b = ord && ord[snake];
-    if (b !== undefined && b !== null && String(b).trim() !== "") return b;
-    return "";
-  }
-
-  async function fetchJsonWithTimeout(url, ms){
-    const controller = new AbortController();
-    const t = setTimeout(function(){ controller.abort(); }, ms);
-    try {
-      const r = await fetch(url, { credentials: "include", signal: controller.signal });
-      const text = await r.text();
-      let data = {};
-      try { data = JSON.parse(text); } catch { data = { _raw: text }; }
-      return { r: r, data: data };
-    } finally {
-      clearTimeout(t);
-    }
-  }
-
-  async function load(){
-    const out = document.getElementById("out");
-    out.textContent = "Loading…";
-
-    let first;
-    try {
-      first = await fetchJsonWithTimeout("/api/admin/orders", 8000);
-    } catch (e) {
-      out.textContent = "Failed to load /api/admin/orders: " + String(e);
-      return;
+  <script>
+    function esc(s){
+      return String(s ?? "").replace(/[&<>"']/g, function(c){
+        return ({ "&":"&amp;","<":"&lt;",">":"&gt;","\\"":"&quot;","'":"&#39;" })[c];
+      });
     }
 
-    if (!first.r.ok || first.data.ok === false){
-      out.textContent =
-        "Orders API error (" + first.r.status + "): " +
-        (first.data && (first.data.error || first.data._raw) ? (first.data.error || first.data._raw).slice(0, 300) : "Unknown");
-      return;
+    function pick(ord, camel, snake){
+      const a = ord && ord[camel];
+      if (a !== undefined && a !== null && String(a).trim() !== "") return a;
+      const b = ord && ord[snake];
+      if (b !== undefined && b !== null && String(b).trim() !== "") return b;
+      return "";
     }
 
-    const orders = first.data.orders || [];
-    if (!orders.length){
-      out.innerHTML = "<div class='muted'>No orders found.</div>";
-      return;
-    }
-
-    var html = "";
-
-    for (var i = 0; i < orders.length; i++){
-      out.textContent = "Loading " + (i+1) + " / " + orders.length + "…";
-
-      var o = orders[i];
-      var detailUrl =
-        "/api/admin/orders/" +
-        encodeURIComponent(String(o.userId)) + "/" +
-        encodeURIComponent(String(o.orderId));
-
-      let detail;
+    async function fetchJsonWithTimeout(url, ms){
+      const controller = new AbortController();
+      const t = setTimeout(function(){ controller.abort(); }, ms);
       try {
-        detail = await fetchJsonWithTimeout(detailUrl, 8000);
-      } catch (e) {
-        // show which one failed, but keep going
-        html += "<div class='card'><div class='muted'>Skipped an order (timeout/error): " + esc(String(e)) + "</div></div>";
-        continue;
+        const r = await fetch(url, { credentials: "include", signal: controller.signal });
+        const text = await r.text();
+        let data = {};
+        try { data = JSON.parse(text); } catch { data = { _raw: text }; }
+        return { r: r, data: data };
+      } finally {
+        clearTimeout(t);
       }
-
-      if (!detail.r.ok || detail.data.ok === false){
-        html += "<div class='card'><div class='muted'>Skipped an order (API " + detail.r.status + "): " +
-          esc(detail.data && (detail.data.error || detail.data._raw) ? (detail.data.error || detail.data._raw).slice(0, 200) : "Unknown") +
-          "</div></div>";
-        continue;
-      }
-
-      var ord = detail.data.order || {};
-
-      var primaryStore   = pick(ord, "primaryStore", "primary_store");
-      var secondaryStore = pick(ord, "secondaryStore", "secondary_store");
-      var groceryList    = pick(ord, "groceryList", "grocery_list");
-      var community      = pick(ord, "community", "community");
-      var streetAddress  = pick(ord, "streetAddress", "street_address");
-      var phone          = pick(ord, "phone", "phone");
-      var notes          = pick(ord, "notes", "grocery_notes");
-
-      var add = ord.addOns || ord.addons || {};
-      var addOnsText = [
-        add.fastFood ? "Fast Food" : null,
-        add.liquor ? "Liquor" : null,
-        add.printing ? "Printing" : null,
-        add.ride ? "Ride" : null
-      ].filter(Boolean).join(", ") || "None";
-
-      html +=
-        "<div class='card'>" +
-          "<div class='hdr'>" +
-            "<div><strong>" + esc((detail.data.user && detail.data.user.name) ? detail.data.user.name : "") + "</strong> " +
-            "<span class='muted'>(" + esc((detail.data.user && detail.data.user.email) ? detail.data.user.email : "") + ")</span></div>" +
-            "<div class='muted'>" + esc(ord.createdAt ? new Date(ord.createdAt).toLocaleString() : "") + "</div>" +
-          "</div>" +
-
-          "<div><strong>Primary store:</strong> " + esc(primaryStore) + "</div>" +
-          "<div><strong>Secondary store:</strong> " + esc(secondaryStore) + "</div>" +
-
-          "<div><strong>Community:</strong> " + esc(community) + "</div>" +
-          "<div><strong>Address:</strong> " + esc(streetAddress) + "</div>" +
-          "<div><strong>Phone:</strong> " + esc(phone) + "</div>" +
-
-          "<div style='margin-top:8px'><strong>Add-ons:</strong> " + esc(addOnsText) + "</div>" +
-
-          "<div style='margin-top:8px'><strong>Grocery list:</strong></div>" +
-          "<pre class='mono'>" + esc(groceryList) + "</pre>" +
-
-          (notes ? ("<div style='margin-top:8px'><strong>Drop-off / Notes:</strong></div><pre class='mono'>" + esc(notes) + "</pre>") : "") +
-        "</div>";
     }
 
-    out.innerHTML = html || "<div class='muted'>No orders found.</div>";
-  }
+    async function load(){
+      const out = document.getElementById("out");
+      out.textContent = "Loading…";
 
-  load().catch(function(e){
-    var out = document.getElementById("out");
-    out.textContent = "Picklist crashed: " + String(e);
-  });
-</script>
+      let first;
+      try {
+        first = await fetchJsonWithTimeout("/api/admin/orders", 8000);
+      } catch (e) {
+        out.textContent = "Failed to load /api/admin/orders: " + String(e);
+        return;
+      }
+
+      if (!first.r.ok || first.data.ok === false){
+        out.textContent =
+          "Orders API error (" + first.r.status + "): " +
+          (first.data && (first.data.error || first.data._raw) ? (first.data.error || first.data._raw).slice(0, 300) : "Unknown");
+        return;
+      }
+
+      const orders = first.data.orders || [];
+      if (!orders.length){
+        out.innerHTML = "<div class='muted'>No orders found.</div>";
+        return;
+      }
+
+      var html = "";
+
+      for (var i = 0; i < orders.length; i++){
+        out.textContent = "Loading " + (i+1) + " / " + orders.length + "…";
+
+        var o = orders[i];
+        var detailUrl =
+          "/api/admin/orders/" +
+          encodeURIComponent(String(o.userId)) + "/" +
+          encodeURIComponent(String(o.orderId));
+
+        let detail;
+        try {
+          detail = await fetchJsonWithTimeout(detailUrl, 8000);
+        } catch (e) {
+          html += "<div class='card'><div class='muted'>Skipped an order (timeout/error): " + esc(String(e)) + "</div></div>";
+          continue;
+        }
+
+        if (!detail.r.ok || detail.data.ok === false){
+          html += "<div class='card'><div class='muted'>Skipped an order (API " + detail.r.status + "): " +
+            esc(detail.data && (detail.data.error || detail.data._raw) ? (detail.data.error || detail.data._raw).slice(0, 200) : "Unknown") +
+            "</div></div>";
+          continue;
+        }
+
+        var ord = detail.data.order || {};
+
+        var primaryStore   = pick(ord, "primaryStore", "primary_store");
+        var secondaryStore = pick(ord, "secondaryStore", "secondary_store");
+        var groceryList    = pick(ord, "groceryList", "grocery_list");
+        var community      = pick(ord, "community", "community");
+        var streetAddress  = pick(ord, "streetAddress", "street_address");
+        var phone          = pick(ord, "phone", "phone");
+        var notes          = pick(ord, "notes", "grocery_notes");
+
+        var add = ord.addOns || ord.addons || {};
+        var addOnsText = [
+          add.fastFood ? "Fast Food" : null,
+          add.liquor ? "Liquor" : null,
+          add.printing ? "Printing" : null,
+          add.ride ? "Ride" : null
+        ].filter(Boolean).join(", ") || "None";
+
+        html +=
+          "<div class='card'>" +
+            "<div class='hdr'>" +
+              "<div><strong>" + esc((detail.data.user && detail.data.user.name) ? detail.data.user.name : "") + "</strong> " +
+              "<span class='muted'>(" + esc((detail.data.user && detail.data.user.email) ? detail.data.user.email : "") + ")</span></div>" +
+              "<div class='muted'>" + esc(ord.createdAt ? new Date(ord.createdAt).toLocaleString() : "") + "</div>" +
+            "</div>" +
+
+            "<div><strong>Primary store:</strong> " + esc(primaryStore) + "</div>" +
+            "<div><strong>Secondary store:</strong> " + esc(secondaryStore) + "</div>" +
+
+            "<div><strong>Community:</strong> " + esc(community) + "</div>" +
+            "<div><strong>Address:</strong> " + esc(streetAddress) + "</div>" +
+            "<div><strong>Phone:</strong> " + esc(phone) + "</div>" +
+
+            "<div style='margin-top:8px'><strong>Add-ons:</strong> " + esc(addOnsText) + "</div>" +
+
+            "<div style='margin-top:8px'><strong>Grocery list:</strong></div>" +
+            "<pre class='mono'>" + esc(groceryList) + "</pre>" +
+
+            (notes ? ("<div style='margin-top:8px'><strong>Drop-off / Notes:</strong></div><pre class='mono'>" + esc(notes) + "</pre>") : "") +
+          "</div>";
+      }
+
+      out.innerHTML = html || "<div class='muted'>No orders found.</div>";
+    }
+
+    load().catch(function(e){
+      document.getElementById("out").textContent = "Picklist crashed: " + String(e);
+    });
+  </script>
 </body>
 </html>`);
 });
-
 
 
 // ===== ORDER HISTORY: SAVE ORDER (AUTH REQUIRED) =====
