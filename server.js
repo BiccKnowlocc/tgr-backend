@@ -295,6 +295,208 @@ app.get("/api/me", (req, res) => {
   });
 });
 
+// =========================
+// ADMIN HTML PAGES
+// Paste this AFTER /api/me
+// Requires: requireAdminPage (and ADMIN_EMAILS/isAdminUser helpers) already defined above.
+// =========================
+
+app.get("/admin", requireAdminPage, (req, res) => {
+  res.type("html").send(`<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>TGR Admin – Orders</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <style>
+    body{font-family:system-ui,Segoe UI,Arial,sans-serif;margin:16px;}
+    table{width:100%;border-collapse:collapse;}
+    th,td{border-bottom:1px solid #ddd;padding:8px;text-align:left;font-size:14px;vertical-align:top;}
+    th{background:#f5f5f5;}
+    a{font-weight:700;}
+    .top{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:10px;}
+    .muted{opacity:.75;font-weight:500;}
+    .pill{display:inline-block;padding:3px 10px;border:1px solid #ddd;border-radius:999px;font-size:12px;}
+  </style>
+</head>
+<body>
+  <div class="top">
+    <h2 style="margin:0;">Admin Orders</h2>
+    <a href="/member">Member</a>
+    <a href="/admin/picklist">Picklist</a>
+    <a href="/logout?returnTo=https%3A%2F%2Ftobermorygroceryrun.ca%2F">Logout</a>
+    <span class="pill">Signed in as: ${(req.user?.email || "")}</span>
+  </div>
+
+  <div id="out">Loading…</div>
+
+  <script>
+    async function load(){
+      const r = await fetch("/api/admin/orders", { credentials:"include" });
+      const data = await r.json().catch(()=>({}));
+      if(!r.ok || data.ok===false){
+        document.getElementById("out").textContent = data.error || "Error loading orders";
+        return;
+      }
+
+      const rows = (data.orders || []).map(o => {
+        const viewUrl =
+          "/admin/order?userId=" + encodeURIComponent(o.userId) +
+          "&orderId=" + encodeURIComponent(o.orderId);
+
+        return \`
+          <tr>
+            <td>\${o.createdAt ? new Date(o.createdAt).toLocaleString() : ""}</td>
+            <td>\${o.userName || ""}<div class="muted">\${o.userEmail || ""}</div></td>
+            <td>\${o.community || ""}</td>
+            <td>\${o.primaryStore || ""}</td>
+            <td>\${o.status || ""}</td>
+            <td><a href="\${viewUrl}">View</a></td>
+          </tr>\`;
+      }).join("");
+
+      document.getElementById("out").innerHTML = \`
+        <table>
+          <thead>
+            <tr>
+              <th>Created</th><th>User</th><th>Community</th><th>Store</th><th>Status</th><th></th>
+            </tr>
+          </thead>
+          <tbody>\${rows || '<tr><td colspan="6" class="muted">No orders found.</td></tr>'}</tbody>
+        </table>\`;
+    }
+    load();
+  </script>
+</body>
+</html>`);
+});
+
+app.get("/admin/order", requireAdminPage, (req, res) => {
+  res.type("html").send(`<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>TGR Admin – Order</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <style>
+    body{font-family:system-ui,Segoe UI,Arial,sans-serif;margin:16px;}
+    pre{white-space:pre-wrap;background:#f6f6f6;border:1px solid #ddd;padding:10px;border-radius:8px;}
+    a{font-weight:700;}
+    .muted{opacity:.75;font-weight:500;}
+  </style>
+</head>
+<body>
+  <a href="/admin">← Back to all orders</a>
+  <h2>Order Detail</h2>
+  <div id="meta" class="muted"></div>
+  <div id="out">Loading…</div>
+
+  <script>
+    const params = new URLSearchParams(location.search);
+    const userId = params.get("userId");
+    const orderId = params.get("orderId");
+
+    async function load(){
+      if(!userId || !orderId){
+        document.getElementById("out").textContent = "Missing userId or orderId in URL.";
+        return;
+      }
+
+      const url = "/api/admin/orders/" + encodeURIComponent(userId) + "/" + encodeURIComponent(orderId);
+      const r = await fetch(url, { credentials:"include" });
+      const data = await r.json().catch(()=>({}));
+
+      if(!r.ok || data.ok===false){
+        document.getElementById("out").textContent = data.error || "Error";
+        return;
+      }
+
+      document.getElementById("meta").textContent =
+        (data.user?.name || "") + " • " + (data.user?.email || "");
+
+      // Shows the FULL stored order object
+      document.getElementById("out").innerHTML =
+        "<pre>" + JSON.stringify(data.order, null, 2) + "</pre>";
+    }
+    load();
+  </script>
+</body>
+</html>`);
+});
+
+// A simpler “picklist” page: just stores + grocery list + notes (easy to scan)
+app.get("/admin/picklist", requireAdminPage, (req, res) => {
+  res.type("html").send(`<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>TGR Admin – Picklist</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <style>
+    body{font-family:system-ui,Segoe UI,Arial,sans-serif;margin:16px;}
+    .top{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:10px;}
+    .card{border:1px solid #ddd;border-radius:10px;padding:10px;margin:10px 0;}
+    .muted{opacity:.75}
+    .hdr{display:flex;justify-content:space-between;gap:10px;flex-wrap:wrap}
+    .mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;white-space:pre-wrap}
+  </style>
+</head>
+<body>
+  <div class="top">
+    <h2 style="margin:0;">Picklist</h2>
+    <a href="/admin">All Orders</a>
+    <a href="/member">Member</a>
+    <a href="/logout?returnTo=https%3A%2F%2Ftobermorygroceryrun.ca%2F">Logout</a>
+  </div>
+
+  <div id="out">Loading…</div>
+
+  <script>
+    async function load(){
+      const r = await fetch("/api/admin/orders", { credentials:"include" });
+      const data = await r.json().catch(()=>({}));
+      if(!r.ok || data.ok===false){
+        document.getElementById("out").textContent = data.error || "Error loading orders";
+        return;
+      }
+
+      // For picklist we need FULL details, so we fetch each order detail.
+      const orders = data.orders || [];
+      const chunks = [];
+
+      for (const o of orders) {
+        const url = "/api/admin/orders/" + encodeURIComponent(o.userId) + "/" + encodeURIComponent(o.orderId);
+        const rr = await fetch(url, { credentials:"include" });
+        const dd = await rr.json().catch(()=>({}));
+        if(!rr.ok || dd.ok===false) continue;
+
+        const ord = dd.order || {};
+        chunks.push(\`
+          <div class="card">
+            <div class="hdr">
+              <div><strong>\${dd.user?.name || ""}</strong> <span class="muted">(\${dd.user?.email || ""})</span></div>
+              <div class="muted">\${ord.createdAt ? new Date(ord.createdAt).toLocaleString() : ""}</div>
+            </div>
+            <div><strong>Primary store:</strong> \${ord.primaryStore || ""}</div>
+            <div><strong>Secondary store:</strong> \${ord.secondaryStore || ""}</div>
+            <div><strong>Community:</strong> \${ord.community || ""}</div>
+            <div><strong>Address:</strong> \${ord.streetAddress || ""}</div>
+            <div style="margin-top:8px"><strong>Grocery list:</strong></div>
+            <div class="mono">\${(ord.groceryList || "").replace(/</g,"&lt;")}</div>
+            \${ord.notes ? \`<div style="margin-top:8px"><strong>Notes:</strong> <span class="mono">\${String(ord.notes).replace(/</g,"&lt;")}</span></div>\` : ""}
+          </div>\`);
+      }
+
+      document.getElementById("out").innerHTML = chunks.join("") || "<div class='muted'>No orders found.</div>";
+    }
+    load();
+  </script>
+</body>
+</html>`);
+});
+
+
+
 // ===== ORDER HISTORY: SAVE ORDER (AUTH REQUIRED) =====
 app.post("/api/orders", requireAuth, async (req, res) => {
   try {
@@ -367,16 +569,30 @@ app.get("/api/admin/orders", requireAdminApi, async (req, res) => {
     for (const u of users) {
       for (const o of u.orderHistory || []) {
         orders.push({
-          userId: u._id,
-          userEmail: u.email,
-          userName: u.name,
-          orderId: o._id,
-          createdAt: o.createdAt,
-          runDate: o.runDate,
-          community: o.community,
-          primaryStore: o.primaryStore,
-          status: o.status,
-        });
+  userId: u._id,
+  userEmail: u.email,
+  userName: u.name,
+  orderId: o._id,
+
+  createdAt: o.createdAt,
+  runDate: o.runDate,
+  payDeadline: o.payDeadline,
+  listDeadline: o.listDeadline,
+  followingRun: o.followingRun,
+
+  community: o.community,
+  streetAddress: o.streetAddress,
+  phone: o.phone,
+
+  primaryStore: o.primaryStore,
+  secondaryStore: o.secondaryStore,
+
+  groceryList: o.groceryList,
+  notes: o.notes,
+  addOns: o.addOns,
+
+  status: o.status,
+});
       }
     }
 
@@ -754,9 +970,33 @@ app.get("/admin/order", requireAdminPage, (req, res) => {
         document.getElementById("out").textContent = data.error || "Error";
         return;
       }
-      document.getElementById("out").innerHTML =
-        "<div class='muted'>" + (data.user?.email || "") + "</div>" +
-        "<pre>" + JSON.stringify(data.order, null, 2) + "</pre>";
+   const o = data.order || {};
+const html = `
+  <div style="margin:8px 0;opacity:.75">
+    <div><strong>${data.user?.name || ""}</strong> (${data.user?.email || ""})</div>
+    <div>Submitted: ${o.createdAt ? new Date(o.createdAt).toLocaleString() : ""}</div>
+    <div>Run Date: ${o.runDate ? new Date(o.runDate).toLocaleDateString() : ""}</div>
+  </div>
+
+  <h3>Stores</h3>
+  <div><strong>Primary:</strong> ${o.primaryStore || ""}</div>
+  <div><strong>Secondary:</strong> ${o.secondaryStore || ""}</div>
+
+  <h3>Delivery</h3>
+  <div><strong>Community:</strong> ${o.community || ""}</div>
+  <div><strong>Address:</strong> ${o.streetAddress || ""}</div>
+  <div><strong>Phone:</strong> ${o.phone || ""}</div>
+
+  <h3>Grocery List</h3>
+  <pre>${o.groceryList || ""}</pre>
+
+  <h3>Notes</h3>
+  <pre>${o.notes || ""}</pre>
+
+  <h3>Add-ons</h3>
+  <pre>${JSON.stringify(o.addOns || {}, null, 2)}</pre>
+`;
+document.getElementById("out").innerHTML = html;
     }
     load();
   </script>
@@ -797,8 +1037,71 @@ app.get("/admin/set-membership", requireAdminPage, async (req, res) => {
     <p>Status: ${user.membershipStatus}</p>
     <p>Level: ${user.membershipLevel}</p>
     <p>Renewal: ${user.renewalDate ? new Date(user.renewalDate).toLocaleDateString("en-CA") : "N/A"}</p>
+ 
+
+app.get("/admin/packing", requireAdminPage, (req, res) => {
+  res.type("html").send(`
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>TGR Admin – Packing List</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <style>
+    body{font-family:system-ui,Segoe UI,Arial,sans-serif;margin:16px;}
+    .top{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:12px;}
+    .card{border:1px solid #ddd;border-radius:10px;padding:12px;margin:10px 0;}
+    pre{white-space:pre-wrap;background:#f6f6f6;border:1px solid #ddd;padding:10px;border-radius:8px;}
+    .muted{opacity:.75}
+  </style>
+</head>
+<body>
+  <div class="top">
+    <h2 style="margin:0;">Packing List</h2>
+    <a href="/admin">All Orders</a>
+    <a href="/logout?returnTo=https%3A%2F%2Ftobermorygroceryrun.ca%2F">Logout</a>
+  </div>
+
+  <div id="out">Loading…</div>
+
+  <script>
+    async function load(){
+      const r = await fetch("/api/admin/orders", { credentials:"include" });
+      const data = await r.json().catch(()=>({}));
+      if(!r.ok || data.ok===false){
+        document.getElementById("out").textContent = data.error || "Error loading orders";
+        return;
+      }
+
+      const list = (data.orders || []);
+      if(!list.length){
+        document.getElementById("out").textContent = "No orders found.";
+        return;
+      }
+
+      document.getElementById("out").innerHTML = list.map(o => {
+        const created = o.createdAt ? new Date(o.createdAt).toLocaleString() : "";
+        const run = o.runDate ? new Date(o.runDate).toLocaleDateString() : "";
+        return \`
+          <div class="card">
+            <div class="muted">\${created} • Run: <strong>\${run}</strong></div>
+            <div><strong>\${o.userName || ""}</strong> — \${o.community || ""}</div>
+            <div><strong>Primary:</strong> \${o.primaryStore || ""}</div>
+            <div><strong>Secondary:</strong> \${o.secondaryStore || ""}</div>
+            <h4 style="margin:10px 0 6px;">Grocery List</h4>
+            <pre>\${o.groceryList || ""}</pre>
+          </div>
+        \`;
+      }).join("");
+    }
+    load();
+  </script>
+</body>
+</html>
   `);
 });
+
+
 
 // ===== START SERVER =====
 const PORT = process.env.PORT || 3000;
