@@ -505,34 +505,95 @@ app.get("/admin/picklist", requireAdminPage, (req, res) => {
         return;
       }
 
-      // For picklist we need FULL details, so we fetch each order detail.
+     // For picklist we need FULL details, so we fetch each order detail.
       const orders = data.orders || [];
+      const out = document.getElementById("out");
+
+      function esc(s){
+        return String(s ?? "").replace(/[&<>"']/g, (c) => ({
+          "&":"&amp;","<":"&lt;",">":"&gt;","\\"":"&quot;","'":"&#39;"
+        }[c]));
+      }
+
+      function pickField(ord, camel, snake){
+        const a = ord && ord[camel];
+        if (a !== undefined && a !== null && String(a).trim() !== "") return a;
+        const b = ord && ord[snake];
+        if (b !== undefined && b !== null && String(b).trim() !== "") return b;
+        return "";
+      }
+
+      async function fetchWithTimeout(url, ms = 8000){
+        const controller = new AbortController();
+        const t = setTimeout(() => controller.abort(), ms);
+        try {
+          const r = await fetch(url, { credentials:"include", signal: controller.signal });
+          return r;
+        } finally {
+          clearTimeout(t);
+        }
+      }
+
       const chunks = [];
 
       for (const o of orders) {
-        const url = "/api/admin/orders/" + encodeURIComponent(o.userId) + "/" + encodeURIComponent(o.orderId);
-        const rr = await fetch(url, { credentials:"include" });
-        const dd = await rr.json().catch(()=>({}));
+        const url = "/api/admin/orders/" + encodeURIComponent(String(o.userId)) + "/" + encodeURIComponent(String(o.orderId));
+
+        let rr, dd;
+        try {
+          rr = await fetchWithTimeout(url, 8000);
+          dd = await rr.json().catch(()=>({}));
+        } catch (e) {
+          continue;
+        }
         if(!rr.ok || dd.ok===false) continue;
 
         const ord = dd.order || {};
-        chunks.push(\`
-          <div class="card">
-            <div class="hdr">
-              <div><strong>\${dd.user?.name || ""}</strong> <span class="muted">(\${dd.user?.email || ""})</span></div>
-              <div class="muted">\${ord.createdAt ? new Date(ord.createdAt).toLocaleString() : ""}</div>
-            </div>
-            <div><strong>Primary store:</strong> \${ord.primaryStore || ""}</div>
-            <div><strong>Secondary store:</strong> \${ord.secondaryStore || ""}</div>
-            <div><strong>Community:</strong> \${ord.community || ""}</div>
-            <div><strong>Address:</strong> \${ord.streetAddress || ""}</div>
-            <div style="margin-top:8px"><strong>Grocery list:</strong></div>
-            <div class="mono">\${(ord.groceryList || "").replace(/</g,"&lt;")}</div>
-            \${ord.notes ? \`<div style="margin-top:8px"><strong>Notes:</strong> <span class="mono">\${String(ord.notes).replace(/</g,"&lt;")}</span></div>\` : ""}
-          </div>\`);
-      }
 
-      document.getElementById("out").innerHTML = chunks.join("") || "<div class='muted'>No orders found.</div>";
+        // Normalize old/new field names
+        const primaryStore   = pickField(ord, "primaryStore", "primary_store");
+        const secondaryStore = pickField(ord, "secondaryStore", "secondary_store");
+        const groceryList    = pickField(ord, "groceryList", "grocery_list");
+        const community      = pickField(ord, "community", "community");
+        const streetAddress  = pickField(ord, "streetAddress", "street_address");
+        const phone          = pickField(ord, "phone", "phone");
+        const notes          = pickField(ord, "notes", "grocery_notes");
+
+        const add = ord.addOns || ord.addons || {};
+        const addOnsText = [
+          add.fastFood ? "Fast Food" : null,
+          add.liquor ? "Liquor" : null,
+          add.printing ? "Printing" : null,
+          add.ride ? "Ride" : null,
+        ].filter(Boolean).join(", ") || "None";
+
+ chunks.push(
+          "<div class='card'>" +
+            "<div class='hdr'>" +
+              "<div><strong>" + esc(dd.user?.name || "") + "</strong> <span class='muted'>(" + esc(dd.user?.email || "") + ")</span></div>" +
+              "<div class='muted'>" + (ord.createdAt ? esc(new Date(ord.createdAt).toLocaleString()) : "") + "</div>" +
+            "</div>" +
+
+            "<div><strong>Primary store:</strong> " + esc(primaryStore) + "</div>" +
+            "<div><strong>Secondary store:</strong> " + esc(secondaryStore) + "</div>" +
+
+            "<div><strong>Community:</strong> " + esc(community) + "</div>" +
+            "<div><strong>Address:</strong> " + esc(streetAddress) + "</div>" +
+            "<div><strong>Phone:</strong> " + esc(phone) + "</div>" +
+
+            "<div style='margin-top:8px'><strong>Add-ons:</strong> " + esc(addOnsText) + "</div>" +
+
+            "<div style='margin-top:8px'><strong>Grocery list:</strong></div>" +
+            "<pre class='mono'>" + esc(groceryList) + "</pre>" +
+
+            (notes
+              ? "<div style='margin-top:8px'><strong>Drop-off / Notes:</strong></div><pre class='mono'>" + esc(notes) + "</pre>"
+              : ""
+            ) +
+          "</div>"
+        );
+
+      out.innerHTML = chunks.join("") || "<div class='muted'>No orders found.</div>";
     }
     load();
   </script>
@@ -588,6 +649,9 @@ app.post("/api/orders", requireAuth, async (req, res) => {
       status: "submitted",
       addOns,
     };
+
+
+
 
     const user = await User.findById(req.user._id);
     if (!user) return res.status(404).json({ ok: false, error: "User not found" });
@@ -1004,17 +1068,36 @@ out.innerHTML =
 });
 
 app.get("/admin/order", requireAdminPage, (req, res) => {
-  res.type("html").send(`
-<!doctype html>
+  res.type("html").send(`<!doctype html>
 <html>
-<head> ... </head>
+<head>
+  <meta charset="utf-8" />
+  <title>TGR Admin – Order Detail</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <style>
+    body{font-family:system-ui,Segoe UI,Arial,sans-serif;margin:16px;}
+    a{font-weight:700;}
+    .muted{opacity:.75}
+    pre{white-space:pre-wrap;background:#f6f6f6;border:1px solid #ddd;padding:10px;border-radius:8px;}
+    .row{margin:6px 0}
+    .pill{display:inline-block;padding:3px 10px;border:1px solid #ddd;border-radius:999px;font-size:12px;margin-right:6px}
+  </style>
+</head>
 <body>
   <a href="/admin">← Back to all orders</a>
   <h2>Order Detail</h2>
   <div id="out">Loading…</div>
 
   <script>
-    // ✅ PASTE STEP 2 RIGHT HERE (replace your existing script contents)
+ function esc(s){
+  return String(s ?? "").replace(/[&<>"']/g, (c) => ({
+    "&":"&amp;",
+    "<":"&lt;",
+    ">":"&gt;",
+    "\"":"&quot;",
+    "'":"&#39;"
+  }[c]));
+}
 
     async function load(){
       const out = document.getElementById("out");
@@ -1040,7 +1123,7 @@ app.get("/admin/order", requireAdminPage, (req, res) => {
       }
 
       if (!r.ok) {
-        out.textContent = "API error " + r.status + ": " + text;
+        out.textContent = "API error " + r.status + ":\\n\\n" + text.slice(0, 800);
         return;
       }
 
@@ -1048,7 +1131,7 @@ app.get("/admin/order", requireAdminPage, (req, res) => {
       try {
         data = JSON.parse(text);
       } catch {
-        out.textContent = "Expected JSON, got:\n\n" + text.slice(0, 500);
+        out.textContent = "Expected JSON, got:\\n\\n" + text.slice(0, 800);
         return;
       }
 
@@ -1058,27 +1141,46 @@ app.get("/admin/order", requireAdminPage, (req, res) => {
       }
 
       const o = data.order || {};
+
+      const add = o.addOns || {};
+      const addOnsText = [
+        add.fastFood ? "Fast Food" : null,
+        add.liquor ? "Liquor" : null,
+        add.printing ? "Printing" : null,
+        add.ride ? "Ride" : null,
+      ].filter(Boolean).join(", ") || "None";
+
+      const created = o.createdAt ? new Date(o.createdAt).toLocaleString() : "";
+      const runDate = o.runDate ? new Date(o.runDate).toLocaleDateString() : "";
+
       out.innerHTML =
-        "<h3>" + (data.user?.name || "") + " (" + (data.user?.email || "") + ")</h3>" +
-        "<div><strong>Primary store:</strong> " + (o.primaryStore || "") + "</div>" +
-        "<div><strong>Secondary store:</strong> " + (o.secondaryStore || "") + "</div>" +
+        "<div class='muted row'><span class='pill'>Submitted: " + esc(created) + "</span><span class='pill'>Run: " + esc(runDate) + "</span></div>" +
+        "<h3>" + esc((data.user && data.user.name) ? data.user.name : "") + " (" + esc((data.user && data.user.email) ? data.user.email : "") + ")</h3>" +
+
+        "<div class='row'><strong>Primary store:</strong> " + esc(o.primaryStore) + "</div>" +
+        "<div class='row'><strong>Secondary store:</strong> " + esc(o.secondaryStore) + "</div>" +
+
+        "<div class='row'><strong>Community:</strong> " + esc(o.community) + "</div>" +
+        "<div class='row'><strong>Address:</strong> " + esc(o.streetAddress) + "</div>" +
+        "<div class='row'><strong>Phone:</strong> " + esc(o.phone) + "</div>" +
+
+        "<div class='row'><strong>Add-ons:</strong> " + esc(addOnsText) + "</div>" +
+
         "<h3>Grocery list</h3>" +
-        "<pre style='white-space:pre-wrap;background:#f6f6f6;border:1px solid #ddd;padding:10px;border-radius:8px;'>" +
-          (o.groceryList || "") +
-        "</pre>" +
-        "<h3>Notes</h3>" +
-        "<pre style='white-space:pre-wrap;background:#f6f6f6;border:1px solid #ddd;padding:10px;border-radius:8px;'>" +
-          (o.notes || "") +
-        "</pre>";
+        "<pre>" + esc(o.groceryList) + "</pre>" +
+
+        "<h3>Drop-off / Notes</h3>" +
+        "<pre>" + esc(o.notes) + "</pre>";
     }
 
     load();
   </script>
 </body>
-</html>
-  `);
-});
-// ===== ADMIN UTIL ROUTES (optional, email-based auth) =====
+</html>`);
+
+
+
+});// ===== ADMIN UTIL ROUTES (optional, email-based auth) =====
 app.get("/admin/users", requireAdminPage, async (req, res) => {
   const users = await User.find().sort({ createdAt: -1 }).limit(200).lean();
   res.json(users);
