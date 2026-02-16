@@ -425,6 +425,9 @@ app.get("/admin/order", requireAdminPage, (req, res) => {
         '<div><strong>Primary:</strong> ' + (o.primaryStore || "") + '</div>' +
         '<div><strong>Secondary:</strong> ' + (o.secondaryStore || "") + '</div>' +
 
+	'<h3>Add-ons</h3>' +
+  	'<div>' + addOnsText + '</div>' +
+
         '<h3>Delivery</h3>' +
         '<div><strong>Community:</strong> ' + (o.community || "") + '</div>' +
         '<div><strong>Address:</strong> ' + (o.streetAddress || "") + '</div>' +
@@ -524,16 +527,31 @@ app.get("/admin/picklist", requireAdminPage, (req, res) => {
 
 // ===== ORDER HISTORY: SAVE ORDER (AUTH REQUIRED) =====
 app.post("/api/orders", requireAuth, async (req, res) => {
-  try {
+ try {
     const p = req.body || {};
 
-    const primaryStore = (p.primary_store || "").trim();
-    const groceryList = (p.grocery_list || "").trim();
+    // Accept both snake_case (old) and camelCase (new)
+    const primaryStore = String(p.primary_store ?? p.primaryStore ?? "").trim();
+    const secondaryStore = String(p.secondary_store ?? p.secondaryStore ?? "").trim();
 
-    if (!primaryStore)
-      return res.status(400).json({ ok: false, error: "Missing primary_store" });
-    if (!groceryList)
-      return res.status(400).json({ ok: false, error: "Missing grocery_list" });
+    const groceryList = String(p.grocery_list ?? p.groceryList ?? "").trim();
+
+    const community = String(p.community ?? "").trim();
+    const streetAddress = String(p.street_address ?? p.streetAddress ?? "").trim();
+    const phone = String(p.phone ?? "").trim();
+
+    const notes = String(p.grocery_notes ?? p.notes ?? p.dropoff_notes ?? p.dropoffNotes ?? "").trim();
+
+    // Add-ons: accept multiple keys
+    const addOns = {
+      fastFood: (p.addon_fast_food ?? p.addOnFastFood ?? p.fastFood) === "yes" || (p.addon_fast_food ?? p.addOnFastFood ?? p.fastFood) === true,
+      liquor: (p.addon_liquor ?? p.addOnLiquor ?? p.liquor) === "yes" || (p.addon_liquor ?? p.addOnLiquor ?? p.liquor) === true,
+      printing: (p.addon_printing ?? p.addOnPrinting ?? p.printing) === "yes" || (p.addon_printing ?? p.addOnPrinting ?? p.printing) === true,
+      ride: (p.addon_ride ?? p.addOnRide ?? p.ride) === "yes" || (p.addon_ride ?? p.addOnRide ?? p.ride) === true,
+    };
+
+    if (!primaryStore) return res.status(400).json({ ok: false, error: "Missing primary store" });
+    if (!groceryList) return res.status(400).json({ ok: false, error: "Missing grocery list" });
 
     const { runDate, payDeadline, listDeadline, followingRun } = computeNextRunDates();
 
@@ -544,19 +562,14 @@ app.post("/api/orders", requireAuth, async (req, res) => {
       listDeadline,
       followingRun,
       primaryStore,
-      secondaryStore: p.secondary_store || "",
-      community: p.community || "",
-      streetAddress: p.street_address || "",
-      phone: p.phone || "",
+      secondaryStore,
+      community,
+      streetAddress,
+      phone,
       groceryList,
-      notes: p.grocery_notes || "",
+      notes,      // includes drop-off notes if your frontend sends that
       status: "submitted",
-      addOns: {
-        fastFood: p.addon_fast_food === "yes" || p.addon_fast_food === true,
-        liquor: p.addon_liquor === "yes" || p.addon_liquor === true,
-        printing: p.addon_printing === "yes" || p.addon_printing === true,
-        ride: p.addon_ride === "yes" || p.addon_ride === true,
-      },
+      addOns,
     };
 
     const user = await User.findById(req.user._id);
@@ -597,13 +610,10 @@ app.get("/api/admin/orders", requireAdminApi, async (req, res) => {
   userId: u._id,
   userEmail: u.email,
   userName: u.name,
-  orderId: o._id,
 
+  orderId: o._id,
   createdAt: o.createdAt,
   runDate: o.runDate,
-  payDeadline: o.payDeadline,
-  listDeadline: o.listDeadline,
-  followingRun: o.followingRun,
 
   community: o.community,
   streetAddress: o.streetAddress,
@@ -612,11 +622,11 @@ app.get("/api/admin/orders", requireAdminApi, async (req, res) => {
   primaryStore: o.primaryStore,
   secondaryStore: o.secondaryStore,
 
-  groceryList: o.groceryList,
-  notes: o.notes,
-  addOns: o.addOns,
-
   status: o.status,
+
+  // include these so admin can show them without opening detail
+  notes: o.notes,
+  addOns: o.addOns || {},
 });
       }
     }
@@ -996,6 +1006,15 @@ app.get("/admin/order", requireAdminPage, (req, res) => {
         return;
       }
   const o = data.order || {};
+
+// --- ADD-ONS formatting ---
+const a = o.addOns || {};
+const addOnList = []
+  .concat(a.fastFood ? ["Fast food"] : [])
+  .concat(a.liquor ? ["Liquor"] : [])
+  .concat(a.printing ? ["Printing"] : [])
+  .concat(a.ride ? ["Ride"] : []);
+const addOnsText = addOnList.length ? addOnList.join(", ") : "None";
 
 const html =
   '<div style="margin:8px 0;opacity:.75">' +
