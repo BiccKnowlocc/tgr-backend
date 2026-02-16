@@ -330,43 +330,60 @@ app.get("/admin", requireAdminPage, (req, res) => {
 
   <div id="out">Loading…</div>
 
-  <script>
-    async function load(){
-      const r = await fetch("/api/admin/orders/full", { credentials:"include" });
-      const data = await r.json().catch(()=>({}));
-      if(!r.ok || data.ok===false){
-        document.getElementById("out").textContent = data.error || "Error loading orders";
-        return;
-      }
+ <script>
+  async function load(){
+    const out = document.getElementById("out");
 
-      const rows = (data.orders || []).map(o => {
-        const viewUrl =
-          "/admin/order?userId=" + encodeURIComponent(o.userId) +
-          "&orderId=" + encodeURIComponent(o.orderId);
-
-        return \`
-          <tr>
-            <td>\${o.createdAt ? new Date(o.createdAt).toLocaleString() : ""}</td>
-            <td>\${o.userName || ""}<div class="muted">\${o.userEmail || ""}</div></td>
-            <td>\${o.community || ""}</td>
-            <td>\${o.primaryStore || ""}</td>
-            <td>\${o.status || ""}</td>
-            <td><a href="\${viewUrl}">View</a></td>
-          </tr>\`;
-      }).join("");
-
-      document.getElementById("out").innerHTML = \`
-        <table>
-          <thead>
-            <tr>
-              <th>Created</th><th>User</th><th>Community</th><th>Store</th><th>Status</th><th></th>
-            </tr>
-          </thead>
-          <tbody>\${rows || '<tr><td colspan="6" class="muted">No orders found.</td></tr>'}</tbody>
-        </table>\`;
+    let r, data;
+    try {
+      r = await fetch("/api/admin/orders", { credentials: "include" });
+      data = await r.json();
+    } catch (e) {
+      out.textContent = "Failed to load orders: " + String(e);
+      return;
     }
-    load();
-  </script>
+
+    if (!r.ok || data.ok === false) {
+      out.textContent = (data && data.error) ? data.error : ("Error loading orders (" + r.status + ")");
+      return;
+    }
+
+    const orders = data.orders || [];
+    let rows = "";
+
+    for (const o of orders) {
+      const viewUrl =
+        "/admin/order?userId=" + encodeURIComponent(String(o.userId)) +
+        "&orderId=" + encodeURIComponent(String(o.orderId));
+
+      const created = o.createdAt ? new Date(o.createdAt).toLocaleString() : "";
+      rows +=
+        "<tr>" +
+          "<td>" + created + "</td>" +
+          "<td>" + (o.userName || "") + "</td>" +
+          "<td>" + (o.userEmail || "") + "</td>" +
+          "<td>" + (o.community || "") + "</td>" +
+          "<td>" + (o.primaryStore || "") + "</td>" +
+          "<td>" + (o.status || "") + "</td>" +
+          "<td><a href='" + viewUrl + "'>View</a></td>" +
+        "</tr>";
+    }
+
+    out.innerHTML =
+      "<table>" +
+        "<thead>" +
+          "<tr>" +
+            "<th>Created</th><th>Name</th><th>Email</th><th>Community</th><th>Store</th><th>Status</th><th></th>" +
+          "</tr>" +
+        "</thead>" +
+        "<tbody>" +
+          (rows || "<tr><td colspan='7' style='opacity:.75'>No orders found.</td></tr>") +
+        "</tbody>" +
+      "</table>";
+  }
+
+  load();
+</script>
 </body>
 </html>`);
 });
@@ -940,25 +957,37 @@ app.get("/admin", requireAdminPage, (req, res) => {
         document.getElementById("out").textContent = data.error || "Error loading orders";
         return;
       }
-      const rows = (data.orders || []).map(o => {
+     const orders = data.orders || [];
+let rows = "";
+
+for (const o of orders) {
   const viewUrl =
     "/admin/order?userId=" + encodeURIComponent(String(o.userId)) +
     "&orderId=" + encodeURIComponent(String(o.orderId));
 
-  return `
-    <tr>
-      <td>${o.createdAt ? new Date(o.createdAt).toLocaleString() : ""}</td>
-      <td>${o.userName || ""}</td>
-      <td>${o.userEmail || ""}</td>
-      <td>${o.community || ""}</td>
-      <td>${o.primaryStore || ""}</td>
-      <td>${o.status || ""}</td>
-      <td><a href="${viewUrl}">View</a></td>
-    </tr>`;
-}).join("");
+  const created = o.createdAt ? new Date(o.createdAt).toLocaleString() : "";
 
-      document.getElementById("out").innerHTML = \`
-        <table>
+  rows +=
+    "<tr>" +
+      "<td>" + created + "</td>" +
+      "<td>" + (o.userName || "") + "</td>" +
+      "<td>" + (o.userEmail || "") + "</td>" +
+      "<td>" + (o.community || "") + "</td>" +
+      "<td>" + (o.primaryStore || "") + "</td>" +
+      "<td>" + (o.status || "") + "</td>" +
+      "<td><a href='" + viewUrl + "'>View</a></td>" +
+    "</tr>";
+}
+
+out.innerHTML =
+  "<table>" +
+    "<thead><tr>" +
+      "<th>Created</th><th>Name</th><th>Email</th><th>Community</th><th>Store</th><th>Status</th><th></th>" +
+    "</tr></thead>" +
+    "<tbody>" +
+      (rows || "<tr><td colspan='7' style='opacity:.75'>No orders found.</td></tr>") +
+    "</tbody>" +
+  "</table>";
           <thead>
             <tr>
               <th>Created</th><th>Name</th><th>Email</th><th>Community</th><th>Store</th><th>Status</th><th></th>
@@ -1129,56 +1158,52 @@ app.get("/admin/packing", requireAdminPage, (req, res) => {
         return;
       }
 
-      document.getElementById("out").innerHTML = list.map(o => {
-  const created = o.createdAt ? new Date(o.createdAt).toLocaleString() : "";
-  const run = o.runDate ? new Date(o.runDate).toLocaleDateString() : "";
+      document.getElementById("out").innerHTML = (list || []).map(function (o) {
+  // add-ons text (handle both old & new shapes)
+  var ao = o.addOns || {};
+  var addOnsText = [
+    (ao.fastFood ? "Fast Food" : ""),
+    (ao.liquor ? "Liquor" : ""),
+    (ao.printing ? "Printing" : ""),
+    (ao.ride ? "Ride" : "")
+  ].filter(Boolean).join(", ");
+  if (!addOnsText) addOnsText = "None";
 
-  const addOns = o.addOns || {};
-  const addOnLabels = [];
-  if (addOns.fastFood) addOnLabels.push("Fast Food");
-  if (addOns.liquor) addOnLabels.push("Liquor");
-  if (addOns.printing) addOnLabels.push("Printing");
-  if (addOns.ride) addOnLabels.push("Ride");
+  var created = o.createdAt ? new Date(o.createdAt).toLocaleString() : "";
+  var run = o.runDate ? new Date(o.runDate).toLocaleDateString() : "";
 
-  const addOnsText = addOnLabels.length ? addOnLabels.join(", ") : "None";
+  var viewHref =
+    "/admin/order?userId=" + encodeURIComponent(String(o.userId || "")) +
+    "&orderId=" + encodeURIComponent(String(o.orderId || ""));
 
-  const safe = (v) => (v == null ? "" : String(v));
+  return (
+    "<div class='card'>" +
+      "<div class='muted'>" + safe(created) + " • Run: <strong>" + safe(run) + "</strong></div>" +
+      "<div><strong>" + safe(o.userName || "") + "</strong> — " + safe(o.community || "") + "</div>" +
 
-  return `
-    <div class="card">
-      <div class="muted">${created} • Run: <strong>${run}</strong></div>
+      "<div style='margin-top:8px;'>" +
+        "<div><strong>Primary:</strong> " + safe(o.primaryStore || "") + "</div>" +
+        "<div><strong>Secondary:</strong> " + safe(o.secondaryStore || "") + "</div>" +
+      "</div>" +
 
-      <div style="margin:6px 0;">
-        <strong>${safe(o.userName)}</strong>
-        <span class="muted">(${safe(o.userEmail)})</span>
-        — ${safe(o.community)}
-      </div>
+      "<div style='margin-top:8px;'>" +
+        "<div><strong>Address:</strong> " + safe(o.streetAddress || "") + "</div>" +
+        "<div><strong>Phone:</strong> " + safe(o.phone || "") + "</div>" +
+      "</div>" +
 
-      <div><strong>Primary:</strong> ${safe(o.primaryStore)}</div>
-      <div><strong>Secondary:</strong> ${safe(o.secondaryStore)}</div>
+      "<div style='margin-top:8px;'><strong>Add-ons:</strong> " + safe(addOnsText) + "</div>" +
 
-      <div style="margin-top:8px;">
-        <div><strong>Address:</strong> ${safe(o.streetAddress)}</div>
-        <div><strong>Phone:</strong> ${safe(o.phone)}</div>
-      </div>
+      "<h4 style='margin:12px 0 6px;'>Grocery List</h4>" +
+      "<pre>" + safe(o.groceryList || "") + "</pre>" +
 
-      <div style="margin-top:8px;">
-        <strong>Add-ons:</strong> ${addOnsText}
-      </div>
+      "<h4 style='margin:12px 0 6px;'>Drop-off / Notes</h4>" +
+      "<pre>" + safe(o.notes || "") + "</pre>" +
 
-      <h4 style="margin:12px 0 6px;">Grocery List</h4>
-      <pre>${safe(o.groceryList)}</pre>
-
-      <h4 style="margin:12px 0 6px;">Drop-off / Notes</h4>
-      <pre>${safe(o.notes)}</pre>
-
-      <div style="margin-top:10px;">
-        <a href="/admin/order?userId=${encodeURIComponent(o.userId)}&orderId=${encodeURIComponent(o.orderId)}">
-          View full order →
-        </a>
-      </div>
-    </div>
-  `;
+      "<div style='margin-top:10px;'>" +
+        "<a href='" + viewHref + "'>View full order →</a>" +
+      "</div>" +
+    "</div>"
+  );
 }).join("");
     }
     load();
