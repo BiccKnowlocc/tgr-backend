@@ -407,64 +407,117 @@ app.get("/admin/order", requireAdminPage, (req, res) => {
   <h2>Order Detail</h2>
   <div id="out">Loading…</div>
 
-  <script>
+ <script>
+  function esc(s) {
+    return String(s ?? "").replace(/[&<>"']/g, (c) => ({
+      "&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"
+    }[c]));
+  }
+
+  async function fetchTextWithTimeout(url, ms) {
+    const c = new AbortController();
+    const t = setTimeout(() => c.abort(), ms);
+    try {
+      const r = await fetch(url, { credentials: "include", signal: c.signal });
+      const text = await r.text();
+      return { r, text };
+    } finally {
+      clearTimeout(t);
+    }
+  }
+
+  async function load(){
+    const out = document.getElementById("out");
+    out.textContent = "Loading…";
+
     const params = new URLSearchParams(location.search);
     const userId = params.get("userId");
     const orderId = params.get("orderId");
 
-    async function load(){
-      if(!userId || !orderId){
-        document.getElementById("out").textContent = "Missing userId or orderId in URL.";
-        return;
-      }
-
-      const r = await fetch(
-        "/api/admin/orders/" + encodeURIComponent(userId) + "/" + encodeURIComponent(orderId),
-        { credentials:"include" }
-      );
-
-      const data = await r.json().catch(()=>({}));
-      if(!r.ok || data.ok===false){
-        document.getElementById("out").textContent = data.error || "Error";
-        return;
-      }
-
-      const o = data.order || {};
-
-      const html =
-        '<div style="margin:8px 0;opacity:.75">' +
-          '<div><strong>' + (data.user && data.user.name ? data.user.name : "") + '</strong> (' + (data.user && data.user.email ? data.user.email : "") + ')</div>' +
-          '<div>Submitted: ' + (o.createdAt ? new Date(o.createdAt).toLocaleString() : "") + '</div>' +
-          '<div>Run Date: ' + (o.runDate ? new Date(o.runDate).toLocaleDateString() : "") + '</div>' +
-        '</div>' +
-
-        '<h3>Stores</h3>' +
-        '<div><strong>Primary:</strong> ' + (o.primaryStore || "") + '</div>' +
-        '<div><strong>Secondary:</strong> ' + (o.secondaryStore || "") + '</div>' +
-
-	'<h3>Add-ons</h3>' +
-  	'<div>' + addOnsText + '</div>' +
-
-        '<h3>Delivery</h3>' +
-        '<div><strong>Community:</strong> ' + (o.community || "") + '</div>' +
-        '<div><strong>Address:</strong> ' + (o.streetAddress || "") + '</div>' +
-        '<div><strong>Phone:</strong> ' + (o.phone || "") + '</div>' +
-
-        '<h3>Grocery List</h3>' +
-        '<pre style="white-space:pre-wrap;background:#f6f6f6;border:1px solid #ddd;padding:10px;border-radius:8px;">' +
-          (o.groceryList || "") +
-        '</pre>' +
-
-        '<h3>Notes</h3>' +
-        '<pre style="white-space:pre-wrap;background:#f6f6f6;border:1px solid #ddd;padding:10px;border-radius:8px;">' +
-          (o.notes || "") +
-        '</pre>';
-
-      document.getElementById("out").innerHTML = html;
+    if (!userId || !orderId) {
+      out.textContent = "Missing userId or orderId in URL.";
+      return;
     }
 
-    load();
-  </script>
+    const url = "/api/admin/orders/" + encodeURIComponent(userId) + "/" + encodeURIComponent(orderId);
+
+    let r, text;
+    try {
+      ({ r, text } = await fetchTextWithTimeout(url, 10000));
+    } catch (e) {
+      out.textContent = "Fetch failed (timeout/network): " + String(e);
+      return;
+    }
+
+    if (!r.ok) {
+      out.innerHTML =
+        "<h3>API error " + r.status + "</h3>" +
+        "<pre style='white-space:pre-wrap;background:#f6f6f6;border:1px solid #ddd;padding:10px;border-radius:8px;'>" +
+        esc(text.slice(0, 2000)) +
+        "</pre>";
+      return;
+    }
+
+    let data;
+    try {
+      data = JSON.parse(text);
+    } catch {
+      out.innerHTML =
+        "<h3>Expected JSON but got:</h3>" +
+        "<pre style='white-space:pre-wrap;background:#f6f6f6;border:1px solid #ddd;padding:10px;border-radius:8px;'>" +
+        esc(text.slice(0, 2000)) +
+        "</pre>";
+      return;
+    }
+
+    if (data.ok === false) {
+      out.textContent = data.error || "Error";
+      return;
+    }
+
+    const o = data.order || {};
+    const add = o.addOns || {};
+    const addOnsText = [
+      add.fastFood ? "Fast Food" : null,
+      add.liquor ? "Liquor" : null,
+      add.printing ? "Printing" : null,
+      add.ride ? "Ride" : null,
+    ].filter(Boolean).join(", ") || "None";
+
+    const html =
+      '<div style="margin:8px 0;opacity:.75">' +
+        '<div><strong>' + esc((data.user && data.user.name) ? data.user.name : "") + '</strong> (' + esc((data.user && data.user.email) ? data.user.email : "") + ')</div>' +
+        '<div>Submitted: ' + (o.createdAt ? esc(new Date(o.createdAt).toLocaleString()) : "") + '</div>' +
+        '<div>Run Date: ' + (o.runDate ? esc(new Date(o.runDate).toLocaleDateString()) : "") + '</div>' +
+      '</div>' +
+
+      '<h3>Stores</h3>' +
+      '<div><strong>Primary:</strong> ' + esc(o.primaryStore || "") + '</div>' +
+      '<div><strong>Secondary:</strong> ' + esc(o.secondaryStore || "") + '</div>' +
+
+      '<h3>Add-ons</h3>' +
+      '<div>' + esc(addOnsText) + '</div>' +
+
+      '<h3>Delivery</h3>' +
+      '<div><strong>Community:</strong> ' + esc(o.community || "") + '</div>' +
+      '<div><strong>Address:</strong> ' + esc(o.streetAddress || "") + '</div>' +
+      '<div><strong>Phone:</strong> ' + esc(o.phone || "") + '</div>' +
+
+      '<h3>Grocery List</h3>' +
+      '<pre style="white-space:pre-wrap;background:#f6f6f6;border:1px solid #ddd;padding:10px;border-radius:8px;">' +
+        esc(o.groceryList || "") +
+      '</pre>' +
+
+      '<h3>Drop-off / Notes</h3>' +
+      '<pre style="white-space:pre-wrap;background:#f6f6f6;border:1px solid #ddd;padding:10px;border-radius:8px;">' +
+        esc(o.notes || "") +
+      '</pre>';
+
+    out.innerHTML = html;
+  }
+
+  load();
+</script>
 </body>
 </html>
   `);
