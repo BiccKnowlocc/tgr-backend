@@ -372,7 +372,8 @@ app.get("/admin", requireAdminPage, (req, res) => {
 });
 
 app.get("/admin/order", requireAdminPage, (req, res) => {
-  res.type("html").send(`<!doctype html>
+  res.type("html").send(`
+<!doctype html>
 <html>
 <head>
   <meta charset="utf-8" />
@@ -382,13 +383,11 @@ app.get("/admin/order", requireAdminPage, (req, res) => {
     body{font-family:system-ui,Segoe UI,Arial,sans-serif;margin:16px;}
     pre{white-space:pre-wrap;background:#f6f6f6;border:1px solid #ddd;padding:10px;border-radius:8px;}
     a{font-weight:700;}
-    .muted{opacity:.75;font-weight:500;}
   </style>
 </head>
 <body>
   <a href="/admin">← Back to all orders</a>
   <h2>Order Detail</h2>
-  <div id="meta" class="muted"></div>
   <div id="out">Loading…</div>
 
   <script>
@@ -402,28 +401,54 @@ app.get("/admin/order", requireAdminPage, (req, res) => {
         return;
       }
 
-      const url = "/api/admin/orders/" + encodeURIComponent(userId) + "/" + encodeURIComponent(orderId);
-      const r = await fetch(url, { credentials:"include" });
-      const data = await r.json().catch(()=>({}));
+      const r = await fetch(
+        "/api/admin/orders/" + encodeURIComponent(userId) + "/" + encodeURIComponent(orderId),
+        { credentials:"include" }
+      );
 
+      const data = await r.json().catch(()=>({}));
       if(!r.ok || data.ok===false){
         document.getElementById("out").textContent = data.error || "Error";
         return;
       }
 
-      document.getElementById("meta").textContent =
-        (data.user?.name || "") + " • " + (data.user?.email || "");
+      const o = data.order || {};
 
-      // Shows the FULL stored order object
-      document.getElementById("out").innerHTML =
-        "<pre>" + JSON.stringify(data.order, null, 2) + "</pre>";
+      const html =
+        '<div style="margin:8px 0;opacity:.75">' +
+          '<div><strong>' + (data.user && data.user.name ? data.user.name : "") + '</strong> (' + (data.user && data.user.email ? data.user.email : "") + ')</div>' +
+          '<div>Submitted: ' + (o.createdAt ? new Date(o.createdAt).toLocaleString() : "") + '</div>' +
+          '<div>Run Date: ' + (o.runDate ? new Date(o.runDate).toLocaleDateString() : "") + '</div>' +
+        '</div>' +
+
+        '<h3>Stores</h3>' +
+        '<div><strong>Primary:</strong> ' + (o.primaryStore || "") + '</div>' +
+        '<div><strong>Secondary:</strong> ' + (o.secondaryStore || "") + '</div>' +
+
+        '<h3>Delivery</h3>' +
+        '<div><strong>Community:</strong> ' + (o.community || "") + '</div>' +
+        '<div><strong>Address:</strong> ' + (o.streetAddress || "") + '</div>' +
+        '<div><strong>Phone:</strong> ' + (o.phone || "") + '</div>' +
+
+        '<h3>Grocery List</h3>' +
+        '<pre style="white-space:pre-wrap;background:#f6f6f6;border:1px solid #ddd;padding:10px;border-radius:8px;">' +
+          (o.groceryList || "") +
+        '</pre>' +
+
+        '<h3>Notes</h3>' +
+        '<pre style="white-space:pre-wrap;background:#f6f6f6;border:1px solid #ddd;padding:10px;border-radius:8px;">' +
+          (o.notes || "") +
+        '</pre>';
+
+      document.getElementById("out").innerHTML = html;
     }
+
     load();
   </script>
 </body>
-</html>`);
+</html>
+  `);
 });
-
 // A simpler “picklist” page: just stores + grocery list + notes (easy to scan)
 app.get("/admin/picklist", requireAdminPage, (req, res) => {
   res.type("html").send(`<!doctype html>
@@ -970,35 +995,38 @@ app.get("/admin/order", requireAdminPage, (req, res) => {
         document.getElementById("out").textContent = data.error || "Error";
         return;
       }
-   const o = data.order || {};
-const html = `
-  <div style="margin:8px 0;opacity:.75">
-    <div><strong>${data.user?.name || ""}</strong> (${data.user?.email || ""})</div>
-    <div>Submitted: ${o.createdAt ? new Date(o.createdAt).toLocaleString() : ""}</div>
-    <div>Run Date: ${o.runDate ? new Date(o.runDate).toLocaleDateString() : ""}</div>
-  </div>
+  const o = data.order || {};
 
-  <h3>Stores</h3>
-  <div><strong>Primary:</strong> ${o.primaryStore || ""}</div>
-  <div><strong>Secondary:</strong> ${o.secondaryStore || ""}</div>
+const html =
+  '<div style="margin:8px 0;opacity:.75">' +
+    '<div><strong>' + (data.user && data.user.name ? data.user.name : "") + '</strong> (' + (data.user && data.user.email ? data.user.email : "") + ')</div>' +
+    '<div>Submitted: ' + (o.createdAt ? new Date(o.createdAt).toLocaleString() : "") + '</div>' +
+    '<div>Run Date: ' + (o.runDate ? new Date(o.runDate).toLocaleDateString() : "") + '</div>' +
+  '</div>' +
 
-  <h3>Delivery</h3>
-  <div><strong>Community:</strong> ${o.community || ""}</div>
-  <div><strong>Address:</strong> ${o.streetAddress || ""}</div>
-  <div><strong>Phone:</strong> ${o.phone || ""}</div>
+  '<h3>Stores</h3>' +
+  '<div><strong>Primary:</strong> ' + (o.primaryStore || "") + '</div>' +
+  '<div><strong>Secondary:</strong> ' + (o.secondaryStore || "") + '</div>' +
 
-  <h3>Grocery List</h3>
-  <pre>${o.groceryList || ""}</pre>
+  '<h3>Delivery</h3>' +
+  '<div><strong>Community:</strong> ' + (o.community || "") + '</div>' +
+  '<div><strong>Address:</strong> ' + (o.streetAddress || "") + '</div>' +
+  '<div><strong>Phone:</strong> ' + (o.phone || "") + '</div>' +
 
-  <h3>Notes</h3>
-  <pre>${o.notes || ""}</pre>
+  '<h3>Grocery List</h3>' +
+  '<pre style="white-space:pre-wrap;background:#f6f6f6;border:1px solid #ddd;padding:10px;border-radius:8px;">' +
+    (o.groceryList || "") +
+  '</pre>' +
 
-  <h3>Add-ons</h3>
-  <pre>${JSON.stringify(o.addOns || {}, null, 2)}</pre>
-`;
+  '<h3>Notes</h3>' +
+  '<pre style="white-space:pre-wrap;background:#f6f6f6;border:1px solid #ddd;padding:10px;border-radius:8px;">' +
+    (o.notes || "") +
+  '</pre>';
+
 document.getElementById("out").innerHTML = html;
-    }
-    load();
+    
+
+	
   </script>
 </body>
 </html>
@@ -1031,12 +1059,18 @@ app.get("/admin/set-membership", requireAdminPage, async (req, res) => {
   );
   if (!user) return res.status(404).send("User not found.");
 
-  res.send(`
+ res.send(`
     <h1>Updated ✅</h1>
     <p>${user.email}</p>
     <p>Status: ${user.membershipStatus}</p>
     <p>Level: ${user.membershipLevel}</p>
-    <p>Renewal: ${user.renewalDate ? new Date(user.renewalDate).toLocaleDateString("en-CA") : "N/A"}</p>
+    <p>Renewal: ${
+      user.renewalDate
+        ? new Date(user.renewalDate).toLocaleDateString("en-CA")
+        : "N/A"
+    }</p>
+  `);
+});
  
 
 app.get("/admin/packing", requireAdminPage, (req, res) => {
