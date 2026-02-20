@@ -5,11 +5,11 @@
  * - Mongo-backed sessions (connect-mongo) for Render production stability
  * - Locked CORS to your site domains (credentials enabled)
  * - trust proxy + secure cookies (Render HTTPS)
- * - DEV login endpoints (keep for testing; remove/replace with Google OAuth later)
+ * - DEV login endpoints (keep for testing; replace with Google OAuth later)
  * - Runs: active run status for Local + Owen with cutoffs, max slots, minimum-to-run logic
  * - Orders: multipart create with uploads (multer), Order IDs (TGR-00001), fee snapshot, slot gating
  * - Track: GET /api/orders/:orderId
- * - Admin: update status, export CSV (minimal)
+ * - Admin: update status, export CSV
  *
  * IMPORTANT ENV VARS (Render):
  * - MONGODB_URI
@@ -23,7 +23,11 @@ const mongoose = require("mongoose");
 const multer = require("multer");
 const cookieParser = require("cookie-parser");
 const session = require("express-session");
-const MongoStore = require("connect-mongo");
+
+// connect-mongo CJS/ESM interop (fixes MongoStore.create is not a function on some installs)
+const MongoStorePkg = require("connect-mongo");
+const MongoStore = MongoStorePkg.default || MongoStorePkg;
+
 const cors = require("cors");
 
 const dayjs = require("dayjs");
@@ -40,9 +44,9 @@ const MONGODB_URI = process.env.MONGODB_URI || "mongodb://127.0.0.1:27017/tgr";
 const SESSION_SECRET = process.env.SESSION_SECRET || "dev-secret";
 const TZ = process.env.TZ || "America/Toronto";
 
-// If you ever need cross-subdomain cookies and "lax" fails on fetch(), flip these:
-// const COOKIE_SAMESITE = "none";
-// const COOKIE_DOMAIN = ".tobermorygroceryrun.ca";
+// Cookies across subdomains:
+// Start with LAX. If your frontend fetch() to api subdomain doesn't send cookies, switch to:
+//   COOKIE_SAMESITE="none" AND COOKIE_DOMAIN=".tobermorygroceryrun.ca"
 const COOKIE_SAMESITE = "lax";
 const COOKIE_DOMAIN = undefined;
 
@@ -145,7 +149,8 @@ function calcPrinting(pages) {
 
 // Membership estimator rules (server-side approximation)
 function membershipDiscounts(tier, applyPerkYes) {
-  if (!tier || !applyPerkYes) return { serviceOff: 0, zoneOff: 0, freeAddonUpTo: 0, waitWaived: false };
+  if (!tier || !applyPerkYes)
+    return { serviceOff: 0, zoneOff: 0, freeAddonUpTo: 0, waitWaived: false };
   if (tier === "standard") return { serviceOff: 0, zoneOff: 10, freeAddonUpTo: 10, waitWaived: false };
   if (tier === "route") return { serviceOff: 5, zoneOff: 10, freeAddonUpTo: 10, waitWaived: false };
   if (tier === "access") return { serviceOff: 8, zoneOff: 10, freeAddonUpTo: 10, waitWaived: true };
@@ -592,7 +597,7 @@ app.post("/api/orders", upload.single("groceryFile"), async (req, res) => {
       return res.status(400).json({ ok: false, error: "Alcohol cannot be left at the door." });
     }
     if (b.addon_pharmacy === "yes" && b.dropoffPref === "leave_at_door") {
-      return res.status(400).json({ ok: false, error: "Prescriptions should not be left at the door." });
+      return res.status(400).json({ ok: false, error: "Prescriptions cannot be left at the door." });
     }
 
     // Determine runKey for selected runType
