@@ -33,3 +33,5 @@ const UserSchema = new mongoose.Schema(
 );
 
 module.exports = mongoose.model("User", UserSchema);
+
+profile: { type: mongoose.Schema.Types.Mixed, default: { version: 1, defaultId: "", addresses: [] } },
