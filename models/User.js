@@ -20,12 +20,18 @@ const UserSchema = new mongoose.Schema(
     name: { type: String, default: "" },
     photo: { type: String, default: "" },
 
-    membershipLevel: { type: String, default: "none" }, // none / member / runner / access
+    membershipLevel: { type: String, default: "none" }, // none / standard / route / access / access_pro
     membershipStatus: { type: String, default: "inactive" }, // inactive / active / cancelled
     renewalDate: { type: Date, default: null },
 
     discounts: { type: [String], default: [] },
     perks: { type: [String], default: [] },
+
+    // NEW: profile blob for saved addresses + future extensibility
+    profile: {
+      type: mongoose.Schema.Types.Mixed,
+      default: () => ({ version: 1, defaultId: "", addresses: [] }),
+    },
 
     orderHistory: { type: [OrderSchema], default: [] },
   },
@@ -33,8 +39,3 @@ const UserSchema = new mongoose.Schema(
 );
 
 module.exports = mongoose.model("User", UserSchema);
-
-profile: {
-  type: mongoose.Schema.Types.Mixed,
-  default: () => ({ version: 1, defaultId: "", addresses: [] })
-},
