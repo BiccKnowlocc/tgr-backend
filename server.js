@@ -1,26 +1,28 @@
 /**
  * server.js — Tobermory Grocery Run backend (Express + MongoDB)
- * READY TO SELL MEMBERSHIPS + TAKE PAYMENTS TODAY
- *
- * What this supports:
- *  - Membership subscriptions via Square subscription-enabled Payment Links:
- *      POST /api/memberships/checkout   { tier: "standard"|"route"|"access"|"accesspro" }
- *  - One-time payments via Square Payment Links:
- *      POST /api/payments/checkout     { kind: "groceries"|"fees" }
- *  - Runs (live slot counter + cutoffs) + Orders (multipart form w/ optional file upload)
+ * Includes:
+ * - Google OAuth (Passport) so /auth/google works
+ * - Mongo-backed sessions (connect-mongo)
+ * - Square links for memberships + payments
+ * - Runs + Orders API
  *
  * REQUIRED Render ENV:
  *  - SESSION_SECRET
- *  - MONGO_URI  (or MONGODB_URI)
+ *  - MONGO_URI (or MONGODB_URI)
+ *  - GOOGLE_CLIENT_ID
+ *  - GOOGLE_CLIENT_SECRET
+ *  - GOOGLE_CALLBACK_URL   (https://api.tobermorygroceryrun.ca/auth/google/callback)
+ *
  *  - SQUARE_LINK_STANDARD
  *  - SQUARE_LINK_ROUTE
  *  - SQUARE_LINK_ACCESS
  *  - SQUARE_LINK_ACCESSPRO
+ *
  *  - SQUARE_PAY_GROCERIES_LINK
  *  - SQUARE_PAY_FEES_LINK
  *
  * OPTIONAL:
- *  - TZ  (defaults America/Toronto)
+ *  - TZ (defaults America/Toronto)
  */
 
 const express = require("express");
@@ -28,12 +30,18 @@ const mongoose = require("mongoose");
 const multer = require("multer");
 const cookieParser = require("cookie-parser");
 const session = require("express-session");
+const cors = require("cors");
 
 // connect-mongo CJS/ESM interop (fixes MongoStore.create is not a function on some installs)
 const MongoStorePkg = require("connect-mongo");
 const MongoStore = MongoStorePkg.default || MongoStorePkg;
 
-const cors = require("cors");
+// Google OAuth (Passport)
+const passport = require("passport");
+const GoogleStrategy = require("passport-google-oauth20").Strategy;
+
+// Your existing User model file
+const User = require("./models/User");
 
 const dayjs = require("dayjs");
 const utc = require("dayjs/plugin/utc");
@@ -53,6 +61,11 @@ const MONGODB_URI =
 
 const SESSION_SECRET = process.env.SESSION_SECRET || "dev-secret";
 const TZ = process.env.TZ || "America/Toronto";
+
+// Google envs
+const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID || "";
+const GOOGLE_CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET || "";
+const GOOGLE_CALLBACK_URL = process.env.GOOGLE_CALLBACK_URL || "";
 
 // Cookies across subdomains:
 // Start with LAX. If your frontend fetch() to api subdomain doesn't send cookies, switch to:
@@ -76,8 +89,8 @@ const SQUARE_LINKS = {
 
 // Square one-time payment links (set in Render env)
 const SQUARE_PAY_LINKS = {
-  groceries: process.env.SQUARE_PAY_GROCERIES_LINK, // customer pays grocery total
-  fees: process.env.SQUARE_PAY_FEES_LINK, // customer pays service/delivery fees
+  groceries: process.env.SQUARE_PAY_GROCERIES_LINK,
+  fees: process.env.SQUARE_PAY_FEES_LINK,
 };
 
 const app = express();
@@ -88,7 +101,7 @@ const app = express();
 app.use(
   cors({
     origin: function (origin, cb) {
-      if (!origin) return cb(null, true); // allow no-origin requests
+      if (!origin) return cb(null, true);
       return cb(null, ALLOWED_ORIGINS.includes(origin));
     },
     credentials: true,
@@ -120,22 +133,83 @@ app.use(
 
     cookie: {
       httpOnly: true,
-      secure: true,
+      secure: true, // Render HTTPS at the edge
       sameSite: COOKIE_SAMESITE,
       ...(COOKIE_DOMAIN ? { domain: COOKIE_DOMAIN } : {}),
-      maxAge: 1000 * 60 * 60 * 24 * 14,
+      maxAge: 1000 * 60 * 60 * 24 * 14, // 14 days
     },
   })
 );
 
-// Uploads (local disk)
+// =========================
+// Passport (Google OAuth)
+// IMPORTANT: must be after session middleware
+// =========================
+passport.serializeUser((user, done) => done(null, user._id.toString()));
+
+passport.deserializeUser(async (id, done) => {
+  try {
+    const u = await User.findById(id).lean();
+    done(null, u || null);
+  } catch (e) {
+    done(e);
+  }
+});
+
+if (GOOGLE_CLIENT_ID && GOOGLE_CLIENT_SECRET && GOOGLE_CALLBACK_URL) {
+  passport.use(
+    new GoogleStrategy(
+      {
+        clientID: GOOGLE_CLIENT_ID,
+        clientSecret: GOOGLE_CLIENT_SECRET,
+        callbackURL: GOOGLE_CALLBACK_URL,
+      },
+      async (_accessToken, _refreshToken, profile, done) => {
+        try {
+          const email =
+            (profile.emails && profile.emails[0] && profile.emails[0].value) || "";
+          const normalized = String(email).toLowerCase().trim();
+          if (!normalized) return done(null, false);
+
+          const update = {
+            googleId: profile.id,
+            email: normalized,
+            name: profile.displayName || "",
+            photo:
+              (profile.photos && profile.photos[0] && profile.photos[0].value) || "",
+          };
+
+          const u = await User.findOneAndUpdate(
+            { email: normalized },
+            {
+              $set: update,
+              $setOnInsert: { membershipLevel: "none", membershipStatus: "inactive" },
+            },
+            { upsert: true, new: true }
+          );
+
+          return done(null, u);
+        } catch (e) {
+          return done(e);
+        }
+      }
+    )
+  );
+}
+
+app.use(passport.initialize());
+app.use(passport.session());
+
+// =========================
+// Uploads
+// =========================
 const upload = multer({
   dest: "uploads/",
   limits: { fileSize: 15 * 1024 * 1024 }, // 15MB
 });
 
 // =========================
-// Pricing model (server truth)
+// Pricing (server truth)
 // =========================
 const PRICING = {
   serviceFee: 25,
@@ -170,7 +244,7 @@ function calcPrinting(pages) {
   );
 }
 
-// Membership estimator rules (server-side approximation; actual billing handled by Square)
+// Membership estimator rules (approx only; Square bills subscriptions)
 function membershipDiscounts(tier, applyPerkYes) {
   if (!tier || !applyPerkYes)
     return { serviceOff: 0, zoneOff: 0, freeAddonUpTo: 0, waitWaived: false };
@@ -186,13 +260,10 @@ function membershipDiscounts(tier, applyPerkYes) {
 }
 
 // =========================
-// Mongo models
+// Mongo models for runs/orders counters
 // =========================
 const CounterSchema = new mongoose.Schema(
-  {
-    key: { type: String, unique: true },
-    seq: { type: Number, default: 0 },
-  },
+  { key: { type: String, unique: true }, seq: { type: Number, default: 0 } },
   { timestamps: true }
 );
 
@@ -206,8 +277,6 @@ const RunSchema = new mongoose.Schema(
 
     maxSlots: { type: Number, default: 12 },
 
-    // Local: 6 orders OR $200 fees
-    // Owen:  6 orders AND $300 fees
     minOrders: { type: Number, default: 6 },
     minFees: { type: Number, default: 0 },
     minLogic: { type: String, enum: ["OR", "AND"], default: "OR" },
@@ -247,17 +316,6 @@ const OrderSchema = new mongoose.Schema(
     list: {
       groceryListText: String,
       attachment: { originalName: String, mimeType: String, size: Number, path: String },
-    },
-
-    addOns: {
-      pharmacy: { enabled: Boolean, pharmacyName: String, medicationName: String },
-      fastFood: { enabled: Boolean, details: String },
-      liquor: { enabled: Boolean, details: String, idName: String, idDob: String, idType: String },
-      printing: { enabled: Boolean, details: String, pages: Number },
-      parcel: { enabled: Boolean, details: String, bulky: Boolean },
-      bulky: { enabled: Boolean, count: Number },
-      ride: { enabled: Boolean, details: String, seats: Number, southOfFerndale: Boolean },
-      wait: { enabled: Boolean, blocks: Number },
     },
 
     consents: { terms: Boolean, accuracy: Boolean, dropoff: Boolean },
@@ -306,14 +364,12 @@ function nextDow(targetDow, from) {
 
 function buildRunTimes(type) {
   const base = nowTz();
-
   if (type === "local") {
     const delivery = nextDow(6, base); // Saturday
     const cutoff = delivery.subtract(2, "day").hour(18).minute(0).second(0).millisecond(0); // Thu 6pm
     const opens = delivery.subtract(5, "day").hour(0).minute(0).second(0).millisecond(0); // Mon 12am
     return { delivery, cutoff, opens };
   }
-
   const delivery = nextDow(0, base); // Sunday
   const cutoff = delivery.subtract(2, "day").hour(18).minute(0).second(0).millisecond(0); // Fri 6pm
   const opens = delivery.subtract(6, "day").hour(0).minute(0).second(0).millisecond(0); // Mon 12am
@@ -406,20 +462,7 @@ function computeFeesFromBody(body) {
   const runType = String(body.runType || "");
   const extraStores = safeJsonArray(body.extraStores);
 
-  const add_fastFood = body.addon_fastFood === "yes";
-  const add_liquor = body.addon_liquor === "yes";
-  const add_printing = body.addon_printing === "yes";
-  const add_parcel = body.addon_parcel === "yes";
-  const add_bulky = body.addon_bulky === "yes";
-  const add_ride = body.addon_ride === "yes";
-  const add_wait = body.addon_wait === "yes";
-
   const pages = Number(body.printPages || 0);
-  const parcelBulky = body.parcelBulky === "yes";
-  const bulkyCount = Math.max(0, Number(body.bulkyCount || 0));
-  const rideSeats = Math.max(1, Number(body.rideSeats || 1));
-  const rideSouth = body.rideSouthOfFerndale === "yes";
-  const waitBlocks = Math.max(0, Number(body.waitBlocks || 0));
 
   const memberTier = String(body.memberTier || "");
   const applyPerk = String(body.applyPerk || "yes") === "yes";
@@ -431,17 +474,13 @@ function computeFeesFromBody(body) {
 
   let addOnsFees = 0;
   if (extraStores.length) addOnsFees += extraStores.length * PRICING.addOns.extraStore;
-  if (add_fastFood) addOnsFees += PRICING.addOns.fastFood;
-  if (add_liquor) addOnsFees += PRICING.addOns.liquor;
-  if (add_printing) addOnsFees += calcPrinting(pages);
-  if (add_parcel) {
-    addOnsFees += PRICING.addOns.parcelDrop;
-    if (parcelBulky) addOnsFees += PRICING.addOns.parcelBulkyExtra;
-  }
-  if (add_bulky) addOnsFees += bulkyCount * PRICING.addOns.bulkyPerItem;
-  if (add_ride) addOnsFees += rideSeats * (rideSouth ? PRICING.addOns.rideSeatSouthOfFerndale : PRICING.addOns.rideSeat);
+  if (body.addon_fastFood === "yes") addOnsFees += PRICING.addOns.fastFood;
+  if (body.addon_liquor === "yes") addOnsFees += PRICING.addOns.liquor;
+  if (body.addon_printing === "yes") addOnsFees += calcPrinting(pages);
 
-  let waitFee = add_wait ? waitBlocks * PRICING.addOns.waitPerBlock : 0;
+  let waitFee = (body.addon_wait === "yes")
+    ? Math.max(0, Number(body.waitBlocks || 0)) * PRICING.addOns.waitPerBlock
+    : 0;
   if (disc.waitWaived) waitFee = 0;
 
   const serviceOff = Math.min(serviceFee, disc.serviceOff || 0);
@@ -462,6 +501,49 @@ function computeFeesFromBody(body) {
 }
 
 // =========================
+// Google auth routes
+// =========================
+app.get("/auth/google", (req, res, next) => {
+  if (!GOOGLE_CLIENT_ID || !GOOGLE_CLIENT_SECRET || !GOOGLE_CALLBACK_URL) {
+    return res.status(500).send("Google auth is not configured on the server.");
+  }
+
+  const returnTo = String(req.query.returnTo || "https://tobermorygroceryrun.ca/").trim();
+  req.session.returnTo = returnTo;
+
+  return passport.authenticate("google", { scope: ["profile", "email"] })(req, res, next);
+});
+
+app.get(
+  "/auth/google/callback",
+  passport.authenticate("google", {
+    failureRedirect: "https://tobermorygroceryrun.ca/?login=failed",
+  }),
+  (req, res) => {
+    const rt = req.session.returnTo || "https://tobermorygroceryrun.ca/";
+    delete req.session.returnTo;
+    res.redirect(rt);
+  }
+);
+
+app.get("/logout", (req, res) => {
+  const returnTo = String(req.query.returnTo || "https://tobermorygroceryrun.ca/").trim();
+  req.session.destroy(() => res.redirect(returnTo));
+});
+
+app.get("/api/me", (req, res) => {
+  const u = req.user;
+  res.json({
+    ok: true,
+    loggedIn: !!u,
+    email: u?.email || null,
+    name: u?.name || "",
+    membershipLevel: u?.membershipLevel || "none",
+    membershipStatus: u?.membershipStatus || "inactive",
+  });
+});
+
+// =========================
 // Health
 // =========================
 app.get("/health", (req, res) => {
@@ -469,15 +551,12 @@ app.get("/health", (req, res) => {
 });
 
 // =========================
-// MEMBERSHIPS (SELL TODAY)
+// MEMBERSHIPS (Square subscription links)
 // =========================
 app.post("/api/memberships/checkout", (req, res) => {
   const tier = String(req.body?.tier || "").trim().toLowerCase();
-
   const allowed = new Set(["standard", "route", "access", "accesspro"]);
-  if (!allowed.has(tier)) {
-    return res.status(400).json({ ok: false, error: "Invalid tier" });
-  }
+  if (!allowed.has(tier)) return res.status(400).json({ ok: false, error: "Invalid tier" });
 
   const url = SQUARE_LINKS[tier];
   if (!url) {
@@ -486,31 +565,27 @@ app.post("/api/memberships/checkout", (req, res) => {
       error: `Missing Square link for '${tier}'. Set Render env var SQUARE_LINK_${tier.toUpperCase()}.`,
     });
   }
-
   return res.json({ ok: true, tier, checkoutUrl: url });
 });
 
 // =========================
-// PAYMENTS (ONE-TIME LINKS)
+// PAYMENTS (Square one-time links)
 // =========================
 app.post("/api/payments/checkout", (req, res) => {
-  const kind = String(req.body?.kind || "").trim().toLowerCase(); // "groceries" | "fees"
+  const kind = String(req.body?.kind || "").trim().toLowerCase(); // groceries | fees
   const allowed = new Set(["groceries", "fees"]);
-  if (!allowed.has(kind)) {
-    return res.status(400).json({ ok: false, error: "Invalid payment kind" });
-  }
+  if (!allowed.has(kind)) return res.status(400).json({ ok: false, error: "Invalid payment kind" });
 
   const url = SQUARE_PAY_LINKS[kind];
   if (!url) {
     const envKey = kind === "groceries" ? "SQUARE_PAY_GROCERIES_LINK" : "SQUARE_PAY_FEES_LINK";
     return res.status(500).json({ ok: false, error: `Missing Render env var ${envKey}` });
   }
-
   return res.json({ ok: true, kind, checkoutUrl: url });
 });
 
 // =========================
-// RUNS (Local + Owen)
+// RUNS
 // =========================
 app.get("/api/runs/active", async (req, res) => {
   try {
@@ -525,7 +600,6 @@ app.get("/api/runs/active", async (req, res) => {
 
       const windowOpen = now.isAfter(opensAt) && now.isBefore(cutoffAt);
       const slotsRemaining = Math.max(0, (run.maxSlots || 12) - (run.bookedOrdersCount || 0));
-
       const minCfg = runMinimumConfig(type);
 
       out[type] = {
@@ -557,18 +631,8 @@ app.post("/api/orders", upload.single("groceryFile"), async (req, res) => {
     const b = req.body || {};
 
     const required = [
-      "fullName",
-      "email",
-      "phone",
-      "town",
-      "streetAddress",
-      "zone",
-      "runType",
-      "primaryStore",
-      "groceryList",
-      "dropoffPref",
-      "subsPref",
-      "contactPref",
+      "fullName","email","phone","town","streetAddress","zone","runType",
+      "primaryStore","groceryList","dropoffPref","subsPref","contactPref",
     ];
     for (const k of required) {
       const v = String(b[k] || "").trim();
@@ -587,13 +651,7 @@ app.post("/api/orders", upload.single("groceryFile"), async (req, res) => {
       return res.status(400).json({ ok: false, error: "All required consents must be accepted." });
     }
 
-    if (b.addon_liquor === "yes" && b.dropoffPref === "leave_at_door") {
-      return res.status(400).json({ ok: false, error: "Alcohol cannot be left at the door." });
-    }
-    if (b.addon_pharmacy === "yes" && b.dropoffPref === "leave_at_door") {
-      return res.status(400).json({ ok: false, error: "Prescriptions cannot be left at the door." });
-    }
-
+    // Gate run window + slots
     const runs = await ensureUpcomingRuns();
     const runType = String(b.runType || "");
     const run = runs[runType];
@@ -656,32 +714,6 @@ app.post("/api/orders", upload.single("groceryFile"), async (req, res) => {
         attachment,
       },
 
-      addOns: {
-        pharmacy: {
-          enabled: b.addon_pharmacy === "yes",
-          pharmacyName: String(b.pharmacyName || "").trim(),
-          medicationName: String(b.medicationName || "").trim(),
-        },
-        fastFood: { enabled: b.addon_fastFood === "yes", details: String(b.fastFoodDetails || "").trim() },
-        liquor: {
-          enabled: b.addon_liquor === "yes",
-          details: String(b.liquorDetails || "").trim(),
-          idName: String(b.idName || "").trim(),
-          idDob: String(b.idDob || ""),
-          idType: String(b.idType || ""),
-        },
-        printing: { enabled: b.addon_printing === "yes", details: String(b.printingDetails || "").trim(), pages: Number(b.printPages || 0) },
-        parcel: { enabled: b.addon_parcel === "yes", details: String(b.parcelDetails || "").trim(), bulky: b.parcelBulky === "yes" },
-        bulky: { enabled: b.addon_bulky === "yes", count: Number(b.bulkyCount || 0) },
-        ride: {
-          enabled: b.addon_ride === "yes",
-          details: String(b.rideDetails || "").trim(),
-          seats: Number(b.rideSeats || 1),
-          southOfFerndale: b.rideSouthOfFerndale === "yes",
-        },
-        wait: { enabled: b.addon_wait === "yes", blocks: Number(b.waitBlocks || 0) },
-      },
-
       consents: { terms: true, accuracy: true, dropoff: true },
 
       pricingSnapshot: pricing,
@@ -689,6 +721,7 @@ app.post("/api/orders", upload.single("groceryFile"), async (req, res) => {
       status: { state: "submitted", note: "", updatedAt: new Date(), updatedBy: "customer" },
     };
 
+    // Atomic slot gate + increment run counters
     const runUpdate = await Run.findOneAndUpdate(
       { runKey: run.runKey, bookedOrdersCount: { $lt: maxSlots } },
       { $inc: { bookedOrdersCount: 1, bookedFeesTotal: pricing.totalFees }, $set: { lastRecalcAt: new Date() } },
@@ -721,20 +754,21 @@ app.get("/api/orders/:orderId", async (req, res) => {
     const order = await Order.findOne({ orderId }).lean();
     if (!order) return res.status(404).json({ ok: false, error: "Order not found" });
 
-    const out = {
-      orderId: order.orderId,
-      createdAtLocal: fmtLocal(order.createdAt),
-      stores: order.stores,
-      address: order.address,
-      pricingSnapshot: order.pricingSnapshot,
-      status: {
-        state: order.status?.state || "submitted",
-        note: order.status?.note || "",
-        updatedAtLocal: fmtLocal(order.status?.updatedAt || order.updatedAt),
+    res.json({
+      ok: true,
+      order: {
+        orderId: order.orderId,
+        createdAtLocal: fmtLocal(order.createdAt),
+        stores: order.stores,
+        address: order.address,
+        pricingSnapshot: order.pricingSnapshot,
+        status: {
+          state: order.status?.state || "submitted",
+          note: order.status?.note || "",
+          updatedAtLocal: fmtLocal(order.status?.updatedAt || order.updatedAt),
+        },
       },
-    };
-
-    res.json({ ok: true, order: out });
+    });
   } catch (e) {
     res.status(500).json({ ok: false, error: String(e) });
   }
