@@ -1,21 +1,26 @@
 /**
- * server.js — Tobermory Grocery Run backend (Express + MongoDB) — READY FOR SUBSCRIPTIONS TODAY
+ * server.js — Tobermory Grocery Run backend (Express + MongoDB)
+ * READY TO SELL MEMBERSHIPS + TAKE PAYMENTS TODAY
  *
- * What this supports right now:
- * - Your website calls POST /api/memberships/checkout with { tier }
- * - Server returns the correct Square subscription-enabled Payment Link URL (from Render env vars)
- * - User is redirected to Square and can subscribe (Square handles recurring billing)
+ * What this supports:
+ *  - Membership subscriptions via Square subscription-enabled Payment Links:
+ *      POST /api/memberships/checkout   { tier: "standard"|"route"|"access"|"accesspro" }
+ *  - One-time payments via Square Payment Links:
+ *      POST /api/payments/checkout     { kind: "groceries"|"fees" }
+ *  - Runs (live slot counter + cutoffs) + Orders (multipart form w/ optional file upload)
  *
- * REQUIRED Render Environment Variables:
- * - SESSION_SECRET        (strong random string)
- * - MONGO_URI             (your Atlas URI)  [or MONGODB_URI]
- * - SQUARE_LINK_STANDARD  (Square link)
- * - SQUARE_LINK_ROUTE     (Square link)
- * - SQUARE_LINK_ACCESS    (Square link)
- * - SQUARE_LINK_ACCESSPRO (Square link)
+ * REQUIRED Render ENV:
+ *  - SESSION_SECRET
+ *  - MONGO_URI  (or MONGODB_URI)
+ *  - SQUARE_LINK_STANDARD
+ *  - SQUARE_LINK_ROUTE
+ *  - SQUARE_LINK_ACCESS
+ *  - SQUARE_LINK_ACCESSPRO
+ *  - SQUARE_PAY_GROCERIES_LINK
+ *  - SQUARE_PAY_FEES_LINK
  *
- * Optional:
- * - TZ (defaults America/Toronto)
+ * OPTIONAL:
+ *  - TZ  (defaults America/Toronto)
  */
 
 const express = require("express");
@@ -40,6 +45,7 @@ dayjs.extend(timezone);
 // ENV / CONFIG
 // =========================
 const PORT = process.env.PORT || 10000;
+
 const MONGODB_URI =
   process.env.MONGODB_URI ||
   process.env.MONGO_URI ||
@@ -60,12 +66,18 @@ const ALLOWED_ORIGINS = [
   "https://www.tobermorygroceryrun.ca",
 ];
 
-// Square subscription payment links (must be set in Render env)
+// Square subscription payment links (set in Render env)
 const SQUARE_LINKS = {
   standard: process.env.SQUARE_LINK_STANDARD,
   route: process.env.SQUARE_LINK_ROUTE,
   access: process.env.SQUARE_LINK_ACCESS,
   accesspro: process.env.SQUARE_LINK_ACCESSPRO,
+};
+
+// Square one-time payment links (set in Render env)
+const SQUARE_PAY_LINKS = {
+  groceries: process.env.SQUARE_PAY_GROCERIES_LINK, // customer pays grocery total
+  fees: process.env.SQUARE_PAY_FEES_LINK, // customer pays service/delivery fees
 };
 
 const app = express();
@@ -450,27 +462,6 @@ function computeFeesFromBody(body) {
 }
 
 // =========================
-// DEV AUTH (optional helpers)
-// =========================
-app.get("/auth/dev-login", (req, res) => {
-  const email = String(req.query.email || "").trim().toLowerCase();
-  const role = String(req.query.role || "user");
-  if (!email) return res.status(400).send("Missing email");
-  req.session.user = { email, role: role === "admin" ? "admin" : "user" };
-  res.json({ ok: true, loggedIn: true, user: req.session.user });
-});
-
-app.get("/auth/logout", (req, res) => {
-  req.session.destroy(() => {});
-  res.json({ ok: true });
-});
-
-app.get("/api/me", (req, res) => {
-  const u = req.session?.user;
-  res.json({ ok: true, loggedIn: !!u, email: u?.email || null, role: u?.role || "user" });
-});
-
-// =========================
 // Health
 // =========================
 app.get("/health", (req, res) => {
@@ -478,7 +469,7 @@ app.get("/health", (req, res) => {
 });
 
 // =========================
-// MEMBERSHIPS (THIS IS WHAT LETS YOU SELL TODAY)
+// MEMBERSHIPS (SELL TODAY)
 // =========================
 app.post("/api/memberships/checkout", (req, res) => {
   const tier = String(req.body?.tier || "").trim().toLowerCase();
@@ -492,20 +483,30 @@ app.post("/api/memberships/checkout", (req, res) => {
   if (!url) {
     return res.status(500).json({
       ok: false,
-      error:
-        "Square link not configured for tier '" +
-        tier +
-        "'. Set Render env var SQUARE_LINK_" +
-        tier.toUpperCase() +
-        ".",
+      error: `Missing Square link for '${tier}'. Set Render env var SQUARE_LINK_${tier.toUpperCase()}.`,
     });
   }
 
-  // Optional: you can add basic referral tagging by appending ?src=tgr if Square preserves it.
-  // const checkoutUrl = url + (url.includes("?") ? "&" : "?") + "src=tgr";
-  const checkoutUrl = url;
+  return res.json({ ok: true, tier, checkoutUrl: url });
+});
 
-  return res.json({ ok: true, tier, checkoutUrl });
+// =========================
+// PAYMENTS (ONE-TIME LINKS)
+// =========================
+app.post("/api/payments/checkout", (req, res) => {
+  const kind = String(req.body?.kind || "").trim().toLowerCase(); // "groceries" | "fees"
+  const allowed = new Set(["groceries", "fees"]);
+  if (!allowed.has(kind)) {
+    return res.status(400).json({ ok: false, error: "Invalid payment kind" });
+  }
+
+  const url = SQUARE_PAY_LINKS[kind];
+  if (!url) {
+    const envKey = kind === "groceries" ? "SQUARE_PAY_GROCERIES_LINK" : "SQUARE_PAY_FEES_LINK";
+    return res.status(500).json({ ok: false, error: `Missing Render env var ${envKey}` });
+  }
+
+  return res.json({ ok: true, kind, checkoutUrl: url });
 });
 
 // =========================
@@ -586,7 +587,6 @@ app.post("/api/orders", upload.single("groceryFile"), async (req, res) => {
       return res.status(400).json({ ok: false, error: "All required consents must be accepted." });
     }
 
-    // Conservative constraints (you can expand these later)
     if (b.addon_liquor === "yes" && b.dropoffPref === "leave_at_door") {
       return res.status(400).json({ ok: false, error: "Alcohol cannot be left at the door." });
     }
@@ -689,7 +689,6 @@ app.post("/api/orders", upload.single("groceryFile"), async (req, res) => {
       status: { state: "submitted", note: "", updatedAt: new Date(), updatedBy: "customer" },
     };
 
-    // Atomic slot gate + increment run counters
     const runUpdate = await Run.findOneAndUpdate(
       { runKey: run.runKey, bookedOrdersCount: { $lt: maxSlots } },
       { $inc: { bookedOrdersCount: 1, bookedFeesTotal: pricing.totalFees }, $set: { lastRecalcAt: new Date() } },
@@ -698,7 +697,6 @@ app.post("/api/orders", upload.single("groceryFile"), async (req, res) => {
 
     if (!runUpdate) return res.status(409).json({ ok: false, error: "This run is full." });
 
-    // Create order; rollback counts if failure
     try {
       await Order.create(orderDoc);
     } catch (e) {
