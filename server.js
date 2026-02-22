@@ -1,43 +1,38 @@
 /**
- * server.js — TGR backend (Express + MongoDB + Google OAuth + Square + Required Accounts)
+ * server.js — TGR backend (Express + MongoDB + Google OAuth + Required Account Onboarding + Runs + Orders + Estimator + Pay links + Square webhook)
  *
- * What’s new in this version:
- * - REQUIRED account completion before ordering
- *   - Google login creates user (email/name/photo/googleId)
- *   - User must complete /api/profile (Create Account) before /api/orders works
- * - Profile API:
- *   - GET  /api/profile  (requires login)
- *   - POST /api/profile  (requires login, validates required fields, sets profile.complete=true)
- * - /api/me now returns profileComplete
- * - Google OAuth callback redirects to onboarding automatically if profile incomplete
+ * REQUIRED ACCOUNT FLOW:
+ * - Google login creates/updates User (email/name/photo/googleId)
+ * - User must complete /api/profile (Create Account) before POST /api/orders is allowed
+ * - Google callback redirects to https://tobermorygroceryrun.ca/?tab=account&onboarding=1 if incomplete
  *
- * ENV (Render):
- * - SESSION_SECRET
- * - MONGO_URI (or MONGODB_URI)
+ * Render ENV (minimum):
+ * - MONGO_URI (or MONGODB_URI)  -> MongoDB Atlas URI
+ * - SESSION_SECRET             -> long random string
  * - GOOGLE_CLIENT_ID
  * - GOOGLE_CLIENT_SECRET
- * - GOOGLE_CALLBACK_URL = https://api.tobermorygroceryrun.ca/auth/google/callback
+ * - GOOGLE_CALLBACK_URL        -> https://api.tobermorygroceryrun.ca/auth/google/callback
  *
- * Square links:
+ * Optional:
+ * - ADMIN_EMAILS (comma-separated allowlist for /admin)
+ * - TZ (default America/Toronto)
+ *
+ * Square links (optional):
+ * - SQUARE_PAY_GROCERIES_LINK
+ * - SQUARE_PAY_FEES_LINK
  * - SQUARE_LINK_STANDARD
  * - SQUARE_LINK_ROUTE
  * - SQUARE_LINK_ACCESS
  * - SQUARE_LINK_ACCESSPRO
- * - SQUARE_PAY_GROCERIES_LINK
- * - SQUARE_PAY_FEES_LINK
  *
- * Square webhooks:
+ * Square webhook (optional):
  * - SQUARE_WEBHOOK_SIGNATURE_KEY
- * - SQUARE_WEBHOOK_NOTIFICATION_URL = https://api.tobermorygroceryrun.ca/webhooks/square
+ * - SQUARE_WEBHOOK_NOTIFICATION_URL -> https://api.tobermorygroceryrun.ca/webhooks/square
  * - SQUARE_ACCESS_TOKEN
  * - SQUARE_PLAN_STANDARD_VARIATION_ID
  * - SQUARE_PLAN_ROUTE_VARIATION_ID
  * - SQUARE_PLAN_ACCESS_VARIATION_ID
  * - SQUARE_PLAN_ACCESSPRO_VARIATION_ID
- *
- * OPTIONAL:
- * - TZ (default America/Toronto)
- * - ADMIN_EMAILS (comma separated allowlist)
  */
 
 const express = require("express");
@@ -46,8 +41,6 @@ const multer = require("multer");
 const cookieParser = require("cookie-parser");
 const session = require("express-session");
 const cors = require("cors");
-const path = require("path");
-const fs = require("fs");
 
 const MongoStorePkg = require("connect-mongo");
 const MongoStore = MongoStorePkg.default || MongoStorePkg;
@@ -56,6 +49,7 @@ const passport = require("passport");
 const GoogleStrategy = require("passport-google-oauth20").Strategy;
 
 const { Client, Environment, WebhooksHelper } = require("square");
+
 const User = require("./models/User");
 
 const dayjs = require("dayjs");
@@ -85,6 +79,7 @@ const ADMIN_EMAILS = String(process.env.ADMIN_EMAILS || "")
   .map((s) => s.trim().toLowerCase())
   .filter(Boolean);
 
+// Frontend domains allowed to send cookies to API
 const ALLOWED_ORIGINS = [
   "https://tobermorygroceryrun.ca",
   "https://www.tobermorygroceryrun.ca",
@@ -121,7 +116,7 @@ function squareClient() {
 }
 
 // =========================
-// App + middleware
+// APP + MIDDLEWARE
 // =========================
 const app = express();
 
@@ -135,7 +130,7 @@ app.use(
   })
 );
 
-// Capture raw body for Square webhook signature validation
+// Capture rawBody for Square webhook signature validation
 app.use(
   express.json({
     limit: "3mb",
@@ -147,6 +142,8 @@ app.use(
 
 app.use(express.urlencoded({ extended: true }));
 app.use(cookieParser());
+
+// Render/proxy support for secure cookies
 app.set("trust proxy", 1);
 
 app.use(
@@ -171,7 +168,7 @@ app.use(
 );
 
 // =========================
-// Passport (Google OAuth)
+// PASSPORT (GOOGLE OAUTH)
 // =========================
 passport.serializeUser((user, done) => done(null, user._id.toString()));
 
@@ -217,7 +214,6 @@ if (GOOGLE_CLIENT_ID && GOOGLE_CLIENT_SECRET && GOOGLE_CALLBACK_URL) {
                 renewalDate: null,
                 discounts: [],
                 perks: [],
-                // profile blob is where we store onboarding data
                 profile: {
                   version: 1,
                   complete: false,
@@ -242,7 +238,7 @@ app.use(passport.initialize());
 app.use(passport.session());
 
 // =========================
-// Uploads
+// UPLOADS
 // =========================
 const upload = multer({
   dest: "uploads/",
@@ -250,7 +246,7 @@ const upload = multer({
 });
 
 // =========================
-// Pricing (server truth baseline)
+// PRICING (SERVER TRUTH)
 // =========================
 const PRICING = {
   serviceFee: 25,
@@ -297,7 +293,7 @@ function membershipDiscounts(tier, applyPerkYes) {
 }
 
 // =========================
-// Mongo models
+// MONGO MODELS (LOCAL TO SERVER.JS)
 // =========================
 const CounterSchema = new mongoose.Schema(
   { key: { type: String, unique: true }, seq: { type: Number, default: 0 } },
@@ -318,7 +314,6 @@ const RunSchema = new mongoose.Schema(
 
     bookedOrdersCount: { type: Number, default: 0 },
     bookedFeesTotal: { type: Number, default: 0 },
-
     lastRecalcAt: { type: Date },
   },
   { timestamps: true }
@@ -386,7 +381,7 @@ const Order = mongoose.model("Order", OrderSchema);
 const WebhookEvent = mongoose.model("WebhookEvent", WebhookEventSchema);
 
 // =========================
-// Helpers
+// HELPERS
 // =========================
 function escapeHtml(s) {
   return String(s || "")
@@ -589,11 +584,14 @@ function isProfileComplete(profile) {
     return !!street && !!town && !!zone;
   });
 
-  return !!fullName && !!phone && !!contactPref && contactAuth && hasAddress;
+  // Must also have accepted required profile consents
+  const consentsOk = p.consentTerms === true && p.consentPrivacy === true;
+
+  return !!fullName && !!phone && !!contactPref && contactAuth && hasAddress && consentsOk;
 }
 
 // =========================
-// Guards
+// GUARDS
 // =========================
 function requireLogin(req, res, next) {
   if (!req.user) return res.status(401).json({ ok: false, error: "Sign-in required." });
@@ -616,7 +614,7 @@ function requireAdmin(req, res, next) {
 }
 
 // =========================
-// Auth routes
+// AUTH ROUTES
 // =========================
 app.get("/auth/google", (req, res, next) => {
   if (!GOOGLE_CLIENT_ID || !GOOGLE_CLIENT_SECRET || !GOOGLE_CALLBACK_URL) {
@@ -637,12 +635,11 @@ app.get(
     // Force onboarding redirect if profile incomplete
     try {
       const u = await User.findById(req.user._id).lean();
-      const complete = isProfileComplete(u?.profile);
-      if (!complete) {
+      if (!isProfileComplete(u?.profile || {})) {
         return res.redirect("https://tobermorygroceryrun.ca/?tab=account&onboarding=1");
       }
     } catch {
-      // If anything fails, still send them to the site
+      // ignore and continue
     }
 
     res.redirect(rt);
@@ -655,7 +652,7 @@ app.get("/logout", (req, res) => {
 });
 
 // =========================
-// API: me + profile
+// API: ME + PROFILE
 // =========================
 app.get("/api/me", (req, res) => {
   const u = req.user;
@@ -693,33 +690,25 @@ app.post("/api/profile", requireLogin, async (req, res) => {
 
     const profile = (u.profile && typeof u.profile === "object") ? u.profile : { version: 1 };
 
-    // Core identity
+    // Identity + contact (required)
     profile.fullName = String(b.fullName || "").trim();
     profile.preferredName = String(b.preferredName || "").trim();
     profile.phone = String(b.phone || "").trim();
     profile.altPhone = String(b.altPhone || "").trim();
-
-    // Preferences
     profile.contactPref = String(b.contactPref || "").trim(); // call/text/email
     profile.contactAuth = String(b.contactAuth || "") === "yes";
+
+    // Defaults / preferences (optional)
     profile.subsDefault = String(b.subsDefault || "").trim();
     profile.dropoffDefault = String(b.dropoffDefault || "").trim();
     profile.notes = String(b.notes || "").trim();
-
-    // Optional data capture
     profile.accessibility = String(b.accessibility || "").trim();
     profile.dietary = String(b.dietary || "").trim();
-    profile.preferredStores = Array.isArray(b.preferredStores) ? b.preferredStores : safeJsonArray(b.preferredStores);
     profile.emergencyContactName = String(b.emergencyContactName || "").trim();
     profile.emergencyContactPhone = String(b.emergencyContactPhone || "").trim();
 
-    // Addresses
-    const addressesIn = Array.isArray(b.addresses) ? b.addresses : safeJsonArray(b.addressesJson).map(() => ({}));
-    const addr = Array.isArray(b.addresses) ? b.addresses : (() => {
-      try { return JSON.parse(b.addresses || "[]"); } catch { return []; }
-    })();
-
-    const addresses = Array.isArray(addr) ? addr : [];
+    // Addresses (required: at least one with street/town/zone)
+    const addresses = Array.isArray(b.addresses) ? b.addresses : [];
     profile.addresses = addresses.map((a) => ({
       id: String(a.id || "").trim() || String(Math.random()).slice(2),
       label: String(a.label || "").trim(),
@@ -730,21 +719,16 @@ app.post("/api/profile", requireLogin, async (req, res) => {
       instructions: String(a.instructions || "").trim(),
       gateCode: String(a.gateCode || "").trim(),
     }));
-
-    // Default address
     profile.defaultId = String(b.defaultId || "").trim();
 
-    // Consents
+    // Required consents for account completion
     profile.consentTerms = String(b.consentTerms || "") === "yes";
     profile.consentPrivacy = String(b.consentPrivacy || "") === "yes";
     profile.consentMarketing = String(b.consentMarketing || "") === "yes";
 
-    // Completion: must have required + consents
-    const requiredConsentsOk = profile.consentTerms === true && profile.consentPrivacy === true;
-    const completeNow = isProfileComplete(profile) && requiredConsentsOk;
-
-    profile.complete = !!completeNow;
-    profile.completedAt = completeNow ? new Date().toISOString() : (profile.completedAt || null);
+    // Completion
+    profile.complete = isProfileComplete(profile);
+    profile.completedAt = profile.complete ? (profile.completedAt || new Date().toISOString()) : (profile.completedAt || null);
 
     u.profile = profile;
     await u.save();
@@ -756,12 +740,12 @@ app.post("/api/profile", requireLogin, async (req, res) => {
 });
 
 // =========================
-// Health
+// HEALTH
 // =========================
 app.get("/health", (_req, res) => res.json({ ok: true, uptime: process.uptime() }));
 
 // =========================
-// Square link resolvers + convenience redirects
+// PAY + MEMBERSHIP CHECKOUT LINK RESOLVERS
 // =========================
 app.post("/api/memberships/checkout", (req, res) => {
   const tier = String(req.body?.tier || "").trim().toLowerCase();
@@ -800,7 +784,7 @@ app.get("/pay/fees", (_req, res) => {
 });
 
 // =========================
-// Runs
+// RUNS
 // =========================
 app.get("/api/runs/active", async (_req, res) => {
   try {
@@ -839,7 +823,7 @@ app.get("/api/runs/active", async (_req, res) => {
 });
 
 // =========================
-// Fee estimator
+// FEE ESTIMATOR
 // =========================
 app.post("/api/estimator", (req, res) => {
   try {
@@ -852,7 +836,7 @@ app.post("/api/estimator", (req, res) => {
 });
 
 // =========================
-// Orders (REQUIRES LOGIN + PROFILE COMPLETE)
+// ORDERS (REQUIRES LOGIN + PROFILE COMPLETE)
 // =========================
 app.post("/api/orders", requireLogin, requireProfileComplete, upload.single("groceryFile"), async (req, res) => {
   try {
@@ -860,7 +844,7 @@ app.post("/api/orders", requireLogin, requireProfileComplete, upload.single("gro
     const user = await User.findById(req.user._id).lean();
     const profile = user?.profile || {};
 
-    // Must still accept consents at time of order
+    // Per-order consents
     if (
       String(b.consent_terms || "") !== "yes" ||
       String(b.consent_accuracy || "") !== "yes" ||
@@ -870,7 +854,7 @@ app.post("/api/orders", requireLogin, requireProfileComplete, upload.single("gro
     }
 
     // Required order fields
-    const required = ["town", "streetAddress", "zone", "runType", "primaryStore", "groceryList", "dropoffPref", "subsPref", "contactPref"];
+    const required = ["town","streetAddress","zone","runType","primaryStore","groceryList","dropoffPref","subsPref","contactPref"];
     for (const k of required) {
       const v = String(b[k] || "").trim();
       if (!v) return res.status(400).json({ ok: false, error: "Missing required field: " + k });
@@ -915,12 +899,12 @@ app.post("/api/orders", requireLogin, requireProfileComplete, upload.single("gro
 
     const pricingSnapshot = breakdown.totals;
 
-    // Always use account identity as source of truth
     const orderDoc = {
       orderId,
       runKey: run.runKey,
       runType,
 
+      // Source of truth: account profile
       customer: {
         fullName: String(profile.fullName || user.name || "").trim(),
         email: String(user.email || "").trim().toLowerCase(),
@@ -955,6 +939,7 @@ app.post("/api/orders", requireLogin, requireProfileComplete, upload.single("gro
       status: { state: "submitted", note: "", updatedAt: new Date(), updatedBy: "customer" },
     };
 
+    // Slot reservation
     const runUpdate = await Run.findOneAndUpdate(
       { runKey: run.runKey, bookedOrdersCount: { $lt: maxSlots } },
       { $inc: { bookedOrdersCount: 1, bookedFeesTotal: pricingSnapshot.totalFees }, $set: { lastRecalcAt: new Date() } },
@@ -966,6 +951,7 @@ app.post("/api/orders", requireLogin, requireProfileComplete, upload.single("gro
     try {
       await Order.create(orderDoc);
     } catch (e) {
+      // rollback slot count if create fails
       await Run.updateOne(
         { runKey: run.runKey },
         { $inc: { bookedOrdersCount: -1, bookedFeesTotal: -pricingSnapshot.totalFees }, $set: { lastRecalcAt: new Date() } }
@@ -979,7 +965,7 @@ app.post("/api/orders", requireLogin, requireProfileComplete, upload.single("gro
   }
 });
 
-// Public tracking
+// Public tracking endpoint
 app.get("/api/orders/:orderId", async (req, res) => {
   try {
     const orderId = String(req.params.orderId || "").trim();
@@ -1009,7 +995,7 @@ app.get("/api/orders/:orderId", async (req, res) => {
 });
 
 // =========================
-// Member portal
+// MEMBER PAGE (simple)
 // =========================
 app.get("/member", requireLogin, async (req, res) => {
   const u = await User.findById(req.user._id).lean();
@@ -1081,90 +1067,22 @@ ${banner}
 });
 
 // =========================
-// Admin portal (kept minimal)
+// ADMIN PAGE (simple placeholder)
 // =========================
-function buildAdminOrderQuery(q, status) {
-  const query = {};
-  const qq = String(q || "").trim();
-  const st = String(status || "").trim().toLowerCase();
-  if (st && st !== "all") query["status.state"] = st;
-
-  if (qq) {
-    query["$or"] = [
-      { orderId: new RegExp(qq, "i") },
-      { "customer.fullName": new RegExp(qq, "i") },
-      { "customer.email": new RegExp(qq, "i") },
-      { "customer.phone": new RegExp(qq, "i") },
-      { "address.town": new RegExp(qq, "i") },
-      { "stores.primary": new RegExp(qq, "i") },
-    ];
-  }
-  return query;
-}
-
-app.get("/admin", requireLogin, requireAdmin, async (req, res) => {
-  const q = String(req.query.q || "");
-  const status = String(req.query.status || "all");
-  const mongoQuery = buildAdminOrderQuery(q, status);
-
-  const orders = await Order.find(mongoQuery).sort({ createdAt: -1 }).limit(200).lean();
-  const rows = orders
-    .map((o) => {
-      const st = o.status?.state || "submitted";
-      const when = fmtLocal(o.createdAt);
-      const name = o.customer?.fullName || "—";
-      const phone = o.customer?.phone || "—";
-      const email = o.customer?.email || "—";
-      const town = o.address?.town || "—";
-      const runType = o.runType || "—";
-      const totalFees =
-        typeof o.pricingSnapshot?.totalFees === "number"
-          ? o.pricingSnapshot.totalFees.toFixed(2)
-          : "0.00";
-
-      return `
-        <tr>
-          <td style="padding:10px 8px;border-top:1px solid #ddd;font-weight:900;">${escapeHtml(o.orderId)}</td>
-          <td style="padding:10px 8px;border-top:1px solid #ddd;">${escapeHtml(when)}</td>
-          <td style="padding:10px 8px;border-top:1px solid #ddd;">${escapeHtml(runType)}</td>
-          <td style="padding:10px 8px;border-top:1px solid #ddd;">
-            ${escapeHtml(name)}
-            <div style="color:#666;font-size:12px;">${escapeHtml(phone)} • ${escapeHtml(email)}</div>
-          </td>
-          <td style="padding:10px 8px;border-top:1px solid #ddd;">${escapeHtml(town)}</td>
-          <td style="padding:10px 8px;border-top:1px solid #ddd;">$${escapeHtml(totalFees)}</td>
-          <td style="padding:10px 8px;border-top:1px solid #ddd;font-weight:900;">${escapeHtml(st)}</td>
-        </tr>
-      `;
-    })
-    .join("");
-
+app.get("/admin", requireLogin, requireAdmin, async (_req, res) => {
   res.setHeader("Content-Type", "text/html; charset=utf-8");
   res.send(`<!doctype html>
 <html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>TGR Admin</title></head>
-<body style="font-family:system-ui,Segoe UI,Roboto,Arial,sans-serif;padding:18px;max-width:1280px;margin:0 auto;">
-<h1 style="margin:0 0 6px;">Admin</h1>
-<div style="color:#444;margin-bottom:14px;">Signed in as <strong>${escapeHtml(req.user?.email || "")}</strong></div>
-<div style="margin-bottom:14px;"><a href="/logout?returnTo=https%3A%2F%2Ftobermorygroceryrun.ca%2F">Log out</a></div>
-
-<table style="width:100%;border-collapse:collapse;">
-<thead><tr>
-<th style="text-align:left;padding:10px 8px;border-bottom:2px solid #ddd;">Order ID</th>
-<th style="text-align:left;padding:10px 8px;border-bottom:2px solid #ddd;">Created</th>
-<th style="text-align:left;padding:10px 8px;border-bottom:2px solid #ddd;">Run</th>
-<th style="text-align:left;padding:10px 8px;border-bottom:2px solid #ddd;">Customer</th>
-<th style="text-align:left;padding:10px 8px;border-bottom:2px solid #ddd;">Town</th>
-<th style="text-align:left;padding:10px 8px;border-bottom:2px solid #ddd;">Fees</th>
-<th style="text-align:left;padding:10px 8px;border-bottom:2px solid #ddd;">Status</th>
-</tr></thead>
-<tbody>${rows || `<tr><td colspan="7" style="padding:10px 8px;color:#666;">No orders found.</td></tr>`}</tbody>
-</table>
+<body style="font-family:system-ui,Segoe UI,Roboto,Arial,sans-serif;padding:18px;max-width:900px;margin:0 auto;">
+<h1 style="margin:0 0 8px;">Admin</h1>
+<div style="color:#444;margin-bottom:14px;">This is a placeholder admin page.</div>
+<div><a href="/logout?returnTo=https%3A%2F%2Ftobermorygroceryrun.ca%2F">Log out</a></div>
 </body></html>`);
 });
 
 // =========================
-// Square Webhook: auto-sync membership
+// SQUARE WEBHOOK (OPTIONAL)
 // =========================
 app.post("/webhooks/square", async (req, res) => {
   try {
@@ -1243,7 +1161,7 @@ app.post("/webhooks/square", async (req, res) => {
 });
 
 // =========================
-// Root + Boot
+// ROOT + BOOT
 // =========================
 app.get("/", (_req, res) => res.send("TGR backend up"));
 
