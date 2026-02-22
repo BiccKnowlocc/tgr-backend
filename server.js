@@ -1,33 +1,41 @@
 /**
- * server.js — TGR backend (Express + MongoDB + Google OAuth + Required Account Onboarding + Runs + Orders + Estimator + Pay links + Square webhook)
+ * server.js — TGR backend (Express + MongoDB + Google OAuth + Required Account Onboarding
+ * + Runs + Orders + Estimator + Membership checkout links + Pay links + Square webhook)
  *
- * REQUIRED ACCOUNT FLOW:
- * - Google login creates/updates User (email/name/photo/googleId)
- * - User must complete /api/profile (Create Account) before POST /api/orders is allowed
- * - Google callback redirects to https://tobermorygroceryrun.ca/?tab=account&onboarding=1 if incomplete
+ * You asked to keep/restore all site sections (About/Areas/Pricing/etc). Those are frontend panels,
+ * so server stays largely the same. This server supports:
+ * - Google auth: /auth/google, /auth/google/callback, /logout
+ * - Account/profile: GET/POST /api/profile (required before ordering)
+ * - /api/me (returns profileComplete)
+ * - Runs: /api/runs/active
+ * - Estimator: /api/estimator
+ * - Orders: POST /api/orders (requires login + profileComplete), GET /api/orders/:orderId (tracking)
+ * - Membership checkout: POST /api/memberships/checkout (returns Square link)
+ * - Pay links: POST /api/payments/checkout + /pay/groceries + /pay/fees
+ * - Member/admin placeholder pages: /member, /admin
  *
  * Render ENV (minimum):
- * - MONGO_URI (or MONGODB_URI)  -> MongoDB Atlas URI
- * - SESSION_SECRET             -> long random string
+ * - MONGO_URI (or MONGODB_URI)
+ * - SESSION_SECRET
  * - GOOGLE_CLIENT_ID
  * - GOOGLE_CLIENT_SECRET
- * - GOOGLE_CALLBACK_URL        -> https://api.tobermorygroceryrun.ca/auth/google/callback
+ * - GOOGLE_CALLBACK_URL = https://api.tobermorygroceryrun.ca/auth/google/callback
  *
- * Optional:
- * - ADMIN_EMAILS (comma-separated allowlist for /admin)
- * - TZ (default America/Toronto)
- *
- * Square links (optional):
- * - SQUARE_PAY_GROCERIES_LINK
- * - SQUARE_PAY_FEES_LINK
+ * Square links (optional, but used by Membership + Pay tabs):
  * - SQUARE_LINK_STANDARD
  * - SQUARE_LINK_ROUTE
  * - SQUARE_LINK_ACCESS
  * - SQUARE_LINK_ACCESSPRO
+ * - SQUARE_PAY_GROCERIES_LINK
+ * - SQUARE_PAY_FEES_LINK
+ *
+ * Optional:
+ * - ADMIN_EMAILS (comma-separated)
+ * - TZ (default America/Toronto)
  *
  * Square webhook (optional):
  * - SQUARE_WEBHOOK_SIGNATURE_KEY
- * - SQUARE_WEBHOOK_NOTIFICATION_URL -> https://api.tobermorygroceryrun.ca/webhooks/square
+ * - SQUARE_WEBHOOK_NOTIFICATION_URL = https://api.tobermorygroceryrun.ca/webhooks/square
  * - SQUARE_ACCESS_TOKEN
  * - SQUARE_PLAN_STANDARD_VARIATION_ID
  * - SQUARE_PLAN_ROUTE_VARIATION_ID
@@ -79,7 +87,6 @@ const ADMIN_EMAILS = String(process.env.ADMIN_EMAILS || "")
   .map((s) => s.trim().toLowerCase())
   .filter(Boolean);
 
-// Frontend domains allowed to send cookies to API
 const ALLOWED_ORIGINS = [
   "https://tobermorygroceryrun.ca",
   "https://www.tobermorygroceryrun.ca",
@@ -130,7 +137,6 @@ app.use(
   })
 );
 
-// Capture rawBody for Square webhook signature validation
 app.use(
   express.json({
     limit: "3mb",
@@ -139,11 +145,9 @@ app.use(
     },
   })
 );
-
 app.use(express.urlencoded({ extended: true }));
 app.use(cookieParser());
 
-// Render/proxy support for secure cookies
 app.set("trust proxy", 1);
 
 app.use(
@@ -184,15 +188,10 @@ passport.deserializeUser(async (id, done) => {
 if (GOOGLE_CLIENT_ID && GOOGLE_CLIENT_SECRET && GOOGLE_CALLBACK_URL) {
   passport.use(
     new GoogleStrategy(
-      {
-        clientID: GOOGLE_CLIENT_ID,
-        clientSecret: GOOGLE_CLIENT_SECRET,
-        callbackURL: GOOGLE_CALLBACK_URL,
-      },
+      { clientID: GOOGLE_CLIENT_ID, clientSecret: GOOGLE_CLIENT_SECRET, callbackURL: GOOGLE_CALLBACK_URL },
       async (_accessToken, _refreshToken, profile, done) => {
         try {
-          const email =
-            (profile.emails && profile.emails[0] && profile.emails[0].value) || "";
+          const email = (profile.emails && profile.emails[0] && profile.emails[0].value) || "";
           const normalized = String(email).toLowerCase().trim();
           if (!normalized) return done(null, false);
 
@@ -200,8 +199,7 @@ if (GOOGLE_CLIENT_ID && GOOGLE_CLIENT_SECRET && GOOGLE_CALLBACK_URL) {
             googleId: profile.id,
             email: normalized,
             name: profile.displayName || "",
-            photo:
-              (profile.photos && profile.photos[0] && profile.photos[0].value) || "",
+            photo: (profile.photos && profile.photos[0] && profile.photos[0].value) || "",
           };
 
           const u = await User.findOneAndUpdate(
@@ -214,12 +212,7 @@ if (GOOGLE_CLIENT_ID && GOOGLE_CLIENT_SECRET && GOOGLE_CALLBACK_URL) {
                 renewalDate: null,
                 discounts: [],
                 perks: [],
-                profile: {
-                  version: 1,
-                  complete: false,
-                  defaultId: "",
-                  addresses: [],
-                },
+                profile: { version: 1, complete: false, defaultId: "", addresses: [] },
               },
             },
             { upsert: true, new: true }
@@ -246,7 +239,7 @@ const upload = multer({
 });
 
 // =========================
-// PRICING (SERVER TRUTH)
+// PRICING (SERVER TRUTH BASELINE)
 // =========================
 const PRICING = {
   serviceFee: 25,
@@ -266,34 +259,20 @@ function calcPrinting(pages) {
   if (p <= 0) return 0;
   const first = Math.min(p, 10);
   const rest = Math.max(0, p - 10);
-  return (
-    PRICING.addOns.printingBase +
-    first * PRICING.addOns.printingFirst10 +
-    rest * PRICING.addOns.printingAfter10
-  );
+  return PRICING.addOns.printingBase + first * PRICING.addOns.printingFirst10 + rest * PRICING.addOns.printingAfter10;
 }
 
 function membershipDiscounts(tier, applyPerkYes) {
-  if (!tier || !applyPerkYes)
-    return { serviceOff: 0, zoneOff: 0, freeAddonUpTo: 0, waitWaived: false };
-
-  if (tier === "standard")
-    return { serviceOff: 0, zoneOff: 10, freeAddonUpTo: 10, waitWaived: false };
-
-  if (tier === "route")
-    return { serviceOff: 5, zoneOff: 10, freeAddonUpTo: 10, waitWaived: false };
-
-  if (tier === "access")
-    return { serviceOff: 8, zoneOff: 10, freeAddonUpTo: 10, waitWaived: true };
-
-  if (tier === "accesspro")
-    return { serviceOff: 10, zoneOff: 0, freeAddonUpTo: 0, waitWaived: true };
-
+  if (!tier || !applyPerkYes) return { serviceOff: 0, zoneOff: 0, freeAddonUpTo: 0, waitWaived: false };
+  if (tier === "standard") return { serviceOff: 0, zoneOff: 10, freeAddonUpTo: 10, waitWaived: false };
+  if (tier === "route") return { serviceOff: 5, zoneOff: 10, freeAddonUpTo: 10, waitWaived: false };
+  if (tier === "access") return { serviceOff: 8, zoneOff: 10, freeAddonUpTo: 10, waitWaived: true };
+  if (tier === "accesspro") return { serviceOff: 10, zoneOff: 0, freeAddonUpTo: 0, waitWaived: true };
   return { serviceOff: 0, zoneOff: 0, freeAddonUpTo: 0, waitWaived: false };
 }
 
 // =========================
-// MONGO MODELS (LOCAL TO SERVER.JS)
+// MONGO MODELS (IN FILE)
 // =========================
 const CounterSchema = new mongoose.Schema(
   { key: { type: String, unique: true }, seq: { type: Number, default: 0 } },
@@ -322,7 +301,6 @@ const RunSchema = new mongoose.Schema(
 const OrderSchema = new mongoose.Schema(
   {
     orderId: { type: String, unique: true, index: true },
-
     runKey: { type: String, required: true },
     runType: { type: String, enum: ["local", "owen"], required: true },
 
@@ -424,16 +402,12 @@ function buildRunTimes(type) {
 }
 
 function runMinimumConfig(type) {
-  if (type === "local") {
-    return { minOrders: 6, minFees: 200, minLogic: "OR", minimumText: "Minimum: 6 orders OR $200 booked fees" };
-  }
+  if (type === "local") return { minOrders: 6, minFees: 200, minLogic: "OR", minimumText: "Minimum: 6 orders OR $200 booked fees" };
   return { minOrders: 6, minFees: 300, minLogic: "AND", minimumText: "Minimum: 6 orders AND $300 booked fees" };
 }
 
 function meetsMinimums(run) {
-  if (run.minLogic === "AND") {
-    return run.bookedOrdersCount >= run.minOrders && run.bookedFeesTotal >= run.minFees;
-  }
+  if (run.minLogic === "AND") return run.bookedOrdersCount >= run.minOrders && run.bookedFeesTotal >= run.minFees;
   return run.bookedOrdersCount >= run.minOrders || run.bookedFeesTotal >= run.minFees;
 }
 
@@ -459,10 +433,7 @@ async function ensureUpcomingRuns() {
       run = created.toObject();
     }
 
-    const needsRecalc =
-      !run.lastRecalcAt ||
-      dayjs(run.lastRecalcAt).isBefore(nowTz().subtract(2, "minute").toDate());
-
+    const needsRecalc = !run.lastRecalcAt || dayjs(run.lastRecalcAt).isBefore(nowTz().subtract(2, "minute").toDate());
     if (needsRecalc) {
       const agg = await Order.aggregate([
         { $match: { runKey } },
@@ -470,6 +441,7 @@ async function ensureUpcomingRuns() {
       ]);
       const c = agg?.[0]?.c || 0;
       const fees = agg?.[0]?.fees || 0;
+
       await Run.updateOne(
         { runKey },
         { $set: { bookedOrdersCount: c, bookedFeesTotal: fees, lastRecalcAt: new Date() } }
@@ -485,13 +457,8 @@ async function ensureUpcomingRuns() {
 }
 
 async function nextOrderId() {
-  const c = await Counter.findOneAndUpdate(
-    { key: "orders" },
-    { $inc: { seq: 1 } },
-    { upsert: true, new: true }
-  ).lean();
-  const num = String(c.seq).padStart(5, "0");
-  return "TGR-" + num;
+  const c = await Counter.findOneAndUpdate({ key: "orders" }, { $inc: { seq: 1 } }, { upsert: true, new: true }).lean();
+  return "TGR-" + String(c.seq).padStart(5, "0");
 }
 
 function safeJsonArray(str) {
@@ -584,9 +551,7 @@ function isProfileComplete(profile) {
     return !!street && !!town && !!zone;
   });
 
-  // Must also have accepted required profile consents
   const consentsOk = p.consentTerms === true && p.consentPrivacy === true;
-
   return !!fullName && !!phone && !!contactPref && contactAuth && hasAddress && consentsOk;
 }
 
@@ -599,8 +564,7 @@ function requireLogin(req, res, next) {
 }
 
 function requireProfileComplete(req, res, next) {
-  const profile = req.user?.profile || {};
-  if (!isProfileComplete(profile)) {
+  if (!isProfileComplete(req.user?.profile || {})) {
     return res.status(403).json({ ok: false, error: "Account setup required. Please complete your profile." });
   }
   next();
@@ -620,8 +584,7 @@ app.get("/auth/google", (req, res, next) => {
   if (!GOOGLE_CLIENT_ID || !GOOGLE_CLIENT_SECRET || !GOOGLE_CALLBACK_URL) {
     return res.status(500).send("Google auth is not configured on this server.");
   }
-  const returnTo = String(req.query.returnTo || "https://tobermorygroceryrun.ca/").trim();
-  req.session.returnTo = returnTo;
+  req.session.returnTo = String(req.query.returnTo || "https://tobermorygroceryrun.ca/").trim();
   return passport.authenticate("google", { scope: ["profile", "email"] })(req, res, next);
 });
 
@@ -632,15 +595,12 @@ app.get(
     const rt = req.session.returnTo || "https://tobermorygroceryrun.ca/";
     delete req.session.returnTo;
 
-    // Force onboarding redirect if profile incomplete
     try {
       const u = await User.findById(req.user._id).lean();
       if (!isProfileComplete(u?.profile || {})) {
         return res.redirect("https://tobermorygroceryrun.ca/?tab=account&onboarding=1");
       }
-    } catch {
-      // ignore and continue
-    }
+    } catch {}
 
     res.redirect(rt);
   }
@@ -656,7 +616,6 @@ app.get("/logout", (req, res) => {
 // =========================
 app.get("/api/me", (req, res) => {
   const u = req.user;
-  const profile = u?.profile || {};
   res.json({
     ok: true,
     loggedIn: !!u,
@@ -666,7 +625,7 @@ app.get("/api/me", (req, res) => {
     membershipLevel: u?.membershipLevel || "none",
     membershipStatus: u?.membershipStatus || "inactive",
     renewalDate: u?.renewalDate || null,
-    profileComplete: isProfileComplete(profile),
+    profileComplete: isProfileComplete(u?.profile || {}),
   });
 });
 
@@ -690,15 +649,13 @@ app.post("/api/profile", requireLogin, async (req, res) => {
 
     const profile = (u.profile && typeof u.profile === "object") ? u.profile : { version: 1 };
 
-    // Identity + contact (required)
     profile.fullName = String(b.fullName || "").trim();
     profile.preferredName = String(b.preferredName || "").trim();
     profile.phone = String(b.phone || "").trim();
     profile.altPhone = String(b.altPhone || "").trim();
-    profile.contactPref = String(b.contactPref || "").trim(); // call/text/email
+    profile.contactPref = String(b.contactPref || "").trim();
     profile.contactAuth = String(b.contactAuth || "") === "yes";
 
-    // Defaults / preferences (optional)
     profile.subsDefault = String(b.subsDefault || "").trim();
     profile.dropoffDefault = String(b.dropoffDefault || "").trim();
     profile.notes = String(b.notes || "").trim();
@@ -707,7 +664,6 @@ app.post("/api/profile", requireLogin, async (req, res) => {
     profile.emergencyContactName = String(b.emergencyContactName || "").trim();
     profile.emergencyContactPhone = String(b.emergencyContactPhone || "").trim();
 
-    // Addresses (required: at least one with street/town/zone)
     const addresses = Array.isArray(b.addresses) ? b.addresses : [];
     profile.addresses = addresses.map((a) => ({
       id: String(a.id || "").trim() || String(Math.random()).slice(2),
@@ -719,23 +675,22 @@ app.post("/api/profile", requireLogin, async (req, res) => {
       instructions: String(a.instructions || "").trim(),
       gateCode: String(a.gateCode || "").trim(),
     }));
+
     profile.defaultId = String(b.defaultId || "").trim();
 
-    // Required consents for account completion
     profile.consentTerms = String(b.consentTerms || "") === "yes";
     profile.consentPrivacy = String(b.consentPrivacy || "") === "yes";
     profile.consentMarketing = String(b.consentMarketing || "") === "yes";
 
-    // Completion
     profile.complete = isProfileComplete(profile);
     profile.completedAt = profile.complete ? (profile.completedAt || new Date().toISOString()) : (profile.completedAt || null);
 
     u.profile = profile;
     await u.save();
 
-    return res.json({ ok: true, profileComplete: profile.complete === true, profile: u.profile });
+    res.json({ ok: true, profileComplete: profile.complete === true, profile: u.profile });
   } catch (e) {
-    return res.status(500).json({ ok: false, error: String(e) });
+    res.status(500).json({ ok: false, error: String(e) });
   }
 });
 
@@ -745,7 +700,7 @@ app.post("/api/profile", requireLogin, async (req, res) => {
 app.get("/health", (_req, res) => res.json({ ok: true, uptime: process.uptime() }));
 
 // =========================
-// PAY + MEMBERSHIP CHECKOUT LINK RESOLVERS
+// CHECKOUT LINK RESOLVERS
 // =========================
 app.post("/api/memberships/checkout", (req, res) => {
   const tier = String(req.body?.tier || "").trim().toLowerCase();
@@ -823,12 +778,11 @@ app.get("/api/runs/active", async (_req, res) => {
 });
 
 // =========================
-// FEE ESTIMATOR
+// ESTIMATOR
 // =========================
 app.post("/api/estimator", (req, res) => {
   try {
-    const b = req.body || {};
-    const breakdown = computeFeeBreakdown(b);
+    const breakdown = computeFeeBreakdown(req.body || {});
     res.json({ ok: true, breakdown });
   } catch (e) {
     res.status(500).json({ ok: false, error: String(e) });
@@ -836,7 +790,7 @@ app.post("/api/estimator", (req, res) => {
 });
 
 // =========================
-// ORDERS (REQUIRES LOGIN + PROFILE COMPLETE)
+// ORDERS
 // =========================
 app.post("/api/orders", requireLogin, requireProfileComplete, upload.single("groceryFile"), async (req, res) => {
   try {
@@ -844,20 +798,13 @@ app.post("/api/orders", requireLogin, requireProfileComplete, upload.single("gro
     const user = await User.findById(req.user._id).lean();
     const profile = user?.profile || {};
 
-    // Per-order consents
-    if (
-      String(b.consent_terms || "") !== "yes" ||
-      String(b.consent_accuracy || "") !== "yes" ||
-      String(b.consent_dropoff || "") !== "yes"
-    ) {
+    if (String(b.consent_terms || "") !== "yes" || String(b.consent_accuracy || "") !== "yes" || String(b.consent_dropoff || "") !== "yes") {
       return res.status(400).json({ ok: false, error: "All required consents must be accepted." });
     }
 
-    // Required order fields
     const required = ["town","streetAddress","zone","runType","primaryStore","groceryList","dropoffPref","subsPref","contactPref"];
     for (const k of required) {
-      const v = String(b[k] || "").trim();
-      if (!v) return res.status(400).json({ ok: false, error: "Missing required field: " + k });
+      if (!String(b[k] || "").trim()) return res.status(400).json({ ok: false, error: "Missing required field: " + k });
     }
 
     const runs = await ensureUpcomingRuns();
@@ -868,11 +815,12 @@ app.post("/api/orders", requireLogin, requireProfileComplete, upload.single("gro
     const now = nowTz();
     const opensAt = dayjs(run.opensAt).tz(TZ);
     const cutoffAt = dayjs(run.cutoffAt).tz(TZ);
-    const windowOpen = now.isAfter(opensAt) && now.isBefore(cutoffAt);
-    if (!windowOpen) return res.status(403).json({ ok: false, error: "Ordering is closed for this run." });
+    if (!(now.isAfter(opensAt) && now.isBefore(cutoffAt))) {
+      return res.status(403).json({ ok: false, error: "Ordering is closed for this run." });
+    }
 
-    const maxSlots = run.maxSlots || 12;
     const orderId = await nextOrderId();
+    const extraStores = safeJsonArray(b.extraStores);
 
     let attachment = null;
     if (req.file) {
@@ -884,62 +832,18 @@ app.post("/api/orders", requireLogin, requireProfileComplete, upload.single("gro
       };
     }
 
-    const extraStores = safeJsonArray(b.extraStores);
-
-    const breakdown = computeFeeBreakdown({
+    const pricingSnapshot = computeFeeBreakdown({
       zone: b.zone,
       runType: b.runType,
-      extraStores: extraStores,
+      extraStores,
       grocerySubtotal: Number(b.grocerySubtotal || 0),
-      memberTier: b.memberTier || "",
-      applyPerk: b.applyPerk || "yes",
       addon_printing: b.addon_printing || "no",
       printPages: Number(b.printPages || 0),
-    });
+      memberTier: b.memberTier || "",
+      applyPerk: b.applyPerk || "yes",
+    }).totals;
 
-    const pricingSnapshot = breakdown.totals;
-
-    const orderDoc = {
-      orderId,
-      runKey: run.runKey,
-      runType,
-
-      // Source of truth: account profile
-      customer: {
-        fullName: String(profile.fullName || user.name || "").trim(),
-        email: String(user.email || "").trim().toLowerCase(),
-        phone: String(profile.phone || "").trim(),
-      },
-
-      address: {
-        town: String(b.town || "").trim(),
-        streetAddress: String(b.streetAddress || "").trim(),
-        zone: String(b.zone || ""),
-      },
-
-      stores: {
-        primary: String(b.primaryStore || "").trim(),
-        extra: extraStores,
-      },
-
-      preferences: {
-        dropoffPref: String(b.dropoffPref || ""),
-        subsPref: String(b.subsPref || ""),
-        contactPref: String(b.contactPref || ""),
-        contactAuth: true,
-      },
-
-      list: {
-        groceryListText: String(b.groceryList || "").trim(),
-        attachment,
-      },
-
-      consents: { terms: true, accuracy: true, dropoff: true },
-      pricingSnapshot,
-      status: { state: "submitted", note: "", updatedAt: new Date(), updatedBy: "customer" },
-    };
-
-    // Slot reservation
+    const maxSlots = run.maxSlots || 12;
     const runUpdate = await Run.findOneAndUpdate(
       { runKey: run.runKey, bookedOrdersCount: { $lt: maxSlots } },
       { $inc: { bookedOrdersCount: 1, bookedFeesTotal: pricingSnapshot.totalFees }, $set: { lastRecalcAt: new Date() } },
@@ -949,9 +853,33 @@ app.post("/api/orders", requireLogin, requireProfileComplete, upload.single("gro
     if (!runUpdate) return res.status(409).json({ ok: false, error: "This run is full." });
 
     try {
-      await Order.create(orderDoc);
+      await Order.create({
+        orderId,
+        runKey: run.runKey,
+        runType,
+        customer: {
+          fullName: String(profile.fullName || user.name || "").trim(),
+          email: String(user.email || "").trim().toLowerCase(),
+          phone: String(profile.phone || "").trim(),
+        },
+        address: {
+          town: String(b.town || "").trim(),
+          streetAddress: String(b.streetAddress || "").trim(),
+          zone: String(b.zone || ""),
+        },
+        stores: { primary: String(b.primaryStore || "").trim(), extra: extraStores },
+        preferences: {
+          dropoffPref: String(b.dropoffPref || ""),
+          subsPref: String(b.subsPref || ""),
+          contactPref: String(b.contactPref || ""),
+          contactAuth: true,
+        },
+        list: { groceryListText: String(b.groceryList || "").trim(), attachment },
+        consents: { terms: true, accuracy: true, dropoff: true },
+        pricingSnapshot,
+        status: { state: "submitted", note: "", updatedAt: new Date(), updatedBy: "customer" },
+      });
     } catch (e) {
-      // rollback slot count if create fails
       await Run.updateOne(
         { runKey: run.runKey },
         { $inc: { bookedOrdersCount: -1, bookedFeesTotal: -pricingSnapshot.totalFees }, $set: { lastRecalcAt: new Date() } }
@@ -965,12 +893,9 @@ app.post("/api/orders", requireLogin, requireProfileComplete, upload.single("gro
   }
 });
 
-// Public tracking endpoint
 app.get("/api/orders/:orderId", async (req, res) => {
   try {
     const orderId = String(req.params.orderId || "").trim();
-    if (!orderId) return res.status(400).json({ ok: false, error: "Missing orderId" });
-
     const order = await Order.findOne({ orderId }).lean();
     if (!order) return res.status(404).json({ ok: false, error: "Order not found" });
 
@@ -995,45 +920,28 @@ app.get("/api/orders/:orderId", async (req, res) => {
 });
 
 // =========================
-// MEMBER PAGE (simple)
+// MEMBER + ADMIN PAGES (SERVER-RENDERED SIMPLE)
 // =========================
 app.get("/member", requireLogin, async (req, res) => {
   const u = await User.findById(req.user._id).lean();
   const email = String(u?.email || "").toLowerCase();
+  const orders = await Order.find({ "customer.email": email }).sort({ createdAt: -1 }).limit(25).lean();
 
-  const orders = await Order.find({ "customer.email": email })
-    .sort({ createdAt: -1 })
-    .limit(25)
-    .lean();
-
-  const rows = orders
-    .map((o) => {
-      const status = o.status?.state || "submitted";
-      const when = fmtLocal(o.createdAt);
-      const primary = o.stores?.primary || "—";
-      const town = o.address?.town || "—";
-      const fees =
-        typeof o.pricingSnapshot?.totalFees === "number"
-          ? o.pricingSnapshot.totalFees.toFixed(2)
-          : "0.00";
-
-      return `
-        <tr>
-          <td style="padding:10px 8px;border-top:1px solid #ddd;font-weight:900;">${escapeHtml(o.orderId)}</td>
-          <td style="padding:10px 8px;border-top:1px solid #ddd;">${escapeHtml(when)}</td>
-          <td style="padding:10px 8px;border-top:1px solid #ddd;">${escapeHtml(primary)}</td>
-          <td style="padding:10px 8px;border-top:1px solid #ddd;">${escapeHtml(town)}</td>
-          <td style="padding:10px 8px;border-top:1px solid #ddd;font-weight:900;">${escapeHtml(status)}</td>
-          <td style="padding:10px 8px;border-top:1px solid #ddd;">$${escapeHtml(fees)}</td>
-        </tr>
-      `;
-    })
-    .join("");
-
-  const complete = isProfileComplete(u?.profile || {});
-  const banner = complete
-    ? `<div style="padding:12px 14px;border:1px solid #ddd;border-radius:12px;background:#f7fff8;margin-bottom:14px;"><strong>Account:</strong> complete ✅</div>`
-    : `<div style="padding:12px 14px;border:1px solid #f2c2c2;border-radius:12px;background:#fff7f7;margin-bottom:14px;"><strong>Account:</strong> incomplete. Complete setup on the main site to place orders.</div>`;
+  const rows = orders.map((o) => {
+    const status = o.status?.state || "submitted";
+    const when = fmtLocal(o.createdAt);
+    const primary = o.stores?.primary || "—";
+    const town = o.address?.town || "—";
+    const fees = typeof o.pricingSnapshot?.totalFees === "number" ? o.pricingSnapshot.totalFees.toFixed(2) : "0.00";
+    return `<tr>
+      <td style="padding:10px 8px;border-top:1px solid #ddd;font-weight:900;">${escapeHtml(o.orderId)}</td>
+      <td style="padding:10px 8px;border-top:1px solid #ddd;">${escapeHtml(when)}</td>
+      <td style="padding:10px 8px;border-top:1px solid #ddd;">${escapeHtml(primary)}</td>
+      <td style="padding:10px 8px;border-top:1px solid #ddd;">${escapeHtml(town)}</td>
+      <td style="padding:10px 8px;border-top:1px solid #ddd;font-weight:900;">${escapeHtml(status)}</td>
+      <td style="padding:10px 8px;border-top:1px solid #ddd;">$${escapeHtml(fees)}</td>
+    </tr>`;
+  }).join("");
 
   res.setHeader("Content-Type", "text/html; charset=utf-8");
   res.send(`<!doctype html>
@@ -1042,7 +950,6 @@ app.get("/member", requireLogin, async (req, res) => {
 <body style="font-family:system-ui,Segoe UI,Roboto,Arial,sans-serif;padding:18px;max-width:1100px;margin:0 auto;">
 <h1 style="margin:0 0 6px;">Member Portal</h1>
 <div style="color:#444;margin-bottom:14px;">Signed in as <strong>${escapeHtml(email)}</strong></div>
-${banner}
 
 <div style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:14px;">
 <a href="https://tobermorygroceryrun.ca/" style="padding:12px 14px;border:1px solid #ddd;border-radius:12px;text-decoration:none;color:#111;font-weight:900;">Back to site</a>
@@ -1066,9 +973,6 @@ ${banner}
 </body></html>`);
 });
 
-// =========================
-// ADMIN PAGE (simple placeholder)
-// =========================
 app.get("/admin", requireLogin, requireAdmin, async (_req, res) => {
   res.setHeader("Content-Type", "text/html; charset=utf-8");
   res.send(`<!doctype html>
@@ -1076,7 +980,7 @@ app.get("/admin", requireLogin, requireAdmin, async (_req, res) => {
 <title>TGR Admin</title></head>
 <body style="font-family:system-ui,Segoe UI,Roboto,Arial,sans-serif;padding:18px;max-width:900px;margin:0 auto;">
 <h1 style="margin:0 0 8px;">Admin</h1>
-<div style="color:#444;margin-bottom:14px;">This is a placeholder admin page.</div>
+<div style="color:#444;margin-bottom:14px;">Admin placeholder. Add admin tooling next.</div>
 <div><a href="/logout?returnTo=https%3A%2F%2Ftobermorygroceryrun.ca%2F">Log out</a></div>
 </body></html>`);
 });
@@ -1154,9 +1058,9 @@ app.post("/webhooks/square", async (req, res) => {
     if (renewalDate) set.renewalDate = renewalDate;
 
     await User.updateOne({ _id: user._id }, { $set: set });
-    return res.status(200).send("ok");
+    res.status(200).send("ok");
   } catch (e) {
-    return res.status(500).send("webhook error: " + String(e));
+    res.status(500).send("webhook error: " + String(e));
   }
 });
 
