@@ -2,17 +2,22 @@
  * server.js — Tobermory Grocery Run backend (Express + MongoDB)
  *
  * INCLUDED:
- * - Google OAuth (Passport) so /auth/google works
+ * - Google OAuth (Passport): /auth/google + callback
  * - Mongo-backed sessions (connect-mongo)
- * - /member and /admin routes (with guards + ADMIN_EMAILS allowlist)
- * - /api/me (used by your index header)
+ * - /api/me
  * - Square links:
  *    - Membership subscriptions: POST /api/memberships/checkout { tier }
  *    - One-time payments:       POST /api/payments/checkout    { kind }
- * - Runs: GET /api/runs/active (cutoffs + max slots + minimum-to-run)
+ * - Convenience redirects: /pay/groceries, /pay/fees
+ * - Runs: GET /api/runs/active
+ * - Estimator: POST /api/estimator  (server-truth fee breakdown)
  * - Orders: POST /api/orders (multipart, optional file) + GET /api/orders/:orderId
+ * - Member portal: /member (recent orders + pay buttons)
+ * - Admin portal: /admin (search/filter, status updates, CSV export)
+ *   + /admin/orders/:orderId (detail)
+ *   + /admin/orders/:orderId/file (download attachment)
  *
- * REQUIRED Render ENV (API service):
+ * REQUIRED Render ENV:
  * - SESSION_SECRET
  * - MONGO_URI  (or MONGODB_URI)
  * - GOOGLE_CLIENT_ID
@@ -38,16 +43,15 @@ const multer = require("multer");
 const cookieParser = require("cookie-parser");
 const session = require("express-session");
 const cors = require("cors");
+const path = require("path");
+const fs = require("fs");
 
-// connect-mongo CJS/ESM interop
 const MongoStorePkg = require("connect-mongo");
 const MongoStore = MongoStorePkg.default || MongoStorePkg;
 
-// Google OAuth (Passport)
 const passport = require("passport");
 const GoogleStrategy = require("passport-google-oauth20").Strategy;
 
-// Your existing User model
 const User = require("./models/User");
 
 const dayjs = require("dayjs");
@@ -69,30 +73,23 @@ const MONGODB_URI =
 const SESSION_SECRET = process.env.SESSION_SECRET || "dev-secret";
 const TZ = process.env.TZ || "America/Toronto";
 
-// Google envs
 const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID || "";
 const GOOGLE_CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET || "";
 const GOOGLE_CALLBACK_URL = process.env.GOOGLE_CALLBACK_URL || "";
 
-// Admin allowlist (comma separated)
 const ADMIN_EMAILS = String(process.env.ADMIN_EMAILS || "")
   .split(",")
   .map((s) => s.trim().toLowerCase())
   .filter(Boolean);
 
-// Cookies across subdomains:
-// If cookies do not persist across api + site subdomains, switch to:
-//   COOKIE_SAMESITE="none" AND COOKIE_DOMAIN=".tobermorygroceryrun.ca"
 const COOKIE_SAMESITE = "lax";
 const COOKIE_DOMAIN = undefined;
 
-// Lock origins in production
 const ALLOWED_ORIGINS = [
   "https://tobermorygroceryrun.ca",
   "https://www.tobermorygroceryrun.ca",
 ];
 
-// Square subscription payment links (set in Render env)
 const SQUARE_LINKS = {
   standard: process.env.SQUARE_LINK_STANDARD,
   route: process.env.SQUARE_LINK_ROUTE,
@@ -100,7 +97,6 @@ const SQUARE_LINKS = {
   accesspro: process.env.SQUARE_LINK_ACCESSPRO,
 };
 
-// Square one-time payment links (set in Render env)
 const SQUARE_PAY_LINKS = {
   groceries: process.env.SQUARE_PAY_GROCERIES_LINK,
   fees: process.env.SQUARE_PAY_FEES_LINK,
@@ -109,7 +105,7 @@ const SQUARE_PAY_LINKS = {
 const app = express();
 
 // =========================
-// CORS + middleware
+// Middleware
 // =========================
 app.use(
   cors({
@@ -121,15 +117,11 @@ app.use(
   })
 );
 
-app.use(express.json({ limit: "2mb" }));
+app.use(express.json({ limit: "3mb" }));
+app.use(express.urlencoded({ extended: true }));
 app.use(cookieParser());
-
-// Render/proxy support
 app.set("trust proxy", 1);
 
-// =========================
-// Sessions (Mongo-backed)
-// =========================
 app.use(
   session({
     name: "tgr.sid",
@@ -138,18 +130,16 @@ app.use(
     saveUninitialized: false,
     rolling: true,
     proxy: true,
-
     store: MongoStore.create({
       mongoUrl: MONGODB_URI,
-      ttl: 60 * 60 * 24 * 14, // 14 days
+      ttl: 60 * 60 * 24 * 14,
     }),
-
     cookie: {
       httpOnly: true,
-      secure: true, // Render HTTPS edge
+      secure: true,
       sameSite: COOKIE_SAMESITE,
       ...(COOKIE_DOMAIN ? { domain: COOKIE_DOMAIN } : {}),
-      maxAge: 1000 * 60 * 60 * 24 * 14, // 14 days
+      maxAge: 1000 * 60 * 60 * 24 * 14,
     },
   })
 );
@@ -223,7 +213,7 @@ app.use(passport.session());
 // =========================
 const upload = multer({
   dest: "uploads/",
-  limits: { fileSize: 15 * 1024 * 1024 }, // 15MB
+  limits: { fileSize: 15 * 1024 * 1024 },
 });
 
 // =========================
@@ -233,13 +223,14 @@ const PRICING = {
   serviceFee: 25,
   zone: { A: 20, B: 15, C: 10, D: 25 },
   owenRunFeePerOrder: 20,
+
   addOns: {
     extraStore: 8,
     parcelDrop: 10,
     parcelBulkyExtra: 8,
     liquor: 12,
     fastFood: 10,
-    waitPerBlock: 10,
+    waitPerBlock: 10, // per 15 min
     rideSeat: 45,
     rideSeatSouthOfFerndale: 30,
     bulkyPerItem: 18,
@@ -247,6 +238,7 @@ const PRICING = {
     printingFirst10: 1.25,
     printingAfter10: 0.75,
   },
+
   groceryUnderMin: { threshold: 35, surcharge: 19 },
 };
 
@@ -262,23 +254,28 @@ function calcPrinting(pages) {
   );
 }
 
-// (Optional estimator logic; Square bills memberships, not this server.)
+// For estimator only (Square bills memberships)
 function membershipDiscounts(tier, applyPerkYes) {
   if (!tier || !applyPerkYes)
     return { serviceOff: 0, zoneOff: 0, freeAddonUpTo: 0, waitWaived: false };
+
   if (tier === "standard")
     return { serviceOff: 0, zoneOff: 10, freeAddonUpTo: 10, waitWaived: false };
+
   if (tier === "route")
     return { serviceOff: 5, zoneOff: 10, freeAddonUpTo: 10, waitWaived: false };
+
   if (tier === "access")
     return { serviceOff: 8, zoneOff: 10, freeAddonUpTo: 10, waitWaived: true };
+
   if (tier === "accesspro")
     return { serviceOff: 10, zoneOff: 0, freeAddonUpTo: 0, waitWaived: true };
+
   return { serviceOff: 0, zoneOff: 0, freeAddonUpTo: 0, waitWaived: false };
 }
 
 // =========================
-// Mongo models (runs/orders counters + orders)
+// Mongo models
 // =========================
 const CounterSchema = new mongoose.Schema(
   { key: { type: String, unique: true }, seq: { type: Number, default: 0 } },
@@ -295,8 +292,6 @@ const RunSchema = new mongoose.Schema(
 
     maxSlots: { type: Number, default: 12 },
 
-    // Local: 6 orders OR $200 fees
-    // Owen:  6 orders AND $300 fees
     minOrders: { type: Number, default: 6 },
     minFees: { type: Number, default: 0 },
     minLogic: { type: String, enum: ["OR", "AND"], default: "OR" },
@@ -396,26 +391,34 @@ function nextDow(targetDow, from) {
 function buildRunTimes(type) {
   const base = nowTz();
 
-  // Local delivery Saturday; cutoff Thursday 6pm; opens Monday 12am
   if (type === "local") {
     const delivery = nextDow(6, base); // Saturday
-    const cutoff = delivery.subtract(2, "day").hour(18).minute(0).second(0).millisecond(0);
-    const opens = delivery.subtract(5, "day").hour(0).minute(0).second(0).millisecond(0);
+    const cutoff = delivery.subtract(2, "day").hour(18).minute(0).second(0).millisecond(0); // Thu 6pm
+    const opens = delivery.subtract(5, "day").hour(0).minute(0).second(0).millisecond(0); // Mon 12am
     return { delivery, cutoff, opens };
   }
 
-  // Owen delivery Sunday; cutoff Friday 6pm; opens Monday 12am
   const delivery = nextDow(0, base); // Sunday
-  const cutoff = delivery.subtract(2, "day").hour(18).minute(0).second(0).millisecond(0);
-  const opens = delivery.subtract(6, "day").hour(0).minute(0).second(0).millisecond(0);
+  const cutoff = delivery.subtract(2, "day").hour(18).minute(0).second(0).millisecond(0); // Fri 6pm
+  const opens = delivery.subtract(6, "day").hour(0).minute(0).second(0).millisecond(0); // Mon 12am
   return { delivery, cutoff, opens };
 }
 
 function runMinimumConfig(type) {
   if (type === "local") {
-    return { minOrders: 6, minFees: 200, minLogic: "OR", minimumText: "Minimum: 6 orders OR $200 booked fees" };
+    return {
+      minOrders: 6,
+      minFees: 200,
+      minLogic: "OR",
+      minimumText: "Minimum: 6 orders OR $200 booked fees",
+    };
   }
-  return { minOrders: 6, minFees: 300, minLogic: "AND", minimumText: "Minimum: 6 orders AND $300 booked fees" };
+  return {
+    minOrders: 6,
+    minFees: 300,
+    minLogic: "AND",
+    minimumText: "Minimum: 6 orders AND $300 booked fees",
+  };
 }
 
 function meetsMinimums(run) {
@@ -492,44 +495,124 @@ function safeJsonArray(str) {
   }
 }
 
-function computeFeesFromBody(body) {
-  const zone = String(body.zone || "");
-  const runType = String(body.runType || "");
-  const extraStores = safeJsonArray(body.extraStores);
+// Server-truth fee breakdown for Tools tab
+function computeFeeBreakdown(input) {
+  const zone = String(input.zone || "");
+  const runType = String(input.runType || "local");
+  const extraStores = Array.isArray(input.extraStores)
+    ? input.extraStores.map(String).map(s => s.trim()).filter(Boolean)
+    : safeJsonArray(input.extraStoresJson);
 
-  const pages = Number(body.printPages || 0);
+  const add_fastFood = !!input.add_fastFood;
+  const add_liquor = !!input.add_liquor;
+  const add_printing = !!input.add_printing;
+  const add_parcel = !!input.add_parcel;
+  const parcelBulky = !!input.parcelBulky;
+  const add_bulky = !!input.add_bulky;
+  const bulkyCount = Math.max(0, Number(input.bulkyCount || 0));
+  const add_ride = !!input.add_ride;
+  const rideSeats = Math.max(1, Number(input.rideSeats || 1));
+  const rideSouth = !!input.rideSouthOfFerndale;
+  const add_wait = !!input.add_wait;
+  const waitBlocks = Math.max(0, Number(input.waitBlocks || 0));
+  const pages = Math.max(0, Number(input.printPages || 0));
 
-  const memberTier = String(body.memberTier || "");
-  const applyPerk = String(body.applyPerk || "yes") === "yes";
+  const grocerySubtotal = Math.max(0, Number(input.grocerySubtotal || 0));
+
+  const memberTier = String(input.memberTier || "");
+  const applyPerk = String(input.applyPerk || "yes") === "yes";
   const disc = membershipDiscounts(memberTier, applyPerk);
 
   const serviceFee = PRICING.serviceFee;
   const zoneFee = PRICING.zone[zone] || 0;
   const runFee = runType === "owen" ? PRICING.owenRunFeePerOrder : 0;
 
+  const lineItems = [];
+
+  lineItems.push({ label: "Service fee", amount: serviceFee });
+
+  if (zoneFee > 0) lineItems.push({ label: `Zone fee (${zone})`, amount: zoneFee });
+  if (runFee > 0) lineItems.push({ label: "Owen Sound run fee", amount: runFee });
+
   let addOnsFees = 0;
-  if (extraStores.length) addOnsFees += extraStores.length * PRICING.addOns.extraStore;
-  if (body.addon_fastFood === "yes") addOnsFees += PRICING.addOns.fastFood;
-  if (body.addon_liquor === "yes") addOnsFees += PRICING.addOns.liquor;
-  if (body.addon_printing === "yes") addOnsFees += calcPrinting(pages);
 
-  let waitFee =
-    body.addon_wait === "yes"
-      ? Math.max(0, Number(body.waitBlocks || 0)) * PRICING.addOns.waitPerBlock
-      : 0;
+  if (extraStores.length) {
+    const amt = extraStores.length * PRICING.addOns.extraStore;
+    addOnsFees += amt;
+    lineItems.push({ label: `Extra store stops (${extraStores.length})`, amount: amt });
+  }
 
-  if (disc.waitWaived) waitFee = 0;
+  if (add_fastFood) {
+    addOnsFees += PRICING.addOns.fastFood;
+    lineItems.push({ label: "Fast food pickup", amount: PRICING.addOns.fastFood });
+  }
 
+  if (add_liquor) {
+    addOnsFees += PRICING.addOns.liquor;
+    lineItems.push({ label: "Liquor pickup/delivery", amount: PRICING.addOns.liquor });
+  }
+
+  if (add_printing) {
+    const amt = calcPrinting(pages);
+    addOnsFees += amt;
+    lineItems.push({ label: `Printing (${pages} pages)`, amount: amt });
+  }
+
+  if (add_parcel) {
+    addOnsFees += PRICING.addOns.parcelDrop;
+    lineItems.push({ label: "Parcel drop-off", amount: PRICING.addOns.parcelDrop });
+    if (parcelBulky) {
+      addOnsFees += PRICING.addOns.parcelBulkyExtra;
+      lineItems.push({ label: "Parcel bulky/heavy add-on", amount: PRICING.addOns.parcelBulkyExtra });
+    }
+  }
+
+  if (add_bulky && bulkyCount > 0) {
+    const amt = bulkyCount * PRICING.addOns.bulkyPerItem;
+    addOnsFees += amt;
+    lineItems.push({ label: `Heavy/bulky handling (${bulkyCount})`, amount: amt });
+  }
+
+  if (add_ride) {
+    const per = rideSouth ? PRICING.addOns.rideSeatSouthOfFerndale : PRICING.addOns.rideSeat;
+    const amt = rideSeats * per;
+    addOnsFees += amt;
+    lineItems.push({
+      label: `Ride to town (${rideSeats} seat${rideSeats === 1 ? "" : "s"})`,
+      amount: amt,
+    });
+  }
+
+  let waitFee = 0;
+  if (add_wait && waitBlocks > 0) {
+    waitFee = waitBlocks * PRICING.addOns.waitPerBlock;
+    if (disc.waitWaived) {
+      lineItems.push({ label: `Wait time (${waitBlocks} blocks)`, amount: waitFee });
+      lineItems.push({ label: "Wait time waived (membership)", amount: -waitFee });
+      waitFee = 0;
+    } else {
+      lineItems.push({ label: `Wait time (${waitBlocks} blocks)`, amount: waitFee });
+    }
+  }
+
+  let surcharges = 0;
+  if (grocerySubtotal > 0 && grocerySubtotal < PRICING.groceryUnderMin.threshold) {
+    surcharges += PRICING.groceryUnderMin.surcharge;
+    lineItems.push({
+      label: `Small order surcharge (grocery subtotal under $${PRICING.groceryUnderMin.threshold})`,
+      amount: PRICING.groceryUnderMin.surcharge,
+    });
+  }
+
+  // Membership discount logic: best-of zone-off vs free-addon-up-to + service-off
   const serviceOff = Math.min(serviceFee, disc.serviceOff || 0);
   const optionA = Math.min(zoneFee, disc.zoneOff || 0);
   const optionB = Math.min(addOnsFees + waitFee + runFee, disc.freeAddonUpTo || 0);
   const bestOr = Math.max(optionA, optionB);
   const discount = serviceOff + bestOr;
 
-  let surcharges = 0;
-  const grocerySubtotal = Number(body.grocerySubtotal || 0);
-  if (grocerySubtotal > 0 && grocerySubtotal < PRICING.groceryUnderMin.threshold) {
-    surcharges += PRICING.groceryUnderMin.surcharge;
+  if (discount > 0) {
+    lineItems.push({ label: "Membership discount/perk (estimated)", amount: -discount });
   }
 
   const totalFees = Math.max(
@@ -537,11 +620,22 @@ function computeFeesFromBody(body) {
     serviceFee + zoneFee + runFee + addOnsFees + waitFee + surcharges - discount
   );
 
-  return { serviceFee, zoneFee, runFee, addOnsFees: addOnsFees + waitFee, surcharges, discount, totalFees };
+  return {
+    lineItems,
+    totals: {
+      serviceFee,
+      zoneFee,
+      runFee,
+      addOnsFees: addOnsFees + waitFee,
+      surcharges,
+      discount,
+      totalFees,
+    },
+  };
 }
 
 // =========================
-// Auth guards + pages
+// Guards
 // =========================
 function requireLogin(req, res, next) {
   if (!req.user) return res.status(401).send("Sign-in required.");
@@ -558,16 +652,14 @@ function requireAdmin(req, res, next) {
 }
 
 // =========================
-// Google auth routes
+// Auth routes
 // =========================
 app.get("/auth/google", (req, res, next) => {
   if (!GOOGLE_CLIENT_ID || !GOOGLE_CLIENT_SECRET || !GOOGLE_CALLBACK_URL) {
     return res.status(500).send("Google auth is not configured on the server.");
   }
-
   const returnTo = String(req.query.returnTo || "https://tobermorygroceryrun.ca/").trim();
   req.session.returnTo = returnTo;
-
   return passport.authenticate("google", { scope: ["profile", "email"] })(req, res, next);
 });
 
@@ -601,40 +693,6 @@ app.get("/api/me", (req, res) => {
   });
 });
 
-app.get("/member", requireLogin, (req, res) => {
-  const u = req.user;
-  res.setHeader("Content-Type", "text/html; charset=utf-8");
-  res.send(`<!doctype html>
-<html><head>
-<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>TGR Member Portal</title>
-</head>
-<body style="font-family:system-ui,Segoe UI,Roboto,Arial,sans-serif;padding:18px;max-width:900px;margin:0 auto;">
-  <h1>Member Portal</h1>
-  <p><strong>Signed in as:</strong> ${escapeHtml(u.email || "")}</p>
-  <p><strong>Name:</strong> ${escapeHtml(u.name || "")}</p>
-  <p><strong>Membership:</strong> ${escapeHtml(u.membershipLevel || "none")} (${escapeHtml(u.membershipStatus || "inactive")})</p>
-  <p><strong>Renewal date:</strong> ${escapeHtml(u.renewalDate ? String(u.renewalDate) : "—")}</p>
-  <p>This page is live. Next step is syncing subscription status from Square automatically (webhooks).</p>
-  <p><a href="https://tobermorygroceryrun.ca/">Back to site</a> • <a href="/logout?returnTo=https%3A%2F%2Ftobermorygroceryrun.ca%2F">Log out</a></p>
-</body></html>`);
-});
-
-app.get("/admin", requireLogin, requireAdmin, (req, res) => {
-  res.setHeader("Content-Type", "text/html; charset=utf-8");
-  res.send(`<!doctype html>
-<html><head>
-<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>TGR Admin</title>
-</head>
-<body style="font-family:system-ui,Segoe UI,Roboto,Arial,sans-serif;padding:18px;max-width:900px;margin:0 auto;">
-  <h1>Admin</h1>
-  <p>Welcome, ${escapeHtml(req.user?.email || "")}</p>
-  <p>Next: admin order list, status updates, and exports.</p>
-  <p><a href="https://tobermorygroceryrun.ca/">Back to site</a> • <a href="/logout?returnTo=https%3A%2F%2Ftobermorygroceryrun.ca%2F">Log out</a></p>
-</body></html>`);
-});
-
 // =========================
 // Health
 // =========================
@@ -643,7 +701,7 @@ app.get("/health", (req, res) => {
 });
 
 // =========================
-// MEMBERSHIPS (Square subscription links)
+// Square endpoints + redirects
 // =========================
 app.post("/api/memberships/checkout", (req, res) => {
   const tier = String(req.body?.tier || "").trim().toLowerCase();
@@ -651,20 +709,13 @@ app.post("/api/memberships/checkout", (req, res) => {
   if (!allowed.has(tier)) return res.status(400).json({ ok: false, error: "Invalid tier" });
 
   const url = SQUARE_LINKS[tier];
-  if (!url) {
-    return res.status(500).json({
-      ok: false,
-      error: `Missing Square link for '${tier}'. Set Render env var SQUARE_LINK_${tier.toUpperCase()}.`,
-    });
-  }
-  return res.json({ ok: true, tier, checkoutUrl: url });
+  if (!url) return res.status(500).json({ ok: false, error: `Missing Square link SQUARE_LINK_${tier.toUpperCase()}` });
+
+  res.json({ ok: true, tier, checkoutUrl: url });
 });
 
-// =========================
-// PAYMENTS (Square one-time links)
-// =========================
 app.post("/api/payments/checkout", (req, res) => {
-  const kind = String(req.body?.kind || "").trim().toLowerCase(); // groceries | fees
+  const kind = String(req.body?.kind || "").trim().toLowerCase();
   const allowed = new Set(["groceries", "fees"]);
   if (!allowed.has(kind)) return res.status(400).json({ ok: false, error: "Invalid payment kind" });
 
@@ -673,18 +724,31 @@ app.post("/api/payments/checkout", (req, res) => {
     const envKey = kind === "groceries" ? "SQUARE_PAY_GROCERIES_LINK" : "SQUARE_PAY_FEES_LINK";
     return res.status(500).json({ ok: false, error: `Missing Render env var ${envKey}` });
   }
-  return res.json({ ok: true, kind, checkoutUrl: url });
+
+  res.json({ ok: true, kind, checkoutUrl: url });
+});
+
+app.get("/pay/groceries", (req, res) => {
+  const url = SQUARE_PAY_LINKS?.groceries;
+  if (!url) return res.status(500).send("Payment link not configured (SQUARE_PAY_GROCERIES_LINK).");
+  res.redirect(url);
+});
+
+app.get("/pay/fees", (req, res) => {
+  const url = SQUARE_PAY_LINKS?.fees;
+  if (!url) return res.status(500).send("Payment link not configured (SQUARE_PAY_FEES_LINK).");
+  res.redirect(url);
 });
 
 // =========================
-// RUNS
+// Runs
 // =========================
 app.get("/api/runs/active", async (req, res) => {
   try {
     const runs = await ensureUpcomingRuns();
     const now = nowTz();
-
     const out = {};
+
     for (const type of ["local", "owen"]) {
       const run = runs[type];
       const opensAt = dayjs(run.opensAt).tz(TZ);
@@ -716,7 +780,20 @@ app.get("/api/runs/active", async (req, res) => {
 });
 
 // =========================
-// ORDERS
+// Fee estimator (server truth)
+// =========================
+app.post("/api/estimator", async (req, res) => {
+  try {
+    const b = req.body || {};
+    const breakdown = computeFeeBreakdown(b);
+    res.json({ ok: true, breakdown, pricingModel: PRICING });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: String(e) });
+  }
+});
+
+// =========================
+// Orders
 // =========================
 app.post("/api/orders", upload.single("groceryFile"), async (req, res) => {
   try {
@@ -726,6 +803,7 @@ app.post("/api/orders", upload.single("groceryFile"), async (req, res) => {
       "fullName","email","phone","town","streetAddress","zone","runType",
       "primaryStore","groceryList","dropoffPref","subsPref","contactPref",
     ];
+
     for (const k of required) {
       const v = String(b[k] || "").trim();
       if (!v) return res.status(400).json({ ok: false, error: "Missing required field: " + k });
@@ -755,8 +833,6 @@ app.post("/api/orders", upload.single("groceryFile"), async (req, res) => {
     if (!windowOpen) return res.status(403).json({ ok: false, error: "Ordering is closed for this run." });
 
     const maxSlots = run.maxSlots || 12;
-
-    const pricing = computeFeesFromBody(b);
     const orderId = await nextOrderId();
 
     let attachment = null;
@@ -771,50 +847,66 @@ app.post("/api/orders", upload.single("groceryFile"), async (req, res) => {
 
     const extraStores = safeJsonArray(b.extraStores);
 
+    // Create pricing snapshot (using estimator fields available from form)
+    const breakdown = computeFeeBreakdown({
+      zone: b.zone,
+      runType: b.runType,
+      extraStores: extraStores,
+      add_fastFood: false,
+      add_liquor: false,
+      add_printing: false,
+      add_parcel: false,
+      add_bulky: false,
+      add_ride: false,
+      add_wait: false,
+      printPages: 0,
+      bulkyCount: 0,
+      rideSeats: 1,
+      rideSouthOfFerndale: false,
+      waitBlocks: 0,
+      grocerySubtotal: Number(b.grocerySubtotal || 0),
+      memberTier: b.memberTier || "",
+      applyPerk: b.applyPerk || "yes",
+    });
+
+    const pricingSnapshot = breakdown.totals;
+
     const orderDoc = {
       orderId,
       runKey: run.runKey,
       runType,
-
       customer: {
         fullName: String(b.fullName || "").trim(),
         email: String(b.email || "").trim().toLowerCase(),
         phone: String(b.phone || "").trim(),
       },
-
       address: {
         town: String(b.town || "").trim(),
         streetAddress: String(b.streetAddress || "").trim(),
         zone: String(b.zone || ""),
       },
-
       stores: {
         primary: String(b.primaryStore || "").trim(),
         extra: extraStores,
       },
-
       preferences: {
         dropoffPref: String(b.dropoffPref || ""),
         subsPref: String(b.subsPref || ""),
         contactPref: String(b.contactPref || ""),
         contactAuth: true,
       },
-
       list: {
         groceryListText: String(b.groceryList || "").trim(),
         attachment,
       },
-
       consents: { terms: true, accuracy: true, dropoff: true },
-
-      pricingSnapshot: pricing,
-
+      pricingSnapshot,
       status: { state: "submitted", note: "", updatedAt: new Date(), updatedBy: "customer" },
     };
 
     const runUpdate = await Run.findOneAndUpdate(
       { runKey: run.runKey, bookedOrdersCount: { $lt: maxSlots } },
-      { $inc: { bookedOrdersCount: 1, bookedFeesTotal: pricing.totalFees }, $set: { lastRecalcAt: new Date() } },
+      { $inc: { bookedOrdersCount: 1, bookedFeesTotal: pricingSnapshot.totalFees }, $set: { lastRecalcAt: new Date() } },
       { new: true }
     ).lean();
 
@@ -825,7 +917,7 @@ app.post("/api/orders", upload.single("groceryFile"), async (req, res) => {
     } catch (e) {
       await Run.updateOne(
         { runKey: run.runKey },
-        { $inc: { bookedOrdersCount: -1, bookedFeesTotal: -pricing.totalFees }, $set: { lastRecalcAt: new Date() } }
+        { $inc: { bookedOrdersCount: -1, bookedFeesTotal: -pricingSnapshot.totalFees }, $set: { lastRecalcAt: new Date() } }
       );
       throw e;
     }
@@ -864,10 +956,395 @@ app.get("/api/orders/:orderId", async (req, res) => {
   }
 });
 
+// =========================
+// Member portal
+// =========================
+app.get("/member", requireLogin, async (req, res) => {
+  const u = req.user;
+  const email = String(u?.email || "").toLowerCase();
+
+  const orders = await Order.find({ "customer.email": email })
+    .sort({ createdAt: -1 })
+    .limit(25)
+    .lean();
+
+  const rows = orders
+    .map((o) => {
+      const status = o.status?.state || "submitted";
+      const when = fmtLocal(o.createdAt);
+      const primary = o.stores?.primary || "—";
+      const town = o.address?.town || "—";
+      const fees =
+        typeof o.pricingSnapshot?.totalFees === "number"
+          ? o.pricingSnapshot.totalFees.toFixed(2)
+          : "0.00";
+
+      return `
+        <tr>
+          <td style="padding:10px 8px;border-top:1px solid #ddd;font-weight:900;">${escapeHtml(o.orderId)}</td>
+          <td style="padding:10px 8px;border-top:1px solid #ddd;">${escapeHtml(when)}</td>
+          <td style="padding:10px 8px;border-top:1px solid #ddd;">${escapeHtml(primary)}</td>
+          <td style="padding:10px 8px;border-top:1px solid #ddd;">${escapeHtml(town)}</td>
+          <td style="padding:10px 8px;border-top:1px solid #ddd;font-weight:900;">${escapeHtml(status)}</td>
+          <td style="padding:10px 8px;border-top:1px solid #ddd;">$${escapeHtml(fees)}</td>
+          <td style="padding:10px 8px;border-top:1px solid #ddd;">
+            <a href="https://tobermorygroceryrun.ca/?tab=status" style="color:#e3342f;font-weight:900;">Track</a>
+          </td>
+        </tr>
+      `;
+    })
+    .join("");
+
+  res.setHeader("Content-Type", "text/html; charset=utf-8");
+  res.send(`<!doctype html>
+<html><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>TGR Member Portal</title>
+</head>
+<body style="font-family:system-ui,Segoe UI,Roboto,Arial,sans-serif;padding:18px;max-width:1100px;margin:0 auto;">
+  <h1 style="margin:0 0 6px;">Member Portal</h1>
+  <div style="color:#444;margin-bottom:14px;">Signed in as <strong>${escapeHtml(email)}</strong></div>
+
+  <div style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:14px;">
+    <a href="https://tobermorygroceryrun.ca/" style="padding:12px 14px;border:1px solid #ddd;border-radius:12px;text-decoration:none;color:#111;font-weight:900;">Back to site</a>
+    <a href="https://tobermorygroceryrun.ca/?tab=membership" style="padding:12px 14px;border:1px solid #ddd;border-radius:12px;text-decoration:none;color:#111;font-weight:900;">Memberships</a>
+    <a href="https://tobermorygroceryrun.ca/?tab=orders" style="padding:12px 14px;border:1px solid #ddd;border-radius:12px;text-decoration:none;color:#111;font-weight:900;">Place order</a>
+    <a href="/logout?returnTo=https%3A%2F%2Ftobermorygroceryrun.ca%2F" style="padding:12px 14px;border:1px solid #e3342f;background:#e3342f;color:#fff;border-radius:12px;text-decoration:none;font-weight:900;">Log out</a>
+  </div>
+
+  <div style="border:1px solid #ddd;border-radius:14px;padding:14px;margin-bottom:14px;">
+    <h2 style="margin:0 0 8px;">Account</h2>
+    <div><strong>Name:</strong> ${escapeHtml(u?.name || "—")}</div>
+    <div><strong>Membership level:</strong> ${escapeHtml(u?.membershipLevel || "none")}</div>
+    <div><strong>Membership status:</strong> ${escapeHtml(u?.membershipStatus || "inactive")}</div>
+    <div><strong>Renewal date:</strong> ${escapeHtml(u?.renewalDate ? String(u.renewalDate) : "—")}</div>
+    <div style="margin-top:10px;color:#666;">Billing is handled by Square. Next upgrade: automatic sync via Square webhooks.</div>
+  </div>
+
+  <div style="border:1px solid #ddd;border-radius:14px;padding:14px;margin-bottom:14px;">
+    <h2 style="margin:0 0 8px;">Pay</h2>
+    <div style="color:#666;margin-bottom:10px;">Use these when it’s time to settle totals.</div>
+    <div style="display:flex;gap:10px;flex-wrap:wrap;">
+      <a href="/pay/groceries" style="padding:12px 14px;border:1px solid #e3342f;background:#e3342f;color:#fff;border-radius:12px;text-decoration:none;font-weight:900;">Pay Grocery Total</a>
+      <a href="/pay/fees" style="padding:12px 14px;border:1px solid #ddd;border-radius:12px;text-decoration:none;color:#111;font-weight:900;">Pay Service & Delivery Fees</a>
+    </div>
+  </div>
+
+  <h2 style="margin:0 0 8px;">Recent orders</h2>
+  <table style="width:100%;border-collapse:collapse;">
+    <thead>
+      <tr>
+        <th style="text-align:left;padding:10px 8px;border-bottom:2px solid #ddd;">Order ID</th>
+        <th style="text-align:left;padding:10px 8px;border-bottom:2px solid #ddd;">Created</th>
+        <th style="text-align:left;padding:10px 8px;border-bottom:2px solid #ddd;">Store</th>
+        <th style="text-align:left;padding:10px 8px;border-bottom:2px solid #ddd;">Town</th>
+        <th style="text-align:left;padding:10px 8px;border-bottom:2px solid #ddd;">Status</th>
+        <th style="text-align:left;padding:10px 8px;border-bottom:2px solid #ddd;">Fees</th>
+        <th style="text-align:left;padding:10px 8px;border-bottom:2px solid #ddd;">Action</th>
+      </tr>
+    </thead>
+    <tbody>
+      ${rows || `<tr><td colspan="7" style="padding:10px 8px;color:#666;">No orders yet.</td></tr>`}
+    </tbody>
+  </table>
+</body></html>`);
+});
+
+// =========================
+// Admin: search/filter + status updates + CSV + order detail + file download
+// =========================
+function csvEscape(val) {
+  const s = String(val ?? "");
+  if (/[",\n]/.test(s)) return `"${s.replace(/"/g, '""')}"`;
+  return s;
+}
+
+function buildAdminOrderQuery(q, status) {
+  const query = {};
+  const qq = String(q || "").trim();
+  const st = String(status || "").trim().toLowerCase();
+
+  if (st && st !== "all") query["status.state"] = st;
+
+  if (qq) {
+    query["$or"] = [
+      { orderId: new RegExp(qq, "i") },
+      { "customer.fullName": new RegExp(qq, "i") },
+      { "customer.email": new RegExp(qq, "i") },
+      { "customer.phone": new RegExp(qq, "i") },
+      { "address.town": new RegExp(qq, "i") },
+      { "stores.primary": new RegExp(qq, "i") },
+    ];
+  }
+
+  return query;
+}
+
+app.get("/admin", requireLogin, requireAdmin, async (req, res) => {
+  const q = String(req.query.q || "");
+  const status = String(req.query.status || "all");
+  const mongoQuery = buildAdminOrderQuery(q, status);
+
+  const orders = await Order.find(mongoQuery).sort({ createdAt: -1 }).limit(200).lean();
+  const statusSel = (v) => (String(status).toLowerCase() === v ? "selected" : "");
+
+  const rows = orders
+    .map((o) => {
+      const st = o.status?.state || "submitted";
+      const when = fmtLocal(o.createdAt);
+      const name = o.customer?.fullName || "—";
+      const phone = o.customer?.phone || "—";
+      const email = o.customer?.email || "—";
+      const town = o.address?.town || "—";
+      const runType = o.runType || "—";
+      const totalFees =
+        typeof o.pricingSnapshot?.totalFees === "number"
+          ? o.pricingSnapshot.totalFees.toFixed(2)
+          : "0.00";
+
+      const returnTo = "/admin?" + new URLSearchParams({ q, status }).toString();
+
+      return `
+        <tr>
+          <td style="padding:10px 8px;border-top:1px solid #ddd;font-weight:900;">
+            <a href="/admin/orders/${encodeURIComponent(o.orderId)}" style="color:#e3342f;text-decoration:none;">${escapeHtml(o.orderId)}</a>
+          </td>
+          <td style="padding:10px 8px;border-top:1px solid #ddd;">${escapeHtml(when)}</td>
+          <td style="padding:10px 8px;border-top:1px solid #ddd;">${escapeHtml(runType)}</td>
+          <td style="padding:10px 8px;border-top:1px solid #ddd;">
+            ${escapeHtml(name)}
+            <div style="color:#666;font-size:12px;">${escapeHtml(phone)} • ${escapeHtml(email)}</div>
+          </td>
+          <td style="padding:10px 8px;border-top:1px solid #ddd;">${escapeHtml(town)}</td>
+          <td style="padding:10px 8px;border-top:1px solid #ddd;">$${escapeHtml(totalFees)}</td>
+          <td style="padding:10px 8px;border-top:1px solid #ddd;">
+            <div style="font-weight:900;margin-bottom:6px;">${escapeHtml(st)}</div>
+            <div style="display:flex;gap:6px;flex-wrap:wrap;">
+              ${["submitted","paid","delivered","issue"].map(s => `
+                <form method="POST" action="/admin/orders/${encodeURIComponent(o.orderId)}/status" style="margin:0;">
+                  <input type="hidden" name="state" value="${s}">
+                  <input type="hidden" name="returnTo" value="${escapeHtml(returnTo)}">
+                  <button style="padding:8px 10px;border:1px solid #ddd;border-radius:10px;cursor:pointer;background:${s===st?"#e3342f":"#fff"};color:${s===st?"#fff":"#111"};font-weight:900;">
+                    ${s}
+                  </button>
+                </form>
+              `).join("")}
+            </div>
+          </td>
+        </tr>
+      `;
+    })
+    .join("");
+
+  const qs = new URLSearchParams({ q, status }).toString();
+  const csvUrl = "/admin/orders.csv" + (qs ? `?${qs}` : "");
+
+  res.setHeader("Content-Type", "text/html; charset=utf-8");
+  res.send(`<!doctype html>
+<html><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>TGR Admin</title>
+</head>
+<body style="font-family:system-ui,Segoe UI,Roboto,Arial,sans-serif;padding:18px;max-width:1280px;margin:0 auto;">
+  <h1 style="margin:0 0 6px;">Admin</h1>
+  <div style="color:#444;margin-bottom:14px;">Signed in as <strong>${escapeHtml(req.user?.email || "")}</strong></div>
+
+  <div style="border:1px solid #ddd;border-radius:14px;padding:14px;margin-bottom:14px;">
+    <form method="GET" action="/admin" style="display:flex;gap:10px;flex-wrap:wrap;align-items:end;margin:0;">
+      <div style="flex:1;min-width:240px;">
+        <label style="display:block;font-weight:900;margin:0 0 6px;">Search</label>
+        <input name="q" value="${escapeHtml(q)}" placeholder="Order ID, name, phone, town, store..." style="width:100%;padding:12px;border:1px solid #ddd;border-radius:12px;">
+      </div>
+      <div style="min-width:200px;">
+        <label style="display:block;font-weight:900;margin:0 0 6px;">Status</label>
+        <select name="status" style="width:100%;padding:12px;border:1px solid #ddd;border-radius:12px;">
+          <option value="all" ${statusSel("all")}>All</option>
+          <option value="submitted" ${statusSel("submitted")}>submitted</option>
+          <option value="paid" ${statusSel("paid")}>paid</option>
+          <option value="delivered" ${statusSel("delivered")}>delivered</option>
+          <option value="issue" ${statusSel("issue")}>issue</option>
+        </select>
+      </div>
+      <button style="padding:12px 14px;border:1px solid #e3342f;background:#e3342f;color:#fff;border-radius:12px;font-weight:900;cursor:pointer;">Apply</button>
+      <a href="${csvUrl}" style="padding:12px 14px;border:1px solid #ddd;border-radius:12px;text-decoration:none;color:#111;font-weight:900;">Download CSV</a>
+      <a href="/pay/fees" style="padding:12px 14px;border:1px solid #ddd;border-radius:12px;text-decoration:none;color:#111;font-weight:900;">Fees link</a>
+      <a href="/pay/groceries" style="padding:12px 14px;border:1px solid #ddd;border-radius:12px;text-decoration:none;color:#111;font-weight:900;">Groceries link</a>
+      <a href="/logout?returnTo=https%3A%2F%2Ftobermorygroceryrun.ca%2F" style="padding:12px 14px;border:1px solid #ddd;border-radius:12px;text-decoration:none;color:#111;font-weight:900;">Log out</a>
+    </form>
+    <div style="color:#666;margin-top:10px;">Showing latest 200 results for current filters. Click an Order ID to open details.</div>
+  </div>
+
+  <table style="width:100%;border-collapse:collapse;">
+    <thead>
+      <tr>
+        <th style="text-align:left;padding:10px 8px;border-bottom:2px solid #ddd;">Order ID</th>
+        <th style="text-align:left;padding:10px 8px;border-bottom:2px solid #ddd;">Created</th>
+        <th style="text-align:left;padding:10px 8px;border-bottom:2px solid #ddd;">Run</th>
+        <th style="text-align:left;padding:10px 8px;border-bottom:2px solid #ddd;">Customer</th>
+        <th style="text-align:left;padding:10px 8px;border-bottom:2px solid #ddd;">Town</th>
+        <th style="text-align:left;padding:10px 8px;border-bottom:2px solid #ddd;">Fees</th>
+        <th style="text-align:left;padding:10px 8px;border-bottom:2px solid #ddd;">Status</th>
+      </tr>
+    </thead>
+    <tbody>
+      ${rows || `<tr><td colspan="7" style="padding:10px 8px;color:#666;">No orders found.</td></tr>`}
+    </tbody>
+  </table>
+</body></html>`);
+});
+
+app.post("/admin/orders/:orderId/status", requireLogin, requireAdmin, async (req, res) => {
+  const orderId = String(req.params.orderId || "").trim();
+  const state = String(req.body?.state || "").trim().toLowerCase();
+  const returnTo = String(req.body?.returnTo || "/admin").trim();
+
+  const allowed = new Set(["submitted", "paid", "delivered", "issue"]);
+  if (!allowed.has(state)) return res.status(400).send("Invalid state");
+
+  await Order.updateOne(
+    { orderId },
+    {
+      $set: {
+        "status.state": state,
+        "status.updatedAt": new Date(),
+        "status.updatedBy": String(req.user?.email || "admin"),
+      },
+    }
+  );
+
+  res.redirect(returnTo || "/admin");
+});
+
+app.get("/admin/orders.csv", requireLogin, requireAdmin, async (req, res) => {
+  const q = String(req.query.q || "");
+  const status = String(req.query.status || "all");
+  const mongoQuery = buildAdminOrderQuery(q, status);
+
+  const orders = await Order.find(mongoQuery).sort({ createdAt: -1 }).limit(2000).lean();
+
+  res.setHeader("Content-Type", "text/csv; charset=utf-8");
+  res.setHeader("Content-Disposition", `attachment; filename="tgr-orders.csv"`);
+
+  const header = [
+    "orderId","createdAtLocal","runType","status",
+    "customerName","customerEmail","customerPhone",
+    "town","primaryStore","extraStores","totalFees"
+  ].join(",");
+
+  const lines = orders.map(o => {
+    const createdAtLocal = fmtLocal(o.createdAt);
+    const totalFees = typeof o.pricingSnapshot?.totalFees === "number" ? o.pricingSnapshot.totalFees.toFixed(2) : "0.00";
+    return [
+      csvEscape(o.orderId),
+      csvEscape(createdAtLocal),
+      csvEscape(o.runType || ""),
+      csvEscape(o.status?.state || ""),
+      csvEscape(o.customer?.fullName || ""),
+      csvEscape(o.customer?.email || ""),
+      csvEscape(o.customer?.phone || ""),
+      csvEscape(o.address?.town || ""),
+      csvEscape(o.stores?.primary || ""),
+      csvEscape((o.stores?.extra || []).join(" | ")),
+      csvEscape(totalFees),
+    ].join(",");
+  });
+
+  res.send([header, ...lines].join("\n"));
+});
+
+app.get("/admin/orders/:orderId", requireLogin, requireAdmin, async (req, res) => {
+  const orderId = String(req.params.orderId || "").trim();
+  const o = await Order.findOne({ orderId }).lean();
+  if (!o) return res.status(404).send("Order not found");
+
+  const st = o.status?.state || "submitted";
+  const when = fmtLocal(o.createdAt);
+  const fees = typeof o.pricingSnapshot?.totalFees === "number" ? o.pricingSnapshot.totalFees.toFixed(2) : "0.00";
+  const extra = (o.stores?.extra || []).join(", ") || "—";
+  const file = o.list?.attachment;
+
+  const fileBlock = file
+    ? `<div style="margin-top:10px;">
+         <strong>Uploaded file:</strong> ${escapeHtml(file.originalName || "file")}
+         <div style="margin-top:6px;">
+           <a href="/admin/orders/${encodeURIComponent(orderId)}/file" style="color:#e3342f;font-weight:900;">Download</a>
+         </div>
+       </div>`
+    : `<div style="margin-top:10px;color:#666;">No file uploaded.</div>`;
+
+  res.setHeader("Content-Type", "text/html; charset=utf-8");
+  res.send(`<!doctype html>
+<html><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Order ${escapeHtml(orderId)}</title>
+</head>
+<body style="font-family:system-ui,Segoe UI,Roboto,Arial,sans-serif;padding:18px;max-width:980px;margin:0 auto;">
+  <div style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:14px;">
+    <a href="/admin" style="padding:12px 14px;border:1px solid #ddd;border-radius:12px;text-decoration:none;color:#111;font-weight:900;">Back to admin</a>
+    <a href="javascript:window.print()" style="padding:12px 14px;border:1px solid #ddd;border-radius:12px;text-decoration:none;color:#111;font-weight:900;">Print</a>
+    <a href="/logout?returnTo=https%3A%2F%2Ftobermorygroceryrun.ca%2F" style="padding:12px 14px;border:1px solid #ddd;border-radius:12px;text-decoration:none;color:#111;font-weight:900;">Log out</a>
+  </div>
+
+  <h1 style="margin:0 0 6px;">${escapeHtml(orderId)}</h1>
+  <div style="color:#444;margin-bottom:14px;">Created: ${escapeHtml(when)} • Status: <strong>${escapeHtml(st)}</strong> • Fees: <strong>$${escapeHtml(fees)}</strong></div>
+
+  <div style="border:1px solid #ddd;border-radius:14px;padding:14px;margin-bottom:14px;">
+    <h2 style="margin:0 0 8px;">Customer</h2>
+    <div><strong>Name:</strong> ${escapeHtml(o.customer?.fullName || "—")}</div>
+    <div><strong>Email:</strong> ${escapeHtml(o.customer?.email || "—")}</div>
+    <div><strong>Phone:</strong> ${escapeHtml(o.customer?.phone || "—")}</div>
+  </div>
+
+  <div style="border:1px solid #ddd;border-radius:14px;padding:14px;margin-bottom:14px;">
+    <h2 style="margin:0 0 8px;">Address</h2>
+    <div><strong>Town:</strong> ${escapeHtml(o.address?.town || "—")}</div>
+    <div><strong>Street:</strong> ${escapeHtml(o.address?.streetAddress || "—")}</div>
+    <div><strong>Zone:</strong> ${escapeHtml(o.address?.zone || "—")}</div>
+  </div>
+
+  <div style="border:1px solid #ddd;border-radius:14px;padding:14px;margin-bottom:14px;">
+    <h2 style="margin:0 0 8px;">Stores</h2>
+    <div><strong>Primary:</strong> ${escapeHtml(o.stores?.primary || "—")}</div>
+    <div><strong>Extra:</strong> ${escapeHtml(extra)}</div>
+  </div>
+
+  <div style="border:1px solid #ddd;border-radius:14px;padding:14px;margin-bottom:14px;">
+    <h2 style="margin:0 0 8px;">Preferences</h2>
+    <div><strong>Drop-off:</strong> ${escapeHtml(o.preferences?.dropoffPref || "—")}</div>
+    <div><strong>Substitutions:</strong> ${escapeHtml(o.preferences?.subsPref || "—")}</div>
+    <div><strong>Contact:</strong> ${escapeHtml(o.preferences?.contactPref || "—")}</div>
+  </div>
+
+  <div style="border:1px solid #ddd;border-radius:14px;padding:14px;margin-bottom:14px;">
+    <h2 style="margin:0 0 8px;">Grocery list</h2>
+    <pre style="white-space:pre-wrap;margin:0;background:#fafafa;border:1px solid #eee;border-radius:12px;padding:12px;">${escapeHtml(o.list?.groceryListText || "")}</pre>
+    ${fileBlock}
+  </div>
+</body></html>`);
+});
+
+app.get("/admin/orders/:orderId/file", requireLogin, requireAdmin, async (req, res) => {
+  const orderId = String(req.params.orderId || "").trim();
+  const o = await Order.findOne({ orderId }).lean();
+  if (!o) return res.status(404).send("Order not found");
+
+  const file = o.list?.attachment;
+  if (!file || !file.path) return res.status(404).send("No file uploaded");
+
+  const abs = path.resolve(file.path);
+  if (!fs.existsSync(abs)) return res.status(404).send("File missing on server");
+
+  res.download(abs, file.originalName || "attachment");
+});
+
+// =========================
 // Root
+// =========================
 app.get("/", (req, res) => res.send("TGR backend up"));
 
+// =========================
 // Boot
+// =========================
 async function main() {
   await mongoose.connect(MONGODB_URI);
   console.log("Connected to MongoDB");
