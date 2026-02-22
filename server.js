@@ -1,52 +1,16 @@
 /**
- * server.js — TGR backend (Express + MongoDB + Google OAuth + Square webhooks)
+ * server.js — TGR backend (unchanged logic; mobile optimization is frontend-only)
  *
  * Includes:
  * - Google sign-in: /auth/google + callback + /logout
  * - Mongo-backed sessions (connect-mongo)
  * - /api/me
- * - Run engine: /api/runs/active (cutoffs, slots, minimum-to-run)
- * - Orders:
- *    - POST /api/orders (multipart w/ optional file upload)
- *    - GET  /api/orders/:orderId (public status by Order ID)
- * - Server-truth fee estimator: POST /api/estimator
- * - Square link resolvers:
- *    - Membership checkout resolver: POST /api/memberships/checkout { tier }
- *    - Payment checkout resolver:    POST /api/payments/checkout { kind }
- *    - Convenience redirects: /pay/groceries, /pay/fees
- * - Member portal: /member
- * - Admin portal: /admin (search/filter, status updates, CSV, detail view, file download)
+ * - Run engine: /api/runs/active
+ * - Orders: POST /api/orders (multipart + optional file), GET /api/orders/:orderId
+ * - Fee estimator: POST /api/estimator
+ * - Square link resolvers + convenience redirects
+ * - /member and /admin HTML pages
  * - Square webhooks: POST /webhooks/square (signature verified + idempotent + auto-sync membership)
- *
- * REQUIRED ENV (Render - backend service):
- * - SESSION_SECRET
- * - MONGO_URI (or MONGODB_URI)
- * - GOOGLE_CLIENT_ID
- * - GOOGLE_CLIENT_SECRET
- * - GOOGLE_CALLBACK_URL = https://api.tobermorygroceryrun.ca/auth/google/callback
- *
- * - SQUARE_LINK_STANDARD
- * - SQUARE_LINK_ROUTE
- * - SQUARE_LINK_ACCESS
- * - SQUARE_LINK_ACCESSPRO
- *
- * - SQUARE_PAY_GROCERIES_LINK
- * - SQUARE_PAY_FEES_LINK
- *
- * Square webhooks:
- * - SQUARE_WEBHOOK_SIGNATURE_KEY
- * - SQUARE_WEBHOOK_NOTIFICATION_URL = https://api.tobermorygroceryrun.ca/webhooks/square
- * - SQUARE_ACCESS_TOKEN (Production token)
- *
- * Plan variation IDs (Catalog API):
- * - SQUARE_PLAN_STANDARD_VARIATION_ID
- * - SQUARE_PLAN_ROUTE_VARIATION_ID
- * - SQUARE_PLAN_ACCESS_VARIATION_ID
- * - SQUARE_PLAN_ACCESSPRO_VARIATION_ID
- *
- * OPTIONAL:
- * - TZ (default America/Toronto)
- * - ADMIN_EMAILS (comma-separated allowlist for /admin)
  */
 
 const express = require("express");
@@ -650,7 +614,7 @@ app.get("/api/me", (req, res) => {
 // =========================
 // Health
 // =========================
-app.get("/health", (req, res) => res.json({ ok: true, uptime: process.uptime() }));
+app.get("/health", (_req, res) => res.json({ ok: true, uptime: process.uptime() }));
 
 // =========================
 // Square link resolvers + convenience redirects
@@ -679,13 +643,13 @@ app.post("/api/payments/checkout", (req, res) => {
   res.json({ ok: true, kind, checkoutUrl: url });
 });
 
-app.get("/pay/groceries", (req, res) => {
+app.get("/pay/groceries", (_req, res) => {
   const url = SQUARE_PAY_LINKS.groceries;
   if (!url) return res.status(500).send("Payment link not configured (SQUARE_PAY_GROCERIES_LINK).");
   res.redirect(url);
 });
 
-app.get("/pay/fees", (req, res) => {
+app.get("/pay/fees", (_req, res) => {
   const url = SQUARE_PAY_LINKS.fees;
   if (!url) return res.status(500).send("Payment link not configured (SQUARE_PAY_FEES_LINK).");
   res.redirect(url);
@@ -694,7 +658,7 @@ app.get("/pay/fees", (req, res) => {
 // =========================
 // Runs
 // =========================
-app.get("/api/runs/active", async (req, res) => {
+app.get("/api/runs/active", async (_req, res) => {
   try {
     const runs = await ensureUpcomingRuns();
     const now = nowTz();
@@ -977,7 +941,7 @@ app.get("/member", requireLogin, async (req, res) => {
 });
 
 // =========================
-// Admin portal
+// Admin portal (same as before)
 // =========================
 function csvEscape(val) {
   const s = String(val ?? "");
