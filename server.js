@@ -1,16 +1,43 @@
 /**
- * server.js — TGR backend (unchanged logic; mobile optimization is frontend-only)
+ * server.js — TGR backend (Express + MongoDB + Google OAuth + Square + Required Accounts)
  *
- * Includes:
- * - Google sign-in: /auth/google + callback + /logout
- * - Mongo-backed sessions (connect-mongo)
- * - /api/me
- * - Run engine: /api/runs/active
- * - Orders: POST /api/orders (multipart + optional file), GET /api/orders/:orderId
- * - Fee estimator: POST /api/estimator
- * - Square link resolvers + convenience redirects
- * - /member and /admin HTML pages
- * - Square webhooks: POST /webhooks/square (signature verified + idempotent + auto-sync membership)
+ * What’s new in this version:
+ * - REQUIRED account completion before ordering
+ *   - Google login creates user (email/name/photo/googleId)
+ *   - User must complete /api/profile (Create Account) before /api/orders works
+ * - Profile API:
+ *   - GET  /api/profile  (requires login)
+ *   - POST /api/profile  (requires login, validates required fields, sets profile.complete=true)
+ * - /api/me now returns profileComplete
+ * - Google OAuth callback redirects to onboarding automatically if profile incomplete
+ *
+ * ENV (Render):
+ * - SESSION_SECRET
+ * - MONGO_URI (or MONGODB_URI)
+ * - GOOGLE_CLIENT_ID
+ * - GOOGLE_CLIENT_SECRET
+ * - GOOGLE_CALLBACK_URL = https://api.tobermorygroceryrun.ca/auth/google/callback
+ *
+ * Square links:
+ * - SQUARE_LINK_STANDARD
+ * - SQUARE_LINK_ROUTE
+ * - SQUARE_LINK_ACCESS
+ * - SQUARE_LINK_ACCESSPRO
+ * - SQUARE_PAY_GROCERIES_LINK
+ * - SQUARE_PAY_FEES_LINK
+ *
+ * Square webhooks:
+ * - SQUARE_WEBHOOK_SIGNATURE_KEY
+ * - SQUARE_WEBHOOK_NOTIFICATION_URL = https://api.tobermorygroceryrun.ca/webhooks/square
+ * - SQUARE_ACCESS_TOKEN
+ * - SQUARE_PLAN_STANDARD_VARIATION_ID
+ * - SQUARE_PLAN_ROUTE_VARIATION_ID
+ * - SQUARE_PLAN_ACCESS_VARIATION_ID
+ * - SQUARE_PLAN_ACCESSPRO_VARIATION_ID
+ *
+ * OPTIONAL:
+ * - TZ (default America/Toronto)
+ * - ADMIN_EMAILS (comma separated allowlist)
  */
 
 const express = require("express");
@@ -29,7 +56,6 @@ const passport = require("passport");
 const GoogleStrategy = require("passport-google-oauth20").Strategy;
 
 const { Client, Environment, WebhooksHelper } = require("square");
-
 const User = require("./models/User");
 
 const dayjs = require("dayjs");
@@ -42,7 +68,6 @@ dayjs.extend(timezone);
 // ENV / CONFIG
 // =========================
 const PORT = process.env.PORT || 10000;
-
 const MONGODB_URI =
   process.env.MONGODB_URI ||
   process.env.MONGO_URI ||
@@ -59,9 +84,6 @@ const ADMIN_EMAILS = String(process.env.ADMIN_EMAILS || "")
   .split(",")
   .map((s) => s.trim().toLowerCase())
   .filter(Boolean);
-
-const COOKIE_SAMESITE = "lax";
-const COOKIE_DOMAIN = undefined;
 
 const ALLOWED_ORIGINS = [
   "https://tobermorygroceryrun.ca",
@@ -84,7 +106,6 @@ const SQUARE_WEBHOOK_SIGNATURE_KEY = process.env.SQUARE_WEBHOOK_SIGNATURE_KEY ||
 const SQUARE_WEBHOOK_NOTIFICATION_URL = process.env.SQUARE_WEBHOOK_NOTIFICATION_URL || "";
 const SQUARE_ACCESS_TOKEN = process.env.SQUARE_ACCESS_TOKEN || "";
 
-// Map plan variation IDs -> internal tiers
 const PLAN_MAP = {
   [process.env.SQUARE_PLAN_STANDARD_VARIATION_ID || ""]: "standard",
   [process.env.SQUARE_PLAN_ROUTE_VARIATION_ID || ""]: "route",
@@ -114,7 +135,7 @@ app.use(
   })
 );
 
-// IMPORTANT: rawBody capture for Square webhook signature validation
+// Capture raw body for Square webhook signature validation
 app.use(
   express.json({
     limit: "3mb",
@@ -143,8 +164,7 @@ app.use(
     cookie: {
       httpOnly: true,
       secure: true,
-      sameSite: COOKIE_SAMESITE,
-      ...(COOKIE_DOMAIN ? { domain: COOKIE_DOMAIN } : {}),
+      sameSite: "lax",
       maxAge: 1000 * 60 * 60 * 24 * 14,
     },
   })
@@ -197,7 +217,13 @@ if (GOOGLE_CLIENT_ID && GOOGLE_CLIENT_SECRET && GOOGLE_CALLBACK_URL) {
                 renewalDate: null,
                 discounts: [],
                 perks: [],
-                profile: { version: 1, defaultId: "", addresses: [] },
+                // profile blob is where we store onboarding data
+                profile: {
+                  version: 1,
+                  complete: false,
+                  defaultId: "",
+                  addresses: [],
+                },
               },
             },
             { upsert: true, new: true }
@@ -232,14 +258,6 @@ const PRICING = {
   owenRunFeePerOrder: 20,
   addOns: {
     extraStore: 8,
-    parcelDrop: 10,
-    parcelBulkyExtra: 8,
-    liquor: 12,
-    fastFood: 10,
-    waitPerBlock: 10,
-    rideSeat: 45,
-    rideSeatSouthOfFerndale: 30,
-    bulkyPerItem: 18,
     printingBase: 5,
     printingFirst10: 1.25,
     printingAfter10: 0.75,
@@ -259,7 +277,6 @@ function calcPrinting(pages) {
   );
 }
 
-// estimator-only discounts
 function membershipDiscounts(tier, applyPerkYes) {
   if (!tier || !applyPerkYes)
     return { serviceOff: 0, zoneOff: 0, freeAddonUpTo: 0, waitWaived: false };
@@ -358,7 +375,6 @@ const OrderSchema = new mongoose.Schema(
   { timestamps: true }
 );
 
-// Webhook idempotency store
 const WebhookEventSchema = new mongoose.Schema(
   { eventId: { type: String, unique: true, index: true }, type: { type: String, default: "" } },
   { timestamps: true }
@@ -556,11 +572,39 @@ function computeFeeBreakdown(input) {
   };
 }
 
+function isProfileComplete(profile) {
+  const p = profile || {};
+  if (p.complete === true) return true;
+
+  const fullName = String(p.fullName || "").trim();
+  const phone = String(p.phone || "").trim();
+  const contactPref = String(p.contactPref || "").trim();
+  const contactAuth = p.contactAuth === true;
+
+  const addresses = Array.isArray(p.addresses) ? p.addresses : [];
+  const hasAddress = addresses.some((a) => {
+    const street = String(a.streetAddress || "").trim();
+    const town = String(a.town || "").trim();
+    const zone = String(a.zone || "").trim();
+    return !!street && !!town && !!zone;
+  });
+
+  return !!fullName && !!phone && !!contactPref && contactAuth && hasAddress;
+}
+
 // =========================
 // Guards
 // =========================
 function requireLogin(req, res, next) {
-  if (!req.user) return res.status(401).send("Sign-in required.");
+  if (!req.user) return res.status(401).json({ ok: false, error: "Sign-in required." });
+  next();
+}
+
+function requireProfileComplete(req, res, next) {
+  const profile = req.user?.profile || {};
+  if (!isProfileComplete(profile)) {
+    return res.status(403).json({ ok: false, error: "Account setup required. Please complete your profile." });
+  }
   next();
 }
 
@@ -586,9 +630,21 @@ app.get("/auth/google", (req, res, next) => {
 app.get(
   "/auth/google/callback",
   passport.authenticate("google", { failureRedirect: "https://tobermorygroceryrun.ca/?login=failed" }),
-  (req, res) => {
+  async (req, res) => {
     const rt = req.session.returnTo || "https://tobermorygroceryrun.ca/";
     delete req.session.returnTo;
+
+    // Force onboarding redirect if profile incomplete
+    try {
+      const u = await User.findById(req.user._id).lean();
+      const complete = isProfileComplete(u?.profile);
+      if (!complete) {
+        return res.redirect("https://tobermorygroceryrun.ca/?tab=account&onboarding=1");
+      }
+    } catch {
+      // If anything fails, still send them to the site
+    }
+
     res.redirect(rt);
   }
 );
@@ -598,17 +654,105 @@ app.get("/logout", (req, res) => {
   req.session.destroy(() => res.redirect(returnTo));
 });
 
+// =========================
+// API: me + profile
+// =========================
 app.get("/api/me", (req, res) => {
   const u = req.user;
+  const profile = u?.profile || {};
   res.json({
     ok: true,
     loggedIn: !!u,
     email: u?.email || null,
     name: u?.name || "",
+    photo: u?.photo || "",
     membershipLevel: u?.membershipLevel || "none",
     membershipStatus: u?.membershipStatus || "inactive",
     renewalDate: u?.renewalDate || null,
+    profileComplete: isProfileComplete(profile),
   });
+});
+
+app.get("/api/profile", requireLogin, async (req, res) => {
+  const u = await User.findById(req.user._id).lean();
+  res.json({
+    ok: true,
+    profile: u?.profile || {},
+    profileComplete: isProfileComplete(u?.profile || {}),
+    email: u?.email || "",
+    name: u?.name || "",
+    photo: u?.photo || "",
+  });
+});
+
+app.post("/api/profile", requireLogin, async (req, res) => {
+  try {
+    const b = req.body || {};
+    const u = await User.findById(req.user._id);
+    if (!u) return res.status(404).json({ ok: false, error: "User not found" });
+
+    const profile = (u.profile && typeof u.profile === "object") ? u.profile : { version: 1 };
+
+    // Core identity
+    profile.fullName = String(b.fullName || "").trim();
+    profile.preferredName = String(b.preferredName || "").trim();
+    profile.phone = String(b.phone || "").trim();
+    profile.altPhone = String(b.altPhone || "").trim();
+
+    // Preferences
+    profile.contactPref = String(b.contactPref || "").trim(); // call/text/email
+    profile.contactAuth = String(b.contactAuth || "") === "yes";
+    profile.subsDefault = String(b.subsDefault || "").trim();
+    profile.dropoffDefault = String(b.dropoffDefault || "").trim();
+    profile.notes = String(b.notes || "").trim();
+
+    // Optional data capture
+    profile.accessibility = String(b.accessibility || "").trim();
+    profile.dietary = String(b.dietary || "").trim();
+    profile.preferredStores = Array.isArray(b.preferredStores) ? b.preferredStores : safeJsonArray(b.preferredStores);
+    profile.emergencyContactName = String(b.emergencyContactName || "").trim();
+    profile.emergencyContactPhone = String(b.emergencyContactPhone || "").trim();
+
+    // Addresses
+    const addressesIn = Array.isArray(b.addresses) ? b.addresses : safeJsonArray(b.addressesJson).map(() => ({}));
+    const addr = Array.isArray(b.addresses) ? b.addresses : (() => {
+      try { return JSON.parse(b.addresses || "[]"); } catch { return []; }
+    })();
+
+    const addresses = Array.isArray(addr) ? addr : [];
+    profile.addresses = addresses.map((a) => ({
+      id: String(a.id || "").trim() || String(Math.random()).slice(2),
+      label: String(a.label || "").trim(),
+      town: String(a.town || "").trim(),
+      zone: String(a.zone || "").trim(),
+      streetAddress: String(a.streetAddress || "").trim(),
+      unit: String(a.unit || "").trim(),
+      instructions: String(a.instructions || "").trim(),
+      gateCode: String(a.gateCode || "").trim(),
+    }));
+
+    // Default address
+    profile.defaultId = String(b.defaultId || "").trim();
+
+    // Consents
+    profile.consentTerms = String(b.consentTerms || "") === "yes";
+    profile.consentPrivacy = String(b.consentPrivacy || "") === "yes";
+    profile.consentMarketing = String(b.consentMarketing || "") === "yes";
+
+    // Completion: must have required + consents
+    const requiredConsentsOk = profile.consentTerms === true && profile.consentPrivacy === true;
+    const completeNow = isProfileComplete(profile) && requiredConsentsOk;
+
+    profile.complete = !!completeNow;
+    profile.completedAt = completeNow ? new Date().toISOString() : (profile.completedAt || null);
+
+    u.profile = profile;
+    await u.save();
+
+    return res.json({ ok: true, profileComplete: profile.complete === true, profile: u.profile });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: String(e) });
+  }
 });
 
 // =========================
@@ -708,31 +852,28 @@ app.post("/api/estimator", (req, res) => {
 });
 
 // =========================
-// Orders
+// Orders (REQUIRES LOGIN + PROFILE COMPLETE)
 // =========================
-app.post("/api/orders", upload.single("groceryFile"), async (req, res) => {
+app.post("/api/orders", requireLogin, requireProfileComplete, upload.single("groceryFile"), async (req, res) => {
   try {
     const b = req.body || {};
+    const user = await User.findById(req.user._id).lean();
+    const profile = user?.profile || {};
 
-    const required = [
-      "fullName","email","phone","town","streetAddress","zone","runType",
-      "primaryStore","groceryList","dropoffPref","subsPref","contactPref",
-    ];
-    for (const k of required) {
-      const v = String(b[k] || "").trim();
-      if (!v) return res.status(400).json({ ok: false, error: "Missing required field: " + k });
-    }
-
-    if (String(b.contactAuth || "") !== "yes") {
-      return res.status(400).json({ ok: false, error: "Contact authorization is required." });
-    }
-
+    // Must still accept consents at time of order
     if (
       String(b.consent_terms || "") !== "yes" ||
       String(b.consent_accuracy || "") !== "yes" ||
       String(b.consent_dropoff || "") !== "yes"
     ) {
       return res.status(400).json({ ok: false, error: "All required consents must be accepted." });
+    }
+
+    // Required order fields
+    const required = ["town", "streetAddress", "zone", "runType", "primaryStore", "groceryList", "dropoffPref", "subsPref", "contactPref"];
+    for (const k of required) {
+      const v = String(b[k] || "").trim();
+      if (!v) return res.status(400).json({ ok: false, error: "Missing required field: " + k });
     }
 
     const runs = await ensureUpcomingRuns();
@@ -774,15 +915,16 @@ app.post("/api/orders", upload.single("groceryFile"), async (req, res) => {
 
     const pricingSnapshot = breakdown.totals;
 
+    // Always use account identity as source of truth
     const orderDoc = {
       orderId,
       runKey: run.runKey,
       runType,
 
       customer: {
-        fullName: String(b.fullName || "").trim(),
-        email: String(b.email || "").trim().toLowerCase(),
-        phone: String(b.phone || "").trim(),
+        fullName: String(profile.fullName || user.name || "").trim(),
+        email: String(user.email || "").trim().toLowerCase(),
+        phone: String(profile.phone || "").trim(),
       },
 
       address: {
@@ -837,6 +979,7 @@ app.post("/api/orders", upload.single("groceryFile"), async (req, res) => {
   }
 });
 
+// Public tracking
 app.get("/api/orders/:orderId", async (req, res) => {
   try {
     const orderId = String(req.params.orderId || "").trim();
@@ -869,7 +1012,7 @@ app.get("/api/orders/:orderId", async (req, res) => {
 // Member portal
 // =========================
 app.get("/member", requireLogin, async (req, res) => {
-  const u = req.user;
+  const u = await User.findById(req.user._id).lean();
   const email = String(u?.email || "").toLowerCase();
 
   const orders = await Order.find({ "customer.email": email })
@@ -901,6 +1044,11 @@ app.get("/member", requireLogin, async (req, res) => {
     })
     .join("");
 
+  const complete = isProfileComplete(u?.profile || {});
+  const banner = complete
+    ? `<div style="padding:12px 14px;border:1px solid #ddd;border-radius:12px;background:#f7fff8;margin-bottom:14px;"><strong>Account:</strong> complete ✅</div>`
+    : `<div style="padding:12px 14px;border:1px solid #f2c2c2;border-radius:12px;background:#fff7f7;margin-bottom:14px;"><strong>Account:</strong> incomplete. Complete setup on the main site to place orders.</div>`;
+
   res.setHeader("Content-Type", "text/html; charset=utf-8");
   res.send(`<!doctype html>
 <html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
@@ -908,21 +1056,13 @@ app.get("/member", requireLogin, async (req, res) => {
 <body style="font-family:system-ui,Segoe UI,Roboto,Arial,sans-serif;padding:18px;max-width:1100px;margin:0 auto;">
 <h1 style="margin:0 0 6px;">Member Portal</h1>
 <div style="color:#444;margin-bottom:14px;">Signed in as <strong>${escapeHtml(email)}</strong></div>
+${banner}
 
 <div style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:14px;">
 <a href="https://tobermorygroceryrun.ca/" style="padding:12px 14px;border:1px solid #ddd;border-radius:12px;text-decoration:none;color:#111;font-weight:900;">Back to site</a>
 <a href="/pay/groceries" style="padding:12px 14px;border:1px solid #e3342f;background:#e3342f;color:#fff;border-radius:12px;text-decoration:none;font-weight:900;">Pay Grocery Total</a>
 <a href="/pay/fees" style="padding:12px 14px;border:1px solid #ddd;border-radius:12px;text-decoration:none;color:#111;font-weight:900;">Pay Service & Delivery Fees</a>
 <a href="/logout?returnTo=https%3A%2F%2Ftobermorygroceryrun.ca%2F" style="padding:12px 14px;border:1px solid #ddd;border-radius:12px;text-decoration:none;color:#111;font-weight:900;">Log out</a>
-</div>
-
-<div style="border:1px solid #ddd;border-radius:14px;padding:14px;margin-bottom:14px;">
-<h2 style="margin:0 0 8px;">Account</h2>
-<div><strong>Name:</strong> ${escapeHtml(u?.name || "—")}</div>
-<div><strong>Membership level:</strong> ${escapeHtml(u?.membershipLevel || "none")}</div>
-<div><strong>Membership status:</strong> ${escapeHtml(u?.membershipStatus || "inactive")}</div>
-<div><strong>Renewal date:</strong> ${escapeHtml(u?.renewalDate ? String(u.renewalDate) : "—")}</div>
-<div style="color:#666;margin-top:8px;">Membership status is auto-synced from Square webhook events.</div>
 </div>
 
 <h2 style="margin:0 0 8px;">Recent orders</h2>
@@ -941,14 +1081,8 @@ app.get("/member", requireLogin, async (req, res) => {
 });
 
 // =========================
-// Admin portal (same as before)
+// Admin portal (kept minimal)
 // =========================
-function csvEscape(val) {
-  const s = String(val ?? "");
-  if (/[",\n]/.test(s)) return `"${s.replace(/"/g, '""')}"`;
-  return s;
-}
-
 function buildAdminOrderQuery(q, status) {
   const query = {};
   const qq = String(q || "").trim();
@@ -974,10 +1108,6 @@ app.get("/admin", requireLogin, requireAdmin, async (req, res) => {
   const mongoQuery = buildAdminOrderQuery(q, status);
 
   const orders = await Order.find(mongoQuery).sort({ createdAt: -1 }).limit(200).lean();
-  const statusSel = (v) => (String(status).toLowerCase() === v ? "selected" : "");
-  const returnToBase = "/admin?" + new URLSearchParams({ q, status }).toString();
-  const csvUrl = "/admin/orders.csv" + (q || status ? `?${new URLSearchParams({ q, status }).toString()}` : "");
-
   const rows = orders
     .map((o) => {
       const st = o.status?.state || "submitted";
@@ -994,9 +1124,7 @@ app.get("/admin", requireLogin, requireAdmin, async (req, res) => {
 
       return `
         <tr>
-          <td style="padding:10px 8px;border-top:1px solid #ddd;font-weight:900;">
-            <a href="/admin/orders/${encodeURIComponent(o.orderId)}" style="color:#e3342f;text-decoration:none;">${escapeHtml(o.orderId)}</a>
-          </td>
+          <td style="padding:10px 8px;border-top:1px solid #ddd;font-weight:900;">${escapeHtml(o.orderId)}</td>
           <td style="padding:10px 8px;border-top:1px solid #ddd;">${escapeHtml(when)}</td>
           <td style="padding:10px 8px;border-top:1px solid #ddd;">${escapeHtml(runType)}</td>
           <td style="padding:10px 8px;border-top:1px solid #ddd;">
@@ -1005,20 +1133,7 @@ app.get("/admin", requireLogin, requireAdmin, async (req, res) => {
           </td>
           <td style="padding:10px 8px;border-top:1px solid #ddd;">${escapeHtml(town)}</td>
           <td style="padding:10px 8px;border-top:1px solid #ddd;">$${escapeHtml(totalFees)}</td>
-          <td style="padding:10px 8px;border-top:1px solid #ddd;">
-            <div style="font-weight:900;margin-bottom:6px;">${escapeHtml(st)}</div>
-            <div style="display:flex;gap:6px;flex-wrap:wrap;">
-              ${["submitted","paid","delivered","issue"].map(s => `
-                <form method="POST" action="/admin/orders/${encodeURIComponent(o.orderId)}/status" style="margin:0;">
-                  <input type="hidden" name="state" value="${s}">
-                  <input type="hidden" name="returnTo" value="${escapeHtml(returnToBase)}">
-                  <button style="padding:8px 10px;border:1px solid #ddd;border-radius:10px;cursor:pointer;background:${s===st?"#e3342f":"#fff"};color:${s===st?"#fff":"#111"};font-weight:900;">
-                    ${s}
-                  </button>
-                </form>
-              `).join("")}
-            </div>
-          </td>
+          <td style="padding:10px 8px;border-top:1px solid #ddd;font-weight:900;">${escapeHtml(st)}</td>
         </tr>
       `;
     })
@@ -1031,31 +1146,7 @@ app.get("/admin", requireLogin, requireAdmin, async (req, res) => {
 <body style="font-family:system-ui,Segoe UI,Roboto,Arial,sans-serif;padding:18px;max-width:1280px;margin:0 auto;">
 <h1 style="margin:0 0 6px;">Admin</h1>
 <div style="color:#444;margin-bottom:14px;">Signed in as <strong>${escapeHtml(req.user?.email || "")}</strong></div>
-
-<div style="border:1px solid #ddd;border-radius:14px;padding:14px;margin-bottom:14px;">
-<form method="GET" action="/admin" style="display:flex;gap:10px;flex-wrap:wrap;align-items:end;margin:0;">
-<div style="flex:1;min-width:240px;">
-<label style="display:block;font-weight:900;margin:0 0 6px;">Search</label>
-<input name="q" value="${escapeHtml(q)}" placeholder="Order ID, name, phone, town, store..." style="width:100%;padding:12px;border:1px solid #ddd;border-radius:12px;">
-</div>
-<div style="min-width:200px;">
-<label style="display:block;font-weight:900;margin:0 0 6px;">Status</label>
-<select name="status" style="width:100%;padding:12px;border:1px solid #ddd;border-radius:12px;">
-<option value="all" ${statusSel("all")}>All</option>
-<option value="submitted" ${statusSel("submitted")}>submitted</option>
-<option value="paid" ${statusSel("paid")}>paid</option>
-<option value="delivered" ${statusSel("delivered")}>delivered</option>
-<option value="issue" ${statusSel("issue")}>issue</option>
-</select>
-</div>
-<button style="padding:12px 14px;border:1px solid #e3342f;background:#e3342f;color:#fff;border-radius:12px;font-weight:900;cursor:pointer;">Apply</button>
-<a href="${csvUrl}" style="padding:12px 14px;border:1px solid #ddd;border-radius:12px;text-decoration:none;color:#111;font-weight:900;">Download CSV</a>
-<a href="/pay/fees" style="padding:12px 14px;border:1px solid #ddd;border-radius:12px;text-decoration:none;color:#111;font-weight:900;">Fees link</a>
-<a href="/pay/groceries" style="padding:12px 14px;border:1px solid #ddd;border-radius:12px;text-decoration:none;color:#111;font-weight:900;">Groceries link</a>
-<a href="/logout?returnTo=https%3A%2F%2Ftobermorygroceryrun.ca%2F" style="padding:12px 14px;border:1px solid #ddd;border-radius:12px;text-decoration:none;color:#111;font-weight:900;">Log out</a>
-</form>
-<div style="color:#666;margin-top:10px;">Showing latest 200 results. Click Order ID for print + file download.</div>
-</div>
+<div style="margin-bottom:14px;"><a href="/logout?returnTo=https%3A%2F%2Ftobermorygroceryrun.ca%2F">Log out</a></div>
 
 <table style="width:100%;border-collapse:collapse;">
 <thead><tr>
@@ -1070,148 +1161,6 @@ app.get("/admin", requireLogin, requireAdmin, async (req, res) => {
 <tbody>${rows || `<tr><td colspan="7" style="padding:10px 8px;color:#666;">No orders found.</td></tr>`}</tbody>
 </table>
 </body></html>`);
-});
-
-app.post("/admin/orders/:orderId/status", requireLogin, requireAdmin, async (req, res) => {
-  const orderId = String(req.params.orderId || "").trim();
-  const state = String(req.body?.state || "").trim().toLowerCase();
-  const returnTo = String(req.body?.returnTo || "/admin").trim();
-
-  const allowed = new Set(["submitted", "paid", "delivered", "issue"]);
-  if (!allowed.has(state)) return res.status(400).send("Invalid state");
-
-  await Order.updateOne(
-    { orderId },
-    {
-      $set: {
-        "status.state": state,
-        "status.updatedAt": new Date(),
-        "status.updatedBy": String(req.user?.email || "admin"),
-      },
-    }
-  );
-
-  res.redirect(returnTo || "/admin");
-});
-
-app.get("/admin/orders.csv", requireLogin, requireAdmin, async (req, res) => {
-  const q = String(req.query.q || "");
-  const status = String(req.query.status || "all");
-  const mongoQuery = buildAdminOrderQuery(q, status);
-
-  const orders = await Order.find(mongoQuery).sort({ createdAt: -1 }).limit(2000).lean();
-
-  res.setHeader("Content-Type", "text/csv; charset=utf-8");
-  res.setHeader("Content-Disposition", `attachment; filename="tgr-orders.csv"`);
-
-  const header = [
-    "orderId","createdAtLocal","runType","status",
-    "customerName","customerEmail","customerPhone",
-    "town","primaryStore","extraStores","totalFees"
-  ].join(",");
-
-  const lines = orders.map(o => {
-    const createdAtLocal = fmtLocal(o.createdAt);
-    const totalFees = typeof o.pricingSnapshot?.totalFees === "number" ? o.pricingSnapshot.totalFees.toFixed(2) : "0.00";
-    return [
-      csvEscape(o.orderId),
-      csvEscape(createdAtLocal),
-      csvEscape(o.runType || ""),
-      csvEscape(o.status?.state || ""),
-      csvEscape(o.customer?.fullName || ""),
-      csvEscape(o.customer?.email || ""),
-      csvEscape(o.customer?.phone || ""),
-      csvEscape(o.address?.town || ""),
-      csvEscape(o.stores?.primary || ""),
-      csvEscape((o.stores?.extra || []).join(" | ")),
-      csvEscape(totalFees),
-    ].join(",");
-  });
-
-  res.send([header, ...lines].join("\n"));
-});
-
-app.get("/admin/orders/:orderId", requireLogin, requireAdmin, async (req, res) => {
-  const orderId = String(req.params.orderId || "").trim();
-  const o = await Order.findOne({ orderId }).lean();
-  if (!o) return res.status(404).send("Order not found");
-
-  const st = o.status?.state || "submitted";
-  const when = fmtLocal(o.createdAt);
-  const fees = typeof o.pricingSnapshot?.totalFees === "number" ? o.pricingSnapshot.totalFees.toFixed(2) : "0.00";
-  const extra = (o.stores?.extra || []).join(", ") || "—";
-  const file = o.list?.attachment;
-
-  const fileBlock = file
-    ? `<div style="margin-top:10px;">
-         <strong>Uploaded file:</strong> ${escapeHtml(file.originalName || "file")}
-         <div style="margin-top:6px;">
-           <a href="/admin/orders/${encodeURIComponent(orderId)}/file" style="color:#e3342f;font-weight:900;">Download</a>
-         </div>
-       </div>`
-    : `<div style="margin-top:10px;color:#666;">No file uploaded.</div>`;
-
-  res.setHeader("Content-Type", "text/html; charset=utf-8");
-  res.send(`<!doctype html>
-<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Order ${escapeHtml(orderId)}</title></head>
-<body style="font-family:system-ui,Segoe UI,Roboto,Arial,sans-serif;padding:18px;max-width:980px;margin:0 auto;">
-<div style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:14px;">
-<a href="/admin" style="padding:12px 14px;border:1px solid #ddd;border-radius:12px;text-decoration:none;color:#111;font-weight:900;">Back to admin</a>
-<a href="javascript:window.print()" style="padding:12px 14px;border:1px solid #ddd;border-radius:12px;text-decoration:none;color:#111;font-weight:900;">Print</a>
-<a href="/logout?returnTo=https%3A%2F%2Ftobermorygroceryrun.ca%2F" style="padding:12px 14px;border:1px solid #ddd;border-radius:12px;text-decoration:none;color:#111;font-weight:900;">Log out</a>
-</div>
-
-<h1 style="margin:0 0 6px;">${escapeHtml(orderId)}</h1>
-<div style="color:#444;margin-bottom:14px;">Created: ${escapeHtml(when)} • Status: <strong>${escapeHtml(st)}</strong> • Fees: <strong>$${escapeHtml(fees)}</strong></div>
-
-<div style="border:1px solid #ddd;border-radius:14px;padding:14px;margin-bottom:14px;">
-<h2 style="margin:0 0 8px;">Customer</h2>
-<div><strong>Name:</strong> ${escapeHtml(o.customer?.fullName || "—")}</div>
-<div><strong>Email:</strong> ${escapeHtml(o.customer?.email || "—")}</div>
-<div><strong>Phone:</strong> ${escapeHtml(o.customer?.phone || "—")}</div>
-</div>
-
-<div style="border:1px solid #ddd;border-radius:14px;padding:14px;margin-bottom:14px;">
-<h2 style="margin:0 0 8px;">Address</h2>
-<div><strong>Town:</strong> ${escapeHtml(o.address?.town || "—")}</div>
-<div><strong>Street:</strong> ${escapeHtml(o.address?.streetAddress || "—")}</div>
-<div><strong>Zone:</strong> ${escapeHtml(o.address?.zone || "—")}</div>
-</div>
-
-<div style="border:1px solid #ddd;border-radius:14px;padding:14px;margin-bottom:14px;">
-<h2 style="margin:0 0 8px;">Stores</h2>
-<div><strong>Primary:</strong> ${escapeHtml(o.stores?.primary || "—")}</div>
-<div><strong>Extra:</strong> ${escapeHtml(extra)}</div>
-</div>
-
-<div style="border:1px solid #ddd;border-radius:14px;padding:14px;margin-bottom:14px;">
-<h2 style="margin:0 0 8px;">Preferences</h2>
-<div><strong>Drop-off:</strong> ${escapeHtml(o.preferences?.dropoffPref || "—")}</div>
-<div><strong>Substitutions:</strong> ${escapeHtml(o.preferences?.subsPref || "—")}</div>
-<div><strong>Contact:</strong> ${escapeHtml(o.preferences?.contactPref || "—")}</div>
-</div>
-
-<div style="border:1px solid #ddd;border-radius:14px;padding:14px;margin-bottom:14px;">
-<h2 style="margin:0 0 8px;">Grocery list</h2>
-<pre style="white-space:pre-wrap;margin:0;background:#fafafa;border:1px solid #eee;border-radius:12px;padding:12px;">${escapeHtml(o.list?.groceryListText || "")}</pre>
-${fileBlock}
-</div>
-</body></html>`);
-});
-
-app.get("/admin/orders/:orderId/file", requireLogin, requireAdmin, async (req, res) => {
-  const orderId = String(req.params.orderId || "").trim();
-  const o = await Order.findOne({ orderId }).lean();
-  if (!o) return res.status(404).send("Order not found");
-
-  const file = o.list?.attachment;
-  if (!file || !file.path) return res.status(404).send("No file uploaded");
-
-  const abs = path.resolve(file.path);
-  if (!fs.existsSync(abs)) return res.status(404).send("File missing on server");
-
-  res.download(abs, file.originalName || "attachment");
 });
 
 // =========================
@@ -1255,12 +1204,10 @@ app.post("/webhooks/square", async (req, res) => {
     const sqStatus = String(subscription.status || "").toUpperCase();
 
     const tier = PLAN_MAP[planVariationId] || "none";
-
     const internalStatus =
       sqStatus === "ACTIVE" ? "active" :
       (sqStatus === "CANCELED" || sqStatus === "CANCELLED") ? "cancelled" :
-      (sqStatus === "PAUSED") ? "inactive" :
-      "inactive";
+      (sqStatus === "PAUSED") ? "inactive" : "inactive";
 
     const renewalDate = subscription.charged_through_date ? new Date(subscription.charged_through_date) : null;
 
@@ -1289,7 +1236,6 @@ app.post("/webhooks/square", async (req, res) => {
     if (renewalDate) set.renewalDate = renewalDate;
 
     await User.updateOne({ _id: user._id }, { $set: set });
-
     return res.status(200).send("ok");
   } catch (e) {
     return res.status(500).send("webhook error: " + String(e));
