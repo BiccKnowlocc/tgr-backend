@@ -1,47 +1,4 @@
-/**
- * server.js — TGR backend (Express + MongoDB + Google OAuth + Required Account Onboarding
- * + Runs + Orders + Estimator + Membership checkout links + Pay links + Square webhook)
- *
- * You asked to keep/restore all site sections (About/Areas/Pricing/etc). Those are frontend panels,
- * so server stays largely the same. This server supports:
- * - Google auth: /auth/google, /auth/google/callback, /logout
- * - Account/profile: GET/POST /api/profile (required before ordering)
- * - /api/me (returns profileComplete)
- * - Runs: /api/runs/active
- * - Estimator: /api/estimator
- * - Orders: POST /api/orders (requires login + profileComplete), GET /api/orders/:orderId (tracking)
- * - Membership checkout: POST /api/memberships/checkout (returns Square link)
- * - Pay links: POST /api/payments/checkout + /pay/groceries + /pay/fees
- * - Member/admin placeholder pages: /member, /admin
- *
- * Render ENV (minimum):
- * - MONGO_URI (or MONGODB_URI)
- * - SESSION_SECRET
- * - GOOGLE_CLIENT_ID
- * - GOOGLE_CLIENT_SECRET
- * - GOOGLE_CALLBACK_URL = https://api.tobermorygroceryrun.ca/auth/google/callback
- *
- * Square links (optional, but used by Membership + Pay tabs):
- * - SQUARE_LINK_STANDARD
- * - SQUARE_LINK_ROUTE
- * - SQUARE_LINK_ACCESS
- * - SQUARE_LINK_ACCESSPRO
- * - SQUARE_PAY_GROCERIES_LINK
- * - SQUARE_PAY_FEES_LINK
- *
- * Optional:
- * - ADMIN_EMAILS (comma-separated)
- * - TZ (default America/Toronto)
- *
- * Square webhook (optional):
- * - SQUARE_WEBHOOK_SIGNATURE_KEY
- * - SQUARE_WEBHOOK_NOTIFICATION_URL = https://api.tobermorygroceryrun.ca/webhooks/square
- * - SQUARE_ACCESS_TOKEN
- * - SQUARE_PLAN_STANDARD_VARIATION_ID
- * - SQUARE_PLAN_ROUTE_VARIATION_ID
- * - SQUARE_PLAN_ACCESS_VARIATION_ID
- * - SQUARE_PLAN_ACCESSPRO_VARIATION_ID
- */
+// ======= server.js (FULL CLEAN FILE) =======
 
 const express = require("express");
 const mongoose = require("mongoose");
@@ -57,7 +14,6 @@ const passport = require("passport");
 const GoogleStrategy = require("passport-google-oauth20").Strategy;
 
 const { Client, Environment, WebhooksHelper } = require("square");
-
 const User = require("./models/User");
 
 const dayjs = require("dayjs");
@@ -137,6 +93,7 @@ app.use(
   })
 );
 
+// Capture rawBody for Square signature validation
 app.use(
   express.json({
     limit: "3mb",
@@ -145,9 +102,9 @@ app.use(
     },
   })
 );
+
 app.use(express.urlencoded({ extended: true }));
 app.use(cookieParser());
-
 app.set("trust proxy", 1);
 
 app.use(
@@ -286,11 +243,9 @@ const RunSchema = new mongoose.Schema(
     opensAt: { type: Date, required: true },
     cutoffAt: { type: Date, required: true },
     maxSlots: { type: Number, default: 12 },
-
     minOrders: { type: Number, default: 6 },
     minFees: { type: Number, default: 0 },
     minLogic: { type: String, enum: ["OR", "AND"], default: "OR" },
-
     bookedOrdersCount: { type: Number, default: 0 },
     bookedFeesTotal: { type: Number, default: 0 },
     lastRecalcAt: { type: Date },
@@ -433,7 +388,10 @@ async function ensureUpcomingRuns() {
       run = created.toObject();
     }
 
-    const needsRecalc = !run.lastRecalcAt || dayjs(run.lastRecalcAt).isBefore(nowTz().subtract(2, "minute").toDate());
+    const needsRecalc =
+      !run.lastRecalcAt ||
+      dayjs(run.lastRecalcAt).isBefore(nowTz().subtract(2, "minute").toDate());
+
     if (needsRecalc) {
       const agg = await Order.aggregate([
         { $match: { runKey } },
@@ -552,6 +510,7 @@ function isProfileComplete(profile) {
   });
 
   const consentsOk = p.consentTerms === true && p.consentPrivacy === true;
+
   return !!fullName && !!phone && !!contactPref && contactAuth && hasAddress && consentsOk;
 }
 
@@ -659,10 +618,6 @@ app.post("/api/profile", requireLogin, async (req, res) => {
     profile.subsDefault = String(b.subsDefault || "").trim();
     profile.dropoffDefault = String(b.dropoffDefault || "").trim();
     profile.notes = String(b.notes || "").trim();
-    profile.accessibility = String(b.accessibility || "").trim();
-    profile.dietary = String(b.dietary || "").trim();
-    profile.emergencyContactName = String(b.emergencyContactName || "").trim();
-    profile.emergencyContactPhone = String(b.emergencyContactPhone || "").trim();
 
     const addresses = Array.isArray(b.addresses) ? b.addresses : [];
     profile.addresses = addresses.map((a) => ({
@@ -920,28 +875,31 @@ app.get("/api/orders/:orderId", async (req, res) => {
 });
 
 // =========================
-// MEMBER + ADMIN PAGES (SERVER-RENDERED SIMPLE)
+// MEMBER + ADMIN (REAL HTML)
 // =========================
 app.get("/member", requireLogin, async (req, res) => {
   const u = await User.findById(req.user._id).lean();
   const email = String(u?.email || "").toLowerCase();
   const orders = await Order.find({ "customer.email": email }).sort({ createdAt: -1 }).limit(25).lean();
 
-  const rows = orders.map((o) => {
-    const status = o.status?.state || "submitted";
-    const when = fmtLocal(o.createdAt);
-    const primary = o.stores?.primary || "—";
-    const town = o.address?.town || "—";
-    const fees = typeof o.pricingSnapshot?.totalFees === "number" ? o.pricingSnapshot.totalFees.toFixed(2) : "0.00";
-    return `<tr>
-      <td style="padding:10px 8px;border-top:1px solid #ddd;font-weight:900;">${escapeHtml(o.orderId)}</td>
-      <td style="padding:10px 8px;border-top:1px solid #ddd;">${escapeHtml(when)}</td>
-      <td style="padding:10px 8px;border-top:1px solid #ddd;">${escapeHtml(primary)}</td>
-      <td style="padding:10px 8px;border-top:1px solid #ddd;">${escapeHtml(town)}</td>
-      <td style="padding:10px 8px;border-top:1px solid #ddd;font-weight:900;">${escapeHtml(status)}</td>
-      <td style="padding:10px 8px;border-top:1px solid #ddd;">$${escapeHtml(fees)}</td>
-    </tr>`;
-  }).join("");
+  const rows = orders
+    .map((o) => {
+      const status = o.status?.state || "submitted";
+      const when = fmtLocal(o.createdAt);
+      const primary = o.stores?.primary || "—";
+      const town = o.address?.town || "—";
+      const fees = typeof o.pricingSnapshot?.totalFees === "number" ? o.pricingSnapshot.totalFees.toFixed(2) : "0.00";
+      return `
+        <tr>
+          <td style="padding:10px 8px;border-top:1px solid #ddd;font-weight:900;">${escapeHtml(o.orderId)}</td>
+          <td style="padding:10px 8px;border-top:1px solid #ddd;">${escapeHtml(when)}</td>
+          <td style="padding:10px 8px;border-top:1px solid #ddd;">${escapeHtml(primary)}</td>
+          <td style="padding:10px 8px;border-top:1px solid #ddd;">${escapeHtml(town)}</td>
+          <td style="padding:10px 8px;border-top:1px solid #ddd;font-weight:900;">${escapeHtml(status)}</td>
+          <td style="padding:10px 8px;border-top:1px solid #ddd;">$${escapeHtml(fees)}</td>
+        </tr>`;
+    })
+    .join("");
 
   res.setHeader("Content-Type", "text/html; charset=utf-8");
   res.send(`<!doctype html>
