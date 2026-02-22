@@ -1,28 +1,35 @@
 /**
  * server.js — Tobermory Grocery Run backend (Express + MongoDB)
- * Includes:
+ *
+ * INCLUDED:
  * - Google OAuth (Passport) so /auth/google works
  * - Mongo-backed sessions (connect-mongo)
- * - Square links for memberships + payments
- * - Runs + Orders API
+ * - /member and /admin routes (with guards + ADMIN_EMAILS allowlist)
+ * - /api/me (used by your index header)
+ * - Square links:
+ *    - Membership subscriptions: POST /api/memberships/checkout { tier }
+ *    - One-time payments:       POST /api/payments/checkout    { kind }
+ * - Runs: GET /api/runs/active (cutoffs + max slots + minimum-to-run)
+ * - Orders: POST /api/orders (multipart, optional file) + GET /api/orders/:orderId
  *
- * REQUIRED Render ENV:
- *  - SESSION_SECRET
- *  - MONGO_URI (or MONGODB_URI)
- *  - GOOGLE_CLIENT_ID
- *  - GOOGLE_CLIENT_SECRET
- *  - GOOGLE_CALLBACK_URL   (https://api.tobermorygroceryrun.ca/auth/google/callback)
+ * REQUIRED Render ENV (API service):
+ * - SESSION_SECRET
+ * - MONGO_URI  (or MONGODB_URI)
+ * - GOOGLE_CLIENT_ID
+ * - GOOGLE_CLIENT_SECRET
+ * - GOOGLE_CALLBACK_URL = https://api.tobermorygroceryrun.ca/auth/google/callback
  *
- *  - SQUARE_LINK_STANDARD
- *  - SQUARE_LINK_ROUTE
- *  - SQUARE_LINK_ACCESS
- *  - SQUARE_LINK_ACCESSPRO
+ * - SQUARE_LINK_STANDARD
+ * - SQUARE_LINK_ROUTE
+ * - SQUARE_LINK_ACCESS
+ * - SQUARE_LINK_ACCESSPRO
  *
- *  - SQUARE_PAY_GROCERIES_LINK
- *  - SQUARE_PAY_FEES_LINK
+ * - SQUARE_PAY_GROCERIES_LINK
+ * - SQUARE_PAY_FEES_LINK
  *
  * OPTIONAL:
- *  - TZ (defaults America/Toronto)
+ * - TZ (defaults America/Toronto)
+ * - ADMIN_EMAILS (comma-separated allowlist for /admin)
  */
 
 const express = require("express");
@@ -32,7 +39,7 @@ const cookieParser = require("cookie-parser");
 const session = require("express-session");
 const cors = require("cors");
 
-// connect-mongo CJS/ESM interop (fixes MongoStore.create is not a function on some installs)
+// connect-mongo CJS/ESM interop
 const MongoStorePkg = require("connect-mongo");
 const MongoStore = MongoStorePkg.default || MongoStorePkg;
 
@@ -40,7 +47,7 @@ const MongoStore = MongoStorePkg.default || MongoStorePkg;
 const passport = require("passport");
 const GoogleStrategy = require("passport-google-oauth20").Strategy;
 
-// Your existing User model file
+// Your existing User model
 const User = require("./models/User");
 
 const dayjs = require("dayjs");
@@ -67,8 +74,14 @@ const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID || "";
 const GOOGLE_CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET || "";
 const GOOGLE_CALLBACK_URL = process.env.GOOGLE_CALLBACK_URL || "";
 
+// Admin allowlist (comma separated)
+const ADMIN_EMAILS = String(process.env.ADMIN_EMAILS || "")
+  .split(",")
+  .map((s) => s.trim().toLowerCase())
+  .filter(Boolean);
+
 // Cookies across subdomains:
-// Start with LAX. If your frontend fetch() to api subdomain doesn't send cookies, switch to:
+// If cookies do not persist across api + site subdomains, switch to:
 //   COOKIE_SAMESITE="none" AND COOKIE_DOMAIN=".tobermorygroceryrun.ca"
 const COOKIE_SAMESITE = "lax";
 const COOKIE_DOMAIN = undefined;
@@ -133,7 +146,7 @@ app.use(
 
     cookie: {
       httpOnly: true,
-      secure: true, // Render HTTPS at the edge
+      secure: true, // Render HTTPS edge
       sameSite: COOKIE_SAMESITE,
       ...(COOKIE_DOMAIN ? { domain: COOKIE_DOMAIN } : {}),
       maxAge: 1000 * 60 * 60 * 24 * 14, // 14 days
@@ -143,7 +156,6 @@ app.use(
 
 // =========================
 // Passport (Google OAuth)
-// IMPORTANT: must be after session middleware
 // =========================
 passport.serializeUser((user, done) => done(null, user._id.toString()));
 
@@ -183,7 +195,13 @@ if (GOOGLE_CLIENT_ID && GOOGLE_CLIENT_SECRET && GOOGLE_CALLBACK_URL) {
             { email: normalized },
             {
               $set: update,
-              $setOnInsert: { membershipLevel: "none", membershipStatus: "inactive" },
+              $setOnInsert: {
+                membershipLevel: "none",
+                membershipStatus: "inactive",
+                renewalDate: null,
+                discounts: [],
+                perks: [],
+              },
             },
             { upsert: true, new: true }
           );
@@ -244,7 +262,7 @@ function calcPrinting(pages) {
   );
 }
 
-// Membership estimator rules (approx only; Square bills subscriptions)
+// (Optional estimator logic; Square bills memberships, not this server.)
 function membershipDiscounts(tier, applyPerkYes) {
   if (!tier || !applyPerkYes)
     return { serviceOff: 0, zoneOff: 0, freeAddonUpTo: 0, waitWaived: false };
@@ -260,7 +278,7 @@ function membershipDiscounts(tier, applyPerkYes) {
 }
 
 // =========================
-// Mongo models for runs/orders counters
+// Mongo models (runs/orders counters + orders)
 // =========================
 const CounterSchema = new mongoose.Schema(
   { key: { type: String, unique: true }, seq: { type: Number, default: 0 } },
@@ -277,6 +295,8 @@ const RunSchema = new mongoose.Schema(
 
     maxSlots: { type: Number, default: 12 },
 
+    // Local: 6 orders OR $200 fees
+    // Owen:  6 orders AND $300 fees
     minOrders: { type: Number, default: 6 },
     minFees: { type: Number, default: 0 },
     minLogic: { type: String, enum: ["OR", "AND"], default: "OR" },
@@ -347,13 +367,24 @@ const Order = mongoose.model("Order", OrderSchema);
 // =========================
 // Helpers
 // =========================
+function escapeHtml(s) {
+  return String(s || "")
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#039;");
+}
+
 function nowTz() {
   return dayjs().tz(TZ);
 }
+
 function fmtLocal(d) {
   if (!d) return "";
   return dayjs(d).tz(TZ).format("ddd MMM D, h:mma");
 }
+
 function nextDow(targetDow, from) {
   let d = dayjs(from).tz(TZ);
   const current = d.day();
@@ -364,15 +395,19 @@ function nextDow(targetDow, from) {
 
 function buildRunTimes(type) {
   const base = nowTz();
+
+  // Local delivery Saturday; cutoff Thursday 6pm; opens Monday 12am
   if (type === "local") {
     const delivery = nextDow(6, base); // Saturday
-    const cutoff = delivery.subtract(2, "day").hour(18).minute(0).second(0).millisecond(0); // Thu 6pm
-    const opens = delivery.subtract(5, "day").hour(0).minute(0).second(0).millisecond(0); // Mon 12am
+    const cutoff = delivery.subtract(2, "day").hour(18).minute(0).second(0).millisecond(0);
+    const opens = delivery.subtract(5, "day").hour(0).minute(0).second(0).millisecond(0);
     return { delivery, cutoff, opens };
   }
+
+  // Owen delivery Sunday; cutoff Friday 6pm; opens Monday 12am
   const delivery = nextDow(0, base); // Sunday
-  const cutoff = delivery.subtract(2, "day").hour(18).minute(0).second(0).millisecond(0); // Fri 6pm
-  const opens = delivery.subtract(6, "day").hour(0).minute(0).second(0).millisecond(0); // Mon 12am
+  const cutoff = delivery.subtract(2, "day").hour(18).minute(0).second(0).millisecond(0);
+  const opens = delivery.subtract(6, "day").hour(0).minute(0).second(0).millisecond(0);
   return { delivery, cutoff, opens };
 }
 
@@ -478,9 +513,11 @@ function computeFeesFromBody(body) {
   if (body.addon_liquor === "yes") addOnsFees += PRICING.addOns.liquor;
   if (body.addon_printing === "yes") addOnsFees += calcPrinting(pages);
 
-  let waitFee = (body.addon_wait === "yes")
-    ? Math.max(0, Number(body.waitBlocks || 0)) * PRICING.addOns.waitPerBlock
-    : 0;
+  let waitFee =
+    body.addon_wait === "yes"
+      ? Math.max(0, Number(body.waitBlocks || 0)) * PRICING.addOns.waitPerBlock
+      : 0;
+
   if (disc.waitWaived) waitFee = 0;
 
   const serviceOff = Math.min(serviceFee, disc.serviceOff || 0);
@@ -495,9 +532,29 @@ function computeFeesFromBody(body) {
     surcharges += PRICING.groceryUnderMin.surcharge;
   }
 
-  const totalFees = Math.max(0, serviceFee + zoneFee + runFee + addOnsFees + waitFee + surcharges - discount);
+  const totalFees = Math.max(
+    0,
+    serviceFee + zoneFee + runFee + addOnsFees + waitFee + surcharges - discount
+  );
 
   return { serviceFee, zoneFee, runFee, addOnsFees: addOnsFees + waitFee, surcharges, discount, totalFees };
+}
+
+// =========================
+// Auth guards + pages
+// =========================
+function requireLogin(req, res, next) {
+  if (!req.user) return res.status(401).send("Sign-in required.");
+  next();
+}
+
+function requireAdmin(req, res, next) {
+  const email = String(req.user?.email || "").toLowerCase();
+  if (!email) return res.status(403).send("Admin access required.");
+  if (ADMIN_EMAILS.length && !ADMIN_EMAILS.includes(email)) {
+    return res.status(403).send("Admin access required.");
+  }
+  next();
 }
 
 // =========================
@@ -540,7 +597,42 @@ app.get("/api/me", (req, res) => {
     name: u?.name || "",
     membershipLevel: u?.membershipLevel || "none",
     membershipStatus: u?.membershipStatus || "inactive",
+    renewalDate: u?.renewalDate || null,
   });
+});
+
+app.get("/member", requireLogin, (req, res) => {
+  const u = req.user;
+  res.setHeader("Content-Type", "text/html; charset=utf-8");
+  res.send(`<!doctype html>
+<html><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>TGR Member Portal</title>
+</head>
+<body style="font-family:system-ui,Segoe UI,Roboto,Arial,sans-serif;padding:18px;max-width:900px;margin:0 auto;">
+  <h1>Member Portal</h1>
+  <p><strong>Signed in as:</strong> ${escapeHtml(u.email || "")}</p>
+  <p><strong>Name:</strong> ${escapeHtml(u.name || "")}</p>
+  <p><strong>Membership:</strong> ${escapeHtml(u.membershipLevel || "none")} (${escapeHtml(u.membershipStatus || "inactive")})</p>
+  <p><strong>Renewal date:</strong> ${escapeHtml(u.renewalDate ? String(u.renewalDate) : "—")}</p>
+  <p>This page is live. Next step is syncing subscription status from Square automatically (webhooks).</p>
+  <p><a href="https://tobermorygroceryrun.ca/">Back to site</a> • <a href="/logout?returnTo=https%3A%2F%2Ftobermorygroceryrun.ca%2F">Log out</a></p>
+</body></html>`);
+});
+
+app.get("/admin", requireLogin, requireAdmin, (req, res) => {
+  res.setHeader("Content-Type", "text/html; charset=utf-8");
+  res.send(`<!doctype html>
+<html><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>TGR Admin</title>
+</head>
+<body style="font-family:system-ui,Segoe UI,Roboto,Arial,sans-serif;padding:18px;max-width:900px;margin:0 auto;">
+  <h1>Admin</h1>
+  <p>Welcome, ${escapeHtml(req.user?.email || "")}</p>
+  <p>Next: admin order list, status updates, and exports.</p>
+  <p><a href="https://tobermorygroceryrun.ca/">Back to site</a> • <a href="/logout?returnTo=https%3A%2F%2Ftobermorygroceryrun.ca%2F">Log out</a></p>
+</body></html>`);
 });
 
 // =========================
@@ -651,7 +743,6 @@ app.post("/api/orders", upload.single("groceryFile"), async (req, res) => {
       return res.status(400).json({ ok: false, error: "All required consents must be accepted." });
     }
 
-    // Gate run window + slots
     const runs = await ensureUpcomingRuns();
     const runType = String(b.runType || "");
     const run = runs[runType];
@@ -721,7 +812,6 @@ app.post("/api/orders", upload.single("groceryFile"), async (req, res) => {
       status: { state: "submitted", note: "", updatedAt: new Date(), updatedBy: "customer" },
     };
 
-    // Atomic slot gate + increment run counters
     const runUpdate = await Run.findOneAndUpdate(
       { runKey: run.runKey, bookedOrdersCount: { $lt: maxSlots } },
       { $inc: { bookedOrdersCount: 1, bookedFeesTotal: pricing.totalFees }, $set: { lastRecalcAt: new Date() } },
@@ -788,3 +878,4 @@ main().catch((err) => {
   console.error(err);
   process.exit(1);
 });
+```0
