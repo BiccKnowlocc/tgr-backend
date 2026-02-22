@@ -1,25 +1,26 @@
 /**
- * server.js — Tobermory Grocery Run backend (Express + MongoDB)
+ * server.js — Tobermory Grocery Run backend (Express + MongoDB + Google OAuth + Square webhooks)
  *
- * INCLUDED:
- * - Google OAuth (Passport): /auth/google + callback
- * - Mongo-backed sessions (connect-mongo)
- * - /api/me
+ * IMPRESSIVE FUNCTIONALITY INCLUDED:
+ * - Google sign-in: /auth/google + callback + /logout
+ * - Robust sessions w/ MongoStore (no MemoryStore warnings)
+ * - /api/me (frontend auth state)
+ * - Run engine: /api/runs/active (cutoffs, slots, minimum-to-run)
+ * - Orders:
+ *    - POST /api/orders (multipart w/ optional file upload)
+ *    - GET  /api/orders/:orderId (public status by Order ID)
+ * - Server-truth fee estimator: POST /api/estimator
  * - Square links:
- *    - Membership subscriptions: POST /api/memberships/checkout { tier }
- *    - One-time payments:       POST /api/payments/checkout    { kind }
- * - Convenience redirects: /pay/groceries, /pay/fees
- * - Runs: GET /api/runs/active
- * - Estimator: POST /api/estimator  (server-truth fee breakdown)
- * - Orders: POST /api/orders (multipart, optional file) + GET /api/orders/:orderId
+ *    - Membership checkout link resolver: POST /api/memberships/checkout
+ *    - Payment link resolver: POST /api/payments/checkout
+ *    - Convenience redirects: /pay/groceries, /pay/fees
  * - Member portal: /member (recent orders + pay buttons)
- * - Admin portal: /admin (search/filter, status updates, CSV export)
- *   + /admin/orders/:orderId (detail)
- *   + /admin/orders/:orderId/file (download attachment)
+ * - Admin portal: /admin (search/filter, one-click status updates, CSV export, detail view, file download)
+ * - Square webhooks: POST /webhooks/square (signature verified, idempotent, auto-sync membership)
  *
- * REQUIRED Render ENV:
+ * REQUIRED ENV (Render - backend service):
  * - SESSION_SECRET
- * - MONGO_URI  (or MONGODB_URI)
+ * - MONGO_URI (or MONGODB_URI)
  * - GOOGLE_CLIENT_ID
  * - GOOGLE_CLIENT_SECRET
  * - GOOGLE_CALLBACK_URL = https://api.tobermorygroceryrun.ca/auth/google/callback
@@ -32,8 +33,19 @@
  * - SQUARE_PAY_GROCERIES_LINK
  * - SQUARE_PAY_FEES_LINK
  *
+ * Square webhooks (for auto membership tracking):
+ * - SQUARE_WEBHOOK_SIGNATURE_KEY
+ * - SQUARE_WEBHOOK_NOTIFICATION_URL = https://api.tobermorygroceryrun.ca/webhooks/square
+ * - SQUARE_ACCESS_TOKEN (Production token, used to retrieve customer email by customer_id)
+ *
+ * Plan variation mapping (from Catalog API):
+ * - SQUARE_PLAN_STANDARD_VARIATION_ID
+ * - SQUARE_PLAN_ROUTE_VARIATION_ID
+ * - SQUARE_PLAN_ACCESS_VARIATION_ID
+ * - SQUARE_PLAN_ACCESSPRO_VARIATION_ID
+ *
  * OPTIONAL:
- * - TZ (defaults America/Toronto)
+ * - TZ (default America/Toronto)
  * - ADMIN_EMAILS (comma-separated allowlist for /admin)
  */
 
@@ -51,6 +63,8 @@ const MongoStore = MongoStorePkg.default || MongoStorePkg;
 
 const passport = require("passport");
 const GoogleStrategy = require("passport-google-oauth20").Strategy;
+
+const { Client, Environment, WebhooksHelper } = require("square");
 
 const User = require("./models/User");
 
@@ -82,6 +96,9 @@ const ADMIN_EMAILS = String(process.env.ADMIN_EMAILS || "")
   .map((s) => s.trim().toLowerCase())
   .filter(Boolean);
 
+// Cookies across subdomains:
+// If you ever need cross-site cookies on API subdomain, use SameSite=None + Secure.
+// For now Lax is simplest.
 const COOKIE_SAMESITE = "lax";
 const COOKIE_DOMAIN = undefined;
 
@@ -102,11 +119,31 @@ const SQUARE_PAY_LINKS = {
   fees: process.env.SQUARE_PAY_FEES_LINK,
 };
 
-const app = express();
+// Square webhooks + customer lookup
+const SQUARE_WEBHOOK_SIGNATURE_KEY = process.env.SQUARE_WEBHOOK_SIGNATURE_KEY || "";
+const SQUARE_WEBHOOK_NOTIFICATION_URL = process.env.SQUARE_WEBHOOK_NOTIFICATION_URL || "";
+const SQUARE_ACCESS_TOKEN = process.env.SQUARE_ACCESS_TOKEN || "";
+
+// Map plan variation IDs -> internal tiers
+const PLAN_MAP = {
+  [process.env.SQUARE_PLAN_STANDARD_VARIATION_ID || ""]: "standard",
+  [process.env.SQUARE_PLAN_ROUTE_VARIATION_ID || ""]: "route",
+  [process.env.SQUARE_PLAN_ACCESS_VARIATION_ID || ""]: "access",
+  [process.env.SQUARE_PLAN_ACCESSPRO_VARIATION_ID || ""]: "accesspro",
+};
+
+function squareClient() {
+  return new Client({
+    accessToken: SQUARE_ACCESS_TOKEN,
+    environment: Environment.Production,
+  });
+}
 
 // =========================
-// Middleware
+// App + middleware
 // =========================
+const app = express();
+
 app.use(
   cors({
     origin: function (origin, cb) {
@@ -117,7 +154,16 @@ app.use(
   })
 );
 
-app.use(express.json({ limit: "3mb" }));
+// IMPORTANT: rawBody capture for Square signature verification
+app.use(
+  express.json({
+    limit: "3mb",
+    verify: (req, _res, buf) => {
+      req.rawBody = buf.toString("utf8");
+    },
+  })
+);
+
 app.use(express.urlencoded({ extended: true }));
 app.use(cookieParser());
 app.set("trust proxy", 1);
@@ -191,6 +237,7 @@ if (GOOGLE_CLIENT_ID && GOOGLE_CLIENT_SECRET && GOOGLE_CALLBACK_URL) {
                 renewalDate: null,
                 discounts: [],
                 perks: [],
+                profile: { version: 1, defaultId: "", addresses: [] },
               },
             },
             { upsert: true, new: true }
@@ -217,7 +264,7 @@ const upload = multer({
 });
 
 // =========================
-// Pricing (server truth)
+// Pricing (server truth baseline)
 // =========================
 const PRICING = {
   serviceFee: 25,
@@ -230,7 +277,7 @@ const PRICING = {
     parcelBulkyExtra: 8,
     liquor: 12,
     fastFood: 10,
-    waitPerBlock: 10, // per 15 min
+    waitPerBlock: 10,
     rideSeat: 45,
     rideSeatSouthOfFerndale: 30,
     bulkyPerItem: 18,
@@ -254,7 +301,7 @@ function calcPrinting(pages) {
   );
 }
 
-// For estimator only (Square bills memberships)
+// estimator-only
 function membershipDiscounts(tier, applyPerkYes) {
   if (!tier || !applyPerkYes)
     return { serviceOff: 0, zoneOff: 0, freeAddonUpTo: 0, waitWaived: false };
@@ -286,10 +333,8 @@ const RunSchema = new mongoose.Schema(
   {
     runKey: { type: String, unique: true },
     type: { type: String, enum: ["local", "owen"], required: true },
-
     opensAt: { type: Date, required: true },
     cutoffAt: { type: Date, required: true },
-
     maxSlots: { type: Number, default: 12 },
 
     minOrders: { type: Number, default: 6 },
@@ -355,9 +400,16 @@ const OrderSchema = new mongoose.Schema(
   { timestamps: true }
 );
 
+// Webhook idempotency store
+const WebhookEventSchema = new mongoose.Schema(
+  { eventId: { type: String, unique: true, index: true }, type: { type: String, default: "" } },
+  { timestamps: true }
+);
+
 const Counter = mongoose.model("Counter", CounterSchema);
 const Run = mongoose.model("Run", RunSchema);
 const Order = mongoose.model("Order", OrderSchema);
+const WebhookEvent = mongoose.model("WebhookEvent", WebhookEventSchema);
 
 // =========================
 // Helpers
@@ -390,14 +442,12 @@ function nextDow(targetDow, from) {
 
 function buildRunTimes(type) {
   const base = nowTz();
-
   if (type === "local") {
     const delivery = nextDow(6, base); // Saturday
     const cutoff = delivery.subtract(2, "day").hour(18).minute(0).second(0).millisecond(0); // Thu 6pm
     const opens = delivery.subtract(5, "day").hour(0).minute(0).second(0).millisecond(0); // Mon 12am
     return { delivery, cutoff, opens };
   }
-
   const delivery = nextDow(0, base); // Sunday
   const cutoff = delivery.subtract(2, "day").hour(18).minute(0).second(0).millisecond(0); // Fri 6pm
   const opens = delivery.subtract(6, "day").hour(0).minute(0).second(0).millisecond(0); // Mon 12am
@@ -406,19 +456,9 @@ function buildRunTimes(type) {
 
 function runMinimumConfig(type) {
   if (type === "local") {
-    return {
-      minOrders: 6,
-      minFees: 200,
-      minLogic: "OR",
-      minimumText: "Minimum: 6 orders OR $200 booked fees",
-    };
+    return { minOrders: 6, minFees: 200, minLogic: "OR", minimumText: "Minimum: 6 orders OR $200 booked fees" };
   }
-  return {
-    minOrders: 6,
-    minFees: 300,
-    minLogic: "AND",
-    minimumText: "Minimum: 6 orders AND $300 booked fees",
-  };
+  return { minOrders: 6, minFees: 300, minLogic: "AND", minimumText: "Minimum: 6 orders AND $300 booked fees" };
 }
 
 function meetsMinimums(run) {
@@ -452,7 +492,7 @@ async function ensureUpcomingRuns() {
 
     const needsRecalc =
       !run.lastRecalcAt ||
-      dayjs(run.lastRecalcAt).isBefore(nowTz().subtract(5, "minute").toDate());
+      dayjs(run.lastRecalcAt).isBefore(nowTz().subtract(2, "minute").toDate());
 
     if (needsRecalc) {
       const agg = await Order.aggregate([
@@ -495,28 +535,15 @@ function safeJsonArray(str) {
   }
 }
 
-// Server-truth fee breakdown for Tools tab
 function computeFeeBreakdown(input) {
   const zone = String(input.zone || "");
   const runType = String(input.runType || "local");
+
   const extraStores = Array.isArray(input.extraStores)
     ? input.extraStores.map(String).map(s => s.trim()).filter(Boolean)
     : safeJsonArray(input.extraStoresJson);
 
-  const add_fastFood = !!input.add_fastFood;
-  const add_liquor = !!input.add_liquor;
-  const add_printing = !!input.add_printing;
-  const add_parcel = !!input.add_parcel;
-  const parcelBulky = !!input.parcelBulky;
-  const add_bulky = !!input.add_bulky;
-  const bulkyCount = Math.max(0, Number(input.bulkyCount || 0));
-  const add_ride = !!input.add_ride;
-  const rideSeats = Math.max(1, Number(input.rideSeats || 1));
-  const rideSouth = !!input.rideSouthOfFerndale;
-  const add_wait = !!input.add_wait;
-  const waitBlocks = Math.max(0, Number(input.waitBlocks || 0));
   const pages = Math.max(0, Number(input.printPages || 0));
-
   const grocerySubtotal = Math.max(0, Number(input.grocerySubtotal || 0));
 
   const memberTier = String(input.memberTier || "");
@@ -528,9 +555,7 @@ function computeFeeBreakdown(input) {
   const runFee = runType === "owen" ? PRICING.owenRunFeePerOrder : 0;
 
   const lineItems = [];
-
   lineItems.push({ label: "Service fee", amount: serviceFee });
-
   if (zoneFee > 0) lineItems.push({ label: `Zone fee (${zone})`, amount: zoneFee });
   if (runFee > 0) lineItems.push({ label: "Owen Sound run fee", amount: runFee });
 
@@ -542,57 +567,10 @@ function computeFeeBreakdown(input) {
     lineItems.push({ label: `Extra store stops (${extraStores.length})`, amount: amt });
   }
 
-  if (add_fastFood) {
-    addOnsFees += PRICING.addOns.fastFood;
-    lineItems.push({ label: "Fast food pickup", amount: PRICING.addOns.fastFood });
-  }
-
-  if (add_liquor) {
-    addOnsFees += PRICING.addOns.liquor;
-    lineItems.push({ label: "Liquor pickup/delivery", amount: PRICING.addOns.liquor });
-  }
-
-  if (add_printing) {
+  if (String(input.addon_printing || "") === "yes" && pages > 0) {
     const amt = calcPrinting(pages);
     addOnsFees += amt;
     lineItems.push({ label: `Printing (${pages} pages)`, amount: amt });
-  }
-
-  if (add_parcel) {
-    addOnsFees += PRICING.addOns.parcelDrop;
-    lineItems.push({ label: "Parcel drop-off", amount: PRICING.addOns.parcelDrop });
-    if (parcelBulky) {
-      addOnsFees += PRICING.addOns.parcelBulkyExtra;
-      lineItems.push({ label: "Parcel bulky/heavy add-on", amount: PRICING.addOns.parcelBulkyExtra });
-    }
-  }
-
-  if (add_bulky && bulkyCount > 0) {
-    const amt = bulkyCount * PRICING.addOns.bulkyPerItem;
-    addOnsFees += amt;
-    lineItems.push({ label: `Heavy/bulky handling (${bulkyCount})`, amount: amt });
-  }
-
-  if (add_ride) {
-    const per = rideSouth ? PRICING.addOns.rideSeatSouthOfFerndale : PRICING.addOns.rideSeat;
-    const amt = rideSeats * per;
-    addOnsFees += amt;
-    lineItems.push({
-      label: `Ride to town (${rideSeats} seat${rideSeats === 1 ? "" : "s"})`,
-      amount: amt,
-    });
-  }
-
-  let waitFee = 0;
-  if (add_wait && waitBlocks > 0) {
-    waitFee = waitBlocks * PRICING.addOns.waitPerBlock;
-    if (disc.waitWaived) {
-      lineItems.push({ label: `Wait time (${waitBlocks} blocks)`, amount: waitFee });
-      lineItems.push({ label: "Wait time waived (membership)", amount: -waitFee });
-      waitFee = 0;
-    } else {
-      lineItems.push({ label: `Wait time (${waitBlocks} blocks)`, amount: waitFee });
-    }
   }
 
   let surcharges = 0;
@@ -604,33 +582,20 @@ function computeFeeBreakdown(input) {
     });
   }
 
-  // Membership discount logic: best-of zone-off vs free-addon-up-to + service-off
+  // Membership discount logic: serviceOff + best-of (zoneOff OR free-addon-up-to against add-ons+run)
   const serviceOff = Math.min(serviceFee, disc.serviceOff || 0);
   const optionA = Math.min(zoneFee, disc.zoneOff || 0);
-  const optionB = Math.min(addOnsFees + waitFee + runFee, disc.freeAddonUpTo || 0);
+  const optionB = Math.min(addOnsFees + runFee, disc.freeAddonUpTo || 0);
   const bestOr = Math.max(optionA, optionB);
   const discount = serviceOff + bestOr;
 
-  if (discount > 0) {
-    lineItems.push({ label: "Membership discount/perk (estimated)", amount: -discount });
-  }
+  if (discount > 0) lineItems.push({ label: "Membership discount/perk (estimated)", amount: -discount });
 
-  const totalFees = Math.max(
-    0,
-    serviceFee + zoneFee + runFee + addOnsFees + waitFee + surcharges - discount
-  );
+  const totalFees = Math.max(0, serviceFee + zoneFee + runFee + addOnsFees + surcharges - discount);
 
   return {
     lineItems,
-    totals: {
-      serviceFee,
-      zoneFee,
-      runFee,
-      addOnsFees: addOnsFees + waitFee,
-      surcharges,
-      discount,
-      totalFees,
-    },
+    totals: { serviceFee, zoneFee, runFee, addOnsFees, surcharges, discount, totalFees },
   };
 }
 
@@ -645,9 +610,7 @@ function requireLogin(req, res, next) {
 function requireAdmin(req, res, next) {
   const email = String(req.user?.email || "").toLowerCase();
   if (!email) return res.status(403).send("Admin access required.");
-  if (ADMIN_EMAILS.length && !ADMIN_EMAILS.includes(email)) {
-    return res.status(403).send("Admin access required.");
-  }
+  if (ADMIN_EMAILS.length && !ADMIN_EMAILS.includes(email)) return res.status(403).send("Admin access required.");
   next();
 }
 
@@ -656,7 +619,7 @@ function requireAdmin(req, res, next) {
 // =========================
 app.get("/auth/google", (req, res, next) => {
   if (!GOOGLE_CLIENT_ID || !GOOGLE_CLIENT_SECRET || !GOOGLE_CALLBACK_URL) {
-    return res.status(500).send("Google auth is not configured on the server.");
+    return res.status(500).send("Google auth is not configured on this server.");
   }
   const returnTo = String(req.query.returnTo || "https://tobermorygroceryrun.ca/").trim();
   req.session.returnTo = returnTo;
@@ -665,9 +628,7 @@ app.get("/auth/google", (req, res, next) => {
 
 app.get(
   "/auth/google/callback",
-  passport.authenticate("google", {
-    failureRedirect: "https://tobermorygroceryrun.ca/?login=failed",
-  }),
+  passport.authenticate("google", { failureRedirect: "https://tobermorygroceryrun.ca/?login=failed" }),
   (req, res) => {
     const rt = req.session.returnTo || "https://tobermorygroceryrun.ca/";
     delete req.session.returnTo;
@@ -696,12 +657,10 @@ app.get("/api/me", (req, res) => {
 // =========================
 // Health
 // =========================
-app.get("/health", (req, res) => {
-  res.json({ ok: true, uptime: process.uptime() });
-});
+app.get("/health", (req, res) => res.json({ ok: true, uptime: process.uptime() }));
 
 // =========================
-// Square endpoints + redirects
+// Square link resolvers + convenience redirects
 // =========================
 app.post("/api/memberships/checkout", (req, res) => {
   const tier = String(req.body?.tier || "").trim().toLowerCase();
@@ -709,7 +668,7 @@ app.post("/api/memberships/checkout", (req, res) => {
   if (!allowed.has(tier)) return res.status(400).json({ ok: false, error: "Invalid tier" });
 
   const url = SQUARE_LINKS[tier];
-  if (!url) return res.status(500).json({ ok: false, error: `Missing Square link SQUARE_LINK_${tier.toUpperCase()}` });
+  if (!url) return res.status(500).json({ ok: false, error: `Missing Square link: SQUARE_LINK_${tier.toUpperCase()}` });
 
   res.json({ ok: true, tier, checkoutUrl: url });
 });
@@ -724,18 +683,17 @@ app.post("/api/payments/checkout", (req, res) => {
     const envKey = kind === "groceries" ? "SQUARE_PAY_GROCERIES_LINK" : "SQUARE_PAY_FEES_LINK";
     return res.status(500).json({ ok: false, error: `Missing Render env var ${envKey}` });
   }
-
   res.json({ ok: true, kind, checkoutUrl: url });
 });
 
 app.get("/pay/groceries", (req, res) => {
-  const url = SQUARE_PAY_LINKS?.groceries;
+  const url = SQUARE_PAY_LINKS.groceries;
   if (!url) return res.status(500).send("Payment link not configured (SQUARE_PAY_GROCERIES_LINK).");
   res.redirect(url);
 });
 
 app.get("/pay/fees", (req, res) => {
-  const url = SQUARE_PAY_LINKS?.fees;
+  const url = SQUARE_PAY_LINKS.fees;
   if (!url) return res.status(500).send("Payment link not configured (SQUARE_PAY_FEES_LINK).");
   res.redirect(url);
 });
@@ -782,11 +740,11 @@ app.get("/api/runs/active", async (req, res) => {
 // =========================
 // Fee estimator (server truth)
 // =========================
-app.post("/api/estimator", async (req, res) => {
+app.post("/api/estimator", (req, res) => {
   try {
     const b = req.body || {};
     const breakdown = computeFeeBreakdown(b);
-    res.json({ ok: true, breakdown, pricingModel: PRICING });
+    res.json({ ok: true, breakdown });
   } catch (e) {
     res.status(500).json({ ok: false, error: String(e) });
   }
@@ -803,7 +761,6 @@ app.post("/api/orders", upload.single("groceryFile"), async (req, res) => {
       "fullName","email","phone","town","streetAddress","zone","runType",
       "primaryStore","groceryList","dropoffPref","subsPref","contactPref",
     ];
-
     for (const k of required) {
       const v = String(b[k] || "").trim();
       if (!v) return res.status(400).json({ ok: false, error: "Missing required field: " + k });
@@ -833,6 +790,7 @@ app.post("/api/orders", upload.single("groceryFile"), async (req, res) => {
     if (!windowOpen) return res.status(403).json({ ok: false, error: "Ordering is closed for this run." });
 
     const maxSlots = run.maxSlots || 12;
+
     const orderId = await nextOrderId();
 
     let attachment = null;
@@ -847,26 +805,16 @@ app.post("/api/orders", upload.single("groceryFile"), async (req, res) => {
 
     const extraStores = safeJsonArray(b.extraStores);
 
-    // Create pricing snapshot (using estimator fields available from form)
+    // Server-truth pricing snapshot (estimator fields you collect on index page)
     const breakdown = computeFeeBreakdown({
       zone: b.zone,
       runType: b.runType,
       extraStores: extraStores,
-      add_fastFood: false,
-      add_liquor: false,
-      add_printing: false,
-      add_parcel: false,
-      add_bulky: false,
-      add_ride: false,
-      add_wait: false,
-      printPages: 0,
-      bulkyCount: 0,
-      rideSeats: 1,
-      rideSouthOfFerndale: false,
-      waitBlocks: 0,
       grocerySubtotal: Number(b.grocerySubtotal || 0),
       memberTier: b.memberTier || "",
       applyPerk: b.applyPerk || "yes",
+      addon_printing: b.addon_printing || "no",
+      printPages: Number(b.printPages || 0),
     });
 
     const pricingSnapshot = breakdown.totals;
@@ -875,35 +823,43 @@ app.post("/api/orders", upload.single("groceryFile"), async (req, res) => {
       orderId,
       runKey: run.runKey,
       runType,
+
       customer: {
         fullName: String(b.fullName || "").trim(),
         email: String(b.email || "").trim().toLowerCase(),
         phone: String(b.phone || "").trim(),
       },
+
       address: {
         town: String(b.town || "").trim(),
         streetAddress: String(b.streetAddress || "").trim(),
         zone: String(b.zone || ""),
       },
+
       stores: {
         primary: String(b.primaryStore || "").trim(),
         extra: extraStores,
       },
+
       preferences: {
         dropoffPref: String(b.dropoffPref || ""),
         subsPref: String(b.subsPref || ""),
         contactPref: String(b.contactPref || ""),
         contactAuth: true,
       },
+
       list: {
         groceryListText: String(b.groceryList || "").trim(),
         attachment,
       },
+
       consents: { terms: true, accuracy: true, dropoff: true },
       pricingSnapshot,
+
       status: { state: "submitted", note: "", updatedAt: new Date(), updatedBy: "customer" },
     };
 
+    // Slot gate + update run counters atomically
     const runUpdate = await Run.findOneAndUpdate(
       { runKey: run.runKey, bookedOrdersCount: { $lt: maxSlots } },
       { $inc: { bookedOrdersCount: 1, bookedFeesTotal: pricingSnapshot.totalFees }, $set: { lastRecalcAt: new Date() } },
@@ -957,7 +913,7 @@ app.get("/api/orders/:orderId", async (req, res) => {
 });
 
 // =========================
-// Member portal
+// Member portal (clean + useful)
 // =========================
 app.get("/member", requireLogin, async (req, res) => {
   const u = req.user;
@@ -987,9 +943,6 @@ app.get("/member", requireLogin, async (req, res) => {
           <td style="padding:10px 8px;border-top:1px solid #ddd;">${escapeHtml(town)}</td>
           <td style="padding:10px 8px;border-top:1px solid #ddd;font-weight:900;">${escapeHtml(status)}</td>
           <td style="padding:10px 8px;border-top:1px solid #ddd;">$${escapeHtml(fees)}</td>
-          <td style="padding:10px 8px;border-top:1px solid #ddd;">
-            <a href="https://tobermorygroceryrun.ca/?tab=status" style="color:#e3342f;font-weight:900;">Track</a>
-          </td>
         </tr>
       `;
     })
@@ -1007,9 +960,9 @@ app.get("/member", requireLogin, async (req, res) => {
 
   <div style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:14px;">
     <a href="https://tobermorygroceryrun.ca/" style="padding:12px 14px;border:1px solid #ddd;border-radius:12px;text-decoration:none;color:#111;font-weight:900;">Back to site</a>
-    <a href="https://tobermorygroceryrun.ca/?tab=membership" style="padding:12px 14px;border:1px solid #ddd;border-radius:12px;text-decoration:none;color:#111;font-weight:900;">Memberships</a>
-    <a href="https://tobermorygroceryrun.ca/?tab=orders" style="padding:12px 14px;border:1px solid #ddd;border-radius:12px;text-decoration:none;color:#111;font-weight:900;">Place order</a>
-    <a href="/logout?returnTo=https%3A%2F%2Ftobermorygroceryrun.ca%2F" style="padding:12px 14px;border:1px solid #e3342f;background:#e3342f;color:#fff;border-radius:12px;text-decoration:none;font-weight:900;">Log out</a>
+    <a href="/pay/groceries" style="padding:12px 14px;border:1px solid #e3342f;background:#e3342f;color:#fff;border-radius:12px;text-decoration:none;font-weight:900;">Pay Grocery Total</a>
+    <a href="/pay/fees" style="padding:12px 14px;border:1px solid #ddd;border-radius:12px;text-decoration:none;color:#111;font-weight:900;">Pay Service & Delivery Fees</a>
+    <a href="/logout?returnTo=https%3A%2F%2Ftobermorygroceryrun.ca%2F" style="padding:12px 14px;border:1px solid #ddd;border-radius:12px;text-decoration:none;color:#111;font-weight:900;">Log out</a>
   </div>
 
   <div style="border:1px solid #ddd;border-radius:14px;padding:14px;margin-bottom:14px;">
@@ -1018,16 +971,7 @@ app.get("/member", requireLogin, async (req, res) => {
     <div><strong>Membership level:</strong> ${escapeHtml(u?.membershipLevel || "none")}</div>
     <div><strong>Membership status:</strong> ${escapeHtml(u?.membershipStatus || "inactive")}</div>
     <div><strong>Renewal date:</strong> ${escapeHtml(u?.renewalDate ? String(u.renewalDate) : "—")}</div>
-    <div style="margin-top:10px;color:#666;">Billing is handled by Square. Next upgrade: automatic sync via Square webhooks.</div>
-  </div>
-
-  <div style="border:1px solid #ddd;border-radius:14px;padding:14px;margin-bottom:14px;">
-    <h2 style="margin:0 0 8px;">Pay</h2>
-    <div style="color:#666;margin-bottom:10px;">Use these when it’s time to settle totals.</div>
-    <div style="display:flex;gap:10px;flex-wrap:wrap;">
-      <a href="/pay/groceries" style="padding:12px 14px;border:1px solid #e3342f;background:#e3342f;color:#fff;border-radius:12px;text-decoration:none;font-weight:900;">Pay Grocery Total</a>
-      <a href="/pay/fees" style="padding:12px 14px;border:1px solid #ddd;border-radius:12px;text-decoration:none;color:#111;font-weight:900;">Pay Service & Delivery Fees</a>
-    </div>
+    <div style="color:#666;margin-top:8px;">Membership status is auto-synced from Square webhook events.</div>
   </div>
 
   <h2 style="margin:0 0 8px;">Recent orders</h2>
@@ -1040,18 +984,17 @@ app.get("/member", requireLogin, async (req, res) => {
         <th style="text-align:left;padding:10px 8px;border-bottom:2px solid #ddd;">Town</th>
         <th style="text-align:left;padding:10px 8px;border-bottom:2px solid #ddd;">Status</th>
         <th style="text-align:left;padding:10px 8px;border-bottom:2px solid #ddd;">Fees</th>
-        <th style="text-align:left;padding:10px 8px;border-bottom:2px solid #ddd;">Action</th>
       </tr>
     </thead>
     <tbody>
-      ${rows || `<tr><td colspan="7" style="padding:10px 8px;color:#666;">No orders yet.</td></tr>`}
+      ${rows || `<tr><td colspan="6" style="padding:10px 8px;color:#666;">No orders yet.</td></tr>`}
     </tbody>
   </table>
 </body></html>`);
 });
 
 // =========================
-// Admin: search/filter + status updates + CSV + order detail + file download
+// Admin portal: list, filter, status updates, CSV, detail, file download
 // =========================
 function csvEscape(val) {
   const s = String(val ?? "");
@@ -1063,7 +1006,6 @@ function buildAdminOrderQuery(q, status) {
   const query = {};
   const qq = String(q || "").trim();
   const st = String(status || "").trim().toLowerCase();
-
   if (st && st !== "all") query["status.state"] = st;
 
   if (qq) {
@@ -1076,7 +1018,6 @@ function buildAdminOrderQuery(q, status) {
       { "stores.primary": new RegExp(qq, "i") },
     ];
   }
-
   return query;
 }
 
@@ -1087,6 +1028,8 @@ app.get("/admin", requireLogin, requireAdmin, async (req, res) => {
 
   const orders = await Order.find(mongoQuery).sort({ createdAt: -1 }).limit(200).lean();
   const statusSel = (v) => (String(status).toLowerCase() === v ? "selected" : "");
+  const returnToBase = "/admin?" + new URLSearchParams({ q, status }).toString();
+  const csvUrl = "/admin/orders.csv" + (q || status ? `?${new URLSearchParams({ q, status }).toString()}` : "");
 
   const rows = orders
     .map((o) => {
@@ -1101,8 +1044,6 @@ app.get("/admin", requireLogin, requireAdmin, async (req, res) => {
         typeof o.pricingSnapshot?.totalFees === "number"
           ? o.pricingSnapshot.totalFees.toFixed(2)
           : "0.00";
-
-      const returnTo = "/admin?" + new URLSearchParams({ q, status }).toString();
 
       return `
         <tr>
@@ -1123,7 +1064,7 @@ app.get("/admin", requireLogin, requireAdmin, async (req, res) => {
               ${["submitted","paid","delivered","issue"].map(s => `
                 <form method="POST" action="/admin/orders/${encodeURIComponent(o.orderId)}/status" style="margin:0;">
                   <input type="hidden" name="state" value="${s}">
-                  <input type="hidden" name="returnTo" value="${escapeHtml(returnTo)}">
+                  <input type="hidden" name="returnTo" value="${escapeHtml(returnToBase)}">
                   <button style="padding:8px 10px;border:1px solid #ddd;border-radius:10px;cursor:pointer;background:${s===st?"#e3342f":"#fff"};color:${s===st?"#fff":"#111"};font-weight:900;">
                     ${s}
                   </button>
@@ -1135,9 +1076,6 @@ app.get("/admin", requireLogin, requireAdmin, async (req, res) => {
       `;
     })
     .join("");
-
-  const qs = new URLSearchParams({ q, status }).toString();
-  const csvUrl = "/admin/orders.csv" + (qs ? `?${qs}` : "");
 
   res.setHeader("Content-Type", "text/html; charset=utf-8");
   res.send(`<!doctype html>
@@ -1171,7 +1109,7 @@ app.get("/admin", requireLogin, requireAdmin, async (req, res) => {
       <a href="/pay/groceries" style="padding:12px 14px;border:1px solid #ddd;border-radius:12px;text-decoration:none;color:#111;font-weight:900;">Groceries link</a>
       <a href="/logout?returnTo=https%3A%2F%2Ftobermorygroceryrun.ca%2F" style="padding:12px 14px;border:1px solid #ddd;border-radius:12px;text-decoration:none;color:#111;font-weight:900;">Log out</a>
     </form>
-    <div style="color:#666;margin-top:10px;">Showing latest 200 results for current filters. Click an Order ID to open details.</div>
+    <div style="color:#666;margin-top:10px;">Showing latest 200 results. Click an Order ID for print-friendly details + file download.</div>
   </div>
 
   <table style="width:100%;border-collapse:collapse;">
@@ -1335,6 +1273,93 @@ app.get("/admin/orders/:orderId/file", requireLogin, requireAdmin, async (req, r
   if (!fs.existsSync(abs)) return res.status(404).send("File missing on server");
 
   res.download(abs, file.originalName || "attachment");
+});
+
+// =========================
+// Square Webhook: auto-sync membership
+// =========================
+app.post("/webhooks/square", async (req, res) => {
+  try {
+    const signatureHeader = req.get("x-square-hmacsha256-signature") || "";
+    const body = req.rawBody || "";
+
+    if (!SQUARE_WEBHOOK_SIGNATURE_KEY || !SQUARE_WEBHOOK_NOTIFICATION_URL) {
+      return res.status(500).send("Square webhook env not configured.");
+    }
+
+    const valid = await WebhooksHelper.verifySignature({
+      requestBody: body,
+      signatureHeader,
+      signatureKey: SQUARE_WEBHOOK_SIGNATURE_KEY,
+      notificationUrl: SQUARE_WEBHOOK_NOTIFICATION_URL,
+    });
+
+    if (!valid) return res.status(403).send("Invalid signature");
+
+    const evt = req.body || {};
+    const eventId = String(evt.event_id || "");
+    const eventType = String(evt.type || "");
+    const subscription = evt?.data?.object?.subscription;
+
+    // idempotent deliveries
+    if (eventId) {
+      const exists = await WebhookEvent.findOne({ eventId }).lean();
+      if (exists) return res.status(200).send("ok");
+      await WebhookEvent.create({ eventId, type: eventType });
+    }
+
+    // only subscription events
+    if ((eventType !== "subscription.created" && eventType !== "subscription.updated") || !subscription) {
+      return res.status(200).send("ok");
+    }
+
+    const customerId = String(subscription.customer_id || "");
+    const planVariationId = String(subscription.plan_variation_id || "");
+    const sqStatus = String(subscription.status || "").toUpperCase();
+
+    const tier = PLAN_MAP[planVariationId] || "none";
+
+    const internalStatus =
+      sqStatus === "ACTIVE" ? "active" :
+      (sqStatus === "CANCELED" || sqStatus === "CANCELLED") ? "cancelled" :
+      (sqStatus === "PAUSED") ? "inactive" :
+      "inactive";
+
+    const renewalDate = subscription.charged_through_date ? new Date(subscription.charged_through_date) : null;
+
+    // 1) match by previously stored square customer id
+    let user = await User.findOne({ "profile.squareCustomerId": customerId });
+
+    // 2) fallback: lookup Square customer -> match email -> store squareCustomerId
+    if (!user) {
+      if (!SQUARE_ACCESS_TOKEN) return res.status(200).send("ok");
+
+      const client = squareClient();
+      const resp = await client.customersApi.retrieveCustomer(customerId);
+      const cust = resp?.result?.customer;
+
+      const email = String(cust?.emailAddress || "").toLowerCase().trim();
+      if (!email) return res.status(200).send("ok");
+
+      user = await User.findOne({ email });
+      if (!user) return res.status(200).send("ok");
+
+      await User.updateOne(
+        { _id: user._id },
+        { $set: { "profile.squareCustomerId": customerId, "profile.squareCustomerEmail": email } }
+      );
+    }
+
+    const set = { membershipStatus: internalStatus };
+    if (tier !== "none") set.membershipLevel = tier;
+    if (renewalDate) set.renewalDate = renewalDate;
+
+    await User.updateOne({ _id: user._id }, { $set: set });
+
+    return res.status(200).send("ok");
+  } catch (e) {
+    return res.status(500).send("webhook error: " + String(e));
+  }
 });
 
 // =========================
