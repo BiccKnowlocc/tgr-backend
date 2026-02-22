@@ -1,22 +1,22 @@
 /**
- * server.js — Tobermory Grocery Run backend (Express + MongoDB + Google OAuth + Square webhooks)
+ * server.js — TGR backend (Express + MongoDB + Google OAuth + Square webhooks)
  *
- * IMPRESSIVE FUNCTIONALITY INCLUDED:
+ * Includes:
  * - Google sign-in: /auth/google + callback + /logout
- * - Robust sessions w/ MongoStore (no MemoryStore warnings)
- * - /api/me (frontend auth state)
+ * - Mongo-backed sessions (connect-mongo)
+ * - /api/me
  * - Run engine: /api/runs/active (cutoffs, slots, minimum-to-run)
  * - Orders:
  *    - POST /api/orders (multipart w/ optional file upload)
  *    - GET  /api/orders/:orderId (public status by Order ID)
  * - Server-truth fee estimator: POST /api/estimator
- * - Square links:
- *    - Membership checkout link resolver: POST /api/memberships/checkout
- *    - Payment link resolver: POST /api/payments/checkout
+ * - Square link resolvers:
+ *    - Membership checkout resolver: POST /api/memberships/checkout { tier }
+ *    - Payment checkout resolver:    POST /api/payments/checkout { kind }
  *    - Convenience redirects: /pay/groceries, /pay/fees
- * - Member portal: /member (recent orders + pay buttons)
- * - Admin portal: /admin (search/filter, one-click status updates, CSV export, detail view, file download)
- * - Square webhooks: POST /webhooks/square (signature verified, idempotent, auto-sync membership)
+ * - Member portal: /member
+ * - Admin portal: /admin (search/filter, status updates, CSV, detail view, file download)
+ * - Square webhooks: POST /webhooks/square (signature verified + idempotent + auto-sync membership)
  *
  * REQUIRED ENV (Render - backend service):
  * - SESSION_SECRET
@@ -33,12 +33,12 @@
  * - SQUARE_PAY_GROCERIES_LINK
  * - SQUARE_PAY_FEES_LINK
  *
- * Square webhooks (for auto membership tracking):
+ * Square webhooks:
  * - SQUARE_WEBHOOK_SIGNATURE_KEY
  * - SQUARE_WEBHOOK_NOTIFICATION_URL = https://api.tobermorygroceryrun.ca/webhooks/square
- * - SQUARE_ACCESS_TOKEN (Production token, used to retrieve customer email by customer_id)
+ * - SQUARE_ACCESS_TOKEN (Production token)
  *
- * Plan variation mapping (from Catalog API):
+ * Plan variation IDs (Catalog API):
  * - SQUARE_PLAN_STANDARD_VARIATION_ID
  * - SQUARE_PLAN_ROUTE_VARIATION_ID
  * - SQUARE_PLAN_ACCESS_VARIATION_ID
@@ -96,9 +96,6 @@ const ADMIN_EMAILS = String(process.env.ADMIN_EMAILS || "")
   .map((s) => s.trim().toLowerCase())
   .filter(Boolean);
 
-// Cookies across subdomains:
-// If you ever need cross-site cookies on API subdomain, use SameSite=None + Secure.
-// For now Lax is simplest.
 const COOKIE_SAMESITE = "lax";
 const COOKIE_DOMAIN = undefined;
 
@@ -119,7 +116,6 @@ const SQUARE_PAY_LINKS = {
   fees: process.env.SQUARE_PAY_FEES_LINK,
 };
 
-// Square webhooks + customer lookup
 const SQUARE_WEBHOOK_SIGNATURE_KEY = process.env.SQUARE_WEBHOOK_SIGNATURE_KEY || "";
 const SQUARE_WEBHOOK_NOTIFICATION_URL = process.env.SQUARE_WEBHOOK_NOTIFICATION_URL || "";
 const SQUARE_ACCESS_TOKEN = process.env.SQUARE_ACCESS_TOKEN || "";
@@ -154,7 +150,7 @@ app.use(
   })
 );
 
-// IMPORTANT: rawBody capture for Square signature verification
+// IMPORTANT: rawBody capture for Square webhook signature validation
 app.use(
   express.json({
     limit: "3mb",
@@ -270,7 +266,6 @@ const PRICING = {
   serviceFee: 25,
   zone: { A: 20, B: 15, C: 10, D: 25 },
   owenRunFeePerOrder: 20,
-
   addOns: {
     extraStore: 8,
     parcelDrop: 10,
@@ -285,7 +280,6 @@ const PRICING = {
     printingFirst10: 1.25,
     printingAfter10: 0.75,
   },
-
   groceryUnderMin: { threshold: 35, surcharge: 19 },
 };
 
@@ -301,7 +295,7 @@ function calcPrinting(pages) {
   );
 }
 
-// estimator-only
+// estimator-only discounts
 function membershipDiscounts(tier, applyPerkYes) {
   if (!tier || !applyPerkYes)
     return { serviceOff: 0, zoneOff: 0, freeAddonUpTo: 0, waitWaived: false };
@@ -540,7 +534,7 @@ function computeFeeBreakdown(input) {
   const runType = String(input.runType || "local");
 
   const extraStores = Array.isArray(input.extraStores)
-    ? input.extraStores.map(String).map(s => s.trim()).filter(Boolean)
+    ? input.extraStores.map(String).map((s) => s.trim()).filter(Boolean)
     : safeJsonArray(input.extraStoresJson);
 
   const pages = Math.max(0, Number(input.printPages || 0));
@@ -582,7 +576,6 @@ function computeFeeBreakdown(input) {
     });
   }
 
-  // Membership discount logic: serviceOff + best-of (zoneOff OR free-addon-up-to against add-ons+run)
   const serviceOff = Math.min(serviceFee, disc.serviceOff || 0);
   const optionA = Math.min(zoneFee, disc.zoneOff || 0);
   const optionB = Math.min(addOnsFees + runFee, disc.freeAddonUpTo || 0);
@@ -738,7 +731,7 @@ app.get("/api/runs/active", async (req, res) => {
 });
 
 // =========================
-// Fee estimator (server truth)
+// Fee estimator
 // =========================
 app.post("/api/estimator", (req, res) => {
   try {
@@ -790,7 +783,6 @@ app.post("/api/orders", upload.single("groceryFile"), async (req, res) => {
     if (!windowOpen) return res.status(403).json({ ok: false, error: "Ordering is closed for this run." });
 
     const maxSlots = run.maxSlots || 12;
-
     const orderId = await nextOrderId();
 
     let attachment = null;
@@ -805,7 +797,6 @@ app.post("/api/orders", upload.single("groceryFile"), async (req, res) => {
 
     const extraStores = safeJsonArray(b.extraStores);
 
-    // Server-truth pricing snapshot (estimator fields you collect on index page)
     const breakdown = computeFeeBreakdown({
       zone: b.zone,
       runType: b.runType,
@@ -855,11 +846,9 @@ app.post("/api/orders", upload.single("groceryFile"), async (req, res) => {
 
       consents: { terms: true, accuracy: true, dropoff: true },
       pricingSnapshot,
-
       status: { state: "submitted", note: "", updatedAt: new Date(), updatedBy: "customer" },
     };
 
-    // Slot gate + update run counters atomically
     const runUpdate = await Run.findOneAndUpdate(
       { runKey: run.runKey, bookedOrdersCount: { $lt: maxSlots } },
       { $inc: { bookedOrdersCount: 1, bookedFeesTotal: pricingSnapshot.totalFees }, $set: { lastRecalcAt: new Date() } },
@@ -913,7 +902,7 @@ app.get("/api/orders/:orderId", async (req, res) => {
 });
 
 // =========================
-// Member portal (clean + useful)
+// Member portal
 // =========================
 app.get("/member", requireLogin, async (req, res) => {
   const u = req.user;
@@ -950,51 +939,45 @@ app.get("/member", requireLogin, async (req, res) => {
 
   res.setHeader("Content-Type", "text/html; charset=utf-8");
   res.send(`<!doctype html>
-<html><head>
-<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>TGR Member Portal</title>
-</head>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>TGR Member Portal</title></head>
 <body style="font-family:system-ui,Segoe UI,Roboto,Arial,sans-serif;padding:18px;max-width:1100px;margin:0 auto;">
-  <h1 style="margin:0 0 6px;">Member Portal</h1>
-  <div style="color:#444;margin-bottom:14px;">Signed in as <strong>${escapeHtml(email)}</strong></div>
+<h1 style="margin:0 0 6px;">Member Portal</h1>
+<div style="color:#444;margin-bottom:14px;">Signed in as <strong>${escapeHtml(email)}</strong></div>
 
-  <div style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:14px;">
-    <a href="https://tobermorygroceryrun.ca/" style="padding:12px 14px;border:1px solid #ddd;border-radius:12px;text-decoration:none;color:#111;font-weight:900;">Back to site</a>
-    <a href="/pay/groceries" style="padding:12px 14px;border:1px solid #e3342f;background:#e3342f;color:#fff;border-radius:12px;text-decoration:none;font-weight:900;">Pay Grocery Total</a>
-    <a href="/pay/fees" style="padding:12px 14px;border:1px solid #ddd;border-radius:12px;text-decoration:none;color:#111;font-weight:900;">Pay Service & Delivery Fees</a>
-    <a href="/logout?returnTo=https%3A%2F%2Ftobermorygroceryrun.ca%2F" style="padding:12px 14px;border:1px solid #ddd;border-radius:12px;text-decoration:none;color:#111;font-weight:900;">Log out</a>
-  </div>
+<div style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:14px;">
+<a href="https://tobermorygroceryrun.ca/" style="padding:12px 14px;border:1px solid #ddd;border-radius:12px;text-decoration:none;color:#111;font-weight:900;">Back to site</a>
+<a href="/pay/groceries" style="padding:12px 14px;border:1px solid #e3342f;background:#e3342f;color:#fff;border-radius:12px;text-decoration:none;font-weight:900;">Pay Grocery Total</a>
+<a href="/pay/fees" style="padding:12px 14px;border:1px solid #ddd;border-radius:12px;text-decoration:none;color:#111;font-weight:900;">Pay Service & Delivery Fees</a>
+<a href="/logout?returnTo=https%3A%2F%2Ftobermorygroceryrun.ca%2F" style="padding:12px 14px;border:1px solid #ddd;border-radius:12px;text-decoration:none;color:#111;font-weight:900;">Log out</a>
+</div>
 
-  <div style="border:1px solid #ddd;border-radius:14px;padding:14px;margin-bottom:14px;">
-    <h2 style="margin:0 0 8px;">Account</h2>
-    <div><strong>Name:</strong> ${escapeHtml(u?.name || "—")}</div>
-    <div><strong>Membership level:</strong> ${escapeHtml(u?.membershipLevel || "none")}</div>
-    <div><strong>Membership status:</strong> ${escapeHtml(u?.membershipStatus || "inactive")}</div>
-    <div><strong>Renewal date:</strong> ${escapeHtml(u?.renewalDate ? String(u.renewalDate) : "—")}</div>
-    <div style="color:#666;margin-top:8px;">Membership status is auto-synced from Square webhook events.</div>
-  </div>
+<div style="border:1px solid #ddd;border-radius:14px;padding:14px;margin-bottom:14px;">
+<h2 style="margin:0 0 8px;">Account</h2>
+<div><strong>Name:</strong> ${escapeHtml(u?.name || "—")}</div>
+<div><strong>Membership level:</strong> ${escapeHtml(u?.membershipLevel || "none")}</div>
+<div><strong>Membership status:</strong> ${escapeHtml(u?.membershipStatus || "inactive")}</div>
+<div><strong>Renewal date:</strong> ${escapeHtml(u?.renewalDate ? String(u.renewalDate) : "—")}</div>
+<div style="color:#666;margin-top:8px;">Membership status is auto-synced from Square webhook events.</div>
+</div>
 
-  <h2 style="margin:0 0 8px;">Recent orders</h2>
-  <table style="width:100%;border-collapse:collapse;">
-    <thead>
-      <tr>
-        <th style="text-align:left;padding:10px 8px;border-bottom:2px solid #ddd;">Order ID</th>
-        <th style="text-align:left;padding:10px 8px;border-bottom:2px solid #ddd;">Created</th>
-        <th style="text-align:left;padding:10px 8px;border-bottom:2px solid #ddd;">Store</th>
-        <th style="text-align:left;padding:10px 8px;border-bottom:2px solid #ddd;">Town</th>
-        <th style="text-align:left;padding:10px 8px;border-bottom:2px solid #ddd;">Status</th>
-        <th style="text-align:left;padding:10px 8px;border-bottom:2px solid #ddd;">Fees</th>
-      </tr>
-    </thead>
-    <tbody>
-      ${rows || `<tr><td colspan="6" style="padding:10px 8px;color:#666;">No orders yet.</td></tr>`}
-    </tbody>
-  </table>
+<h2 style="margin:0 0 8px;">Recent orders</h2>
+<table style="width:100%;border-collapse:collapse;">
+<thead><tr>
+<th style="text-align:left;padding:10px 8px;border-bottom:2px solid #ddd;">Order ID</th>
+<th style="text-align:left;padding:10px 8px;border-bottom:2px solid #ddd;">Created</th>
+<th style="text-align:left;padding:10px 8px;border-bottom:2px solid #ddd;">Store</th>
+<th style="text-align:left;padding:10px 8px;border-bottom:2px solid #ddd;">Town</th>
+<th style="text-align:left;padding:10px 8px;border-bottom:2px solid #ddd;">Status</th>
+<th style="text-align:left;padding:10px 8px;border-bottom:2px solid #ddd;">Fees</th>
+</tr></thead>
+<tbody>${rows || `<tr><td colspan="6" style="padding:10px 8px;color:#666;">No orders yet.</td></tr>`}</tbody>
+</table>
 </body></html>`);
 });
 
 // =========================
-// Admin portal: list, filter, status updates, CSV, detail, file download
+// Admin portal
 // =========================
 function csvEscape(val) {
   const s = String(val ?? "");
@@ -1079,55 +1062,49 @@ app.get("/admin", requireLogin, requireAdmin, async (req, res) => {
 
   res.setHeader("Content-Type", "text/html; charset=utf-8");
   res.send(`<!doctype html>
-<html><head>
-<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>TGR Admin</title>
-</head>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>TGR Admin</title></head>
 <body style="font-family:system-ui,Segoe UI,Roboto,Arial,sans-serif;padding:18px;max-width:1280px;margin:0 auto;">
-  <h1 style="margin:0 0 6px;">Admin</h1>
-  <div style="color:#444;margin-bottom:14px;">Signed in as <strong>${escapeHtml(req.user?.email || "")}</strong></div>
+<h1 style="margin:0 0 6px;">Admin</h1>
+<div style="color:#444;margin-bottom:14px;">Signed in as <strong>${escapeHtml(req.user?.email || "")}</strong></div>
 
-  <div style="border:1px solid #ddd;border-radius:14px;padding:14px;margin-bottom:14px;">
-    <form method="GET" action="/admin" style="display:flex;gap:10px;flex-wrap:wrap;align-items:end;margin:0;">
-      <div style="flex:1;min-width:240px;">
-        <label style="display:block;font-weight:900;margin:0 0 6px;">Search</label>
-        <input name="q" value="${escapeHtml(q)}" placeholder="Order ID, name, phone, town, store..." style="width:100%;padding:12px;border:1px solid #ddd;border-radius:12px;">
-      </div>
-      <div style="min-width:200px;">
-        <label style="display:block;font-weight:900;margin:0 0 6px;">Status</label>
-        <select name="status" style="width:100%;padding:12px;border:1px solid #ddd;border-radius:12px;">
-          <option value="all" ${statusSel("all")}>All</option>
-          <option value="submitted" ${statusSel("submitted")}>submitted</option>
-          <option value="paid" ${statusSel("paid")}>paid</option>
-          <option value="delivered" ${statusSel("delivered")}>delivered</option>
-          <option value="issue" ${statusSel("issue")}>issue</option>
-        </select>
-      </div>
-      <button style="padding:12px 14px;border:1px solid #e3342f;background:#e3342f;color:#fff;border-radius:12px;font-weight:900;cursor:pointer;">Apply</button>
-      <a href="${csvUrl}" style="padding:12px 14px;border:1px solid #ddd;border-radius:12px;text-decoration:none;color:#111;font-weight:900;">Download CSV</a>
-      <a href="/pay/fees" style="padding:12px 14px;border:1px solid #ddd;border-radius:12px;text-decoration:none;color:#111;font-weight:900;">Fees link</a>
-      <a href="/pay/groceries" style="padding:12px 14px;border:1px solid #ddd;border-radius:12px;text-decoration:none;color:#111;font-weight:900;">Groceries link</a>
-      <a href="/logout?returnTo=https%3A%2F%2Ftobermorygroceryrun.ca%2F" style="padding:12px 14px;border:1px solid #ddd;border-radius:12px;text-decoration:none;color:#111;font-weight:900;">Log out</a>
-    </form>
-    <div style="color:#666;margin-top:10px;">Showing latest 200 results. Click an Order ID for print-friendly details + file download.</div>
-  </div>
+<div style="border:1px solid #ddd;border-radius:14px;padding:14px;margin-bottom:14px;">
+<form method="GET" action="/admin" style="display:flex;gap:10px;flex-wrap:wrap;align-items:end;margin:0;">
+<div style="flex:1;min-width:240px;">
+<label style="display:block;font-weight:900;margin:0 0 6px;">Search</label>
+<input name="q" value="${escapeHtml(q)}" placeholder="Order ID, name, phone, town, store..." style="width:100%;padding:12px;border:1px solid #ddd;border-radius:12px;">
+</div>
+<div style="min-width:200px;">
+<label style="display:block;font-weight:900;margin:0 0 6px;">Status</label>
+<select name="status" style="width:100%;padding:12px;border:1px solid #ddd;border-radius:12px;">
+<option value="all" ${statusSel("all")}>All</option>
+<option value="submitted" ${statusSel("submitted")}>submitted</option>
+<option value="paid" ${statusSel("paid")}>paid</option>
+<option value="delivered" ${statusSel("delivered")}>delivered</option>
+<option value="issue" ${statusSel("issue")}>issue</option>
+</select>
+</div>
+<button style="padding:12px 14px;border:1px solid #e3342f;background:#e3342f;color:#fff;border-radius:12px;font-weight:900;cursor:pointer;">Apply</button>
+<a href="${csvUrl}" style="padding:12px 14px;border:1px solid #ddd;border-radius:12px;text-decoration:none;color:#111;font-weight:900;">Download CSV</a>
+<a href="/pay/fees" style="padding:12px 14px;border:1px solid #ddd;border-radius:12px;text-decoration:none;color:#111;font-weight:900;">Fees link</a>
+<a href="/pay/groceries" style="padding:12px 14px;border:1px solid #ddd;border-radius:12px;text-decoration:none;color:#111;font-weight:900;">Groceries link</a>
+<a href="/logout?returnTo=https%3A%2F%2Ftobermorygroceryrun.ca%2F" style="padding:12px 14px;border:1px solid #ddd;border-radius:12px;text-decoration:none;color:#111;font-weight:900;">Log out</a>
+</form>
+<div style="color:#666;margin-top:10px;">Showing latest 200 results. Click Order ID for print + file download.</div>
+</div>
 
-  <table style="width:100%;border-collapse:collapse;">
-    <thead>
-      <tr>
-        <th style="text-align:left;padding:10px 8px;border-bottom:2px solid #ddd;">Order ID</th>
-        <th style="text-align:left;padding:10px 8px;border-bottom:2px solid #ddd;">Created</th>
-        <th style="text-align:left;padding:10px 8px;border-bottom:2px solid #ddd;">Run</th>
-        <th style="text-align:left;padding:10px 8px;border-bottom:2px solid #ddd;">Customer</th>
-        <th style="text-align:left;padding:10px 8px;border-bottom:2px solid #ddd;">Town</th>
-        <th style="text-align:left;padding:10px 8px;border-bottom:2px solid #ddd;">Fees</th>
-        <th style="text-align:left;padding:10px 8px;border-bottom:2px solid #ddd;">Status</th>
-      </tr>
-    </thead>
-    <tbody>
-      ${rows || `<tr><td colspan="7" style="padding:10px 8px;color:#666;">No orders found.</td></tr>`}
-    </tbody>
-  </table>
+<table style="width:100%;border-collapse:collapse;">
+<thead><tr>
+<th style="text-align:left;padding:10px 8px;border-bottom:2px solid #ddd;">Order ID</th>
+<th style="text-align:left;padding:10px 8px;border-bottom:2px solid #ddd;">Created</th>
+<th style="text-align:left;padding:10px 8px;border-bottom:2px solid #ddd;">Run</th>
+<th style="text-align:left;padding:10px 8px;border-bottom:2px solid #ddd;">Customer</th>
+<th style="text-align:left;padding:10px 8px;border-bottom:2px solid #ddd;">Town</th>
+<th style="text-align:left;padding:10px 8px;border-bottom:2px solid #ddd;">Fees</th>
+<th style="text-align:left;padding:10px 8px;border-bottom:2px solid #ddd;">Status</th>
+</tr></thead>
+<tbody>${rows || `<tr><td colspan="7" style="padding:10px 8px;color:#666;">No orders found.</td></tr>`}</tbody>
+</table>
 </body></html>`);
 });
 
@@ -1212,52 +1189,50 @@ app.get("/admin/orders/:orderId", requireLogin, requireAdmin, async (req, res) =
 
   res.setHeader("Content-Type", "text/html; charset=utf-8");
   res.send(`<!doctype html>
-<html><head>
-<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Order ${escapeHtml(orderId)}</title>
-</head>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Order ${escapeHtml(orderId)}</title></head>
 <body style="font-family:system-ui,Segoe UI,Roboto,Arial,sans-serif;padding:18px;max-width:980px;margin:0 auto;">
-  <div style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:14px;">
-    <a href="/admin" style="padding:12px 14px;border:1px solid #ddd;border-radius:12px;text-decoration:none;color:#111;font-weight:900;">Back to admin</a>
-    <a href="javascript:window.print()" style="padding:12px 14px;border:1px solid #ddd;border-radius:12px;text-decoration:none;color:#111;font-weight:900;">Print</a>
-    <a href="/logout?returnTo=https%3A%2F%2Ftobermorygroceryrun.ca%2F" style="padding:12px 14px;border:1px solid #ddd;border-radius:12px;text-decoration:none;color:#111;font-weight:900;">Log out</a>
-  </div>
+<div style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:14px;">
+<a href="/admin" style="padding:12px 14px;border:1px solid #ddd;border-radius:12px;text-decoration:none;color:#111;font-weight:900;">Back to admin</a>
+<a href="javascript:window.print()" style="padding:12px 14px;border:1px solid #ddd;border-radius:12px;text-decoration:none;color:#111;font-weight:900;">Print</a>
+<a href="/logout?returnTo=https%3A%2F%2Ftobermorygroceryrun.ca%2F" style="padding:12px 14px;border:1px solid #ddd;border-radius:12px;text-decoration:none;color:#111;font-weight:900;">Log out</a>
+</div>
 
-  <h1 style="margin:0 0 6px;">${escapeHtml(orderId)}</h1>
-  <div style="color:#444;margin-bottom:14px;">Created: ${escapeHtml(when)} • Status: <strong>${escapeHtml(st)}</strong> • Fees: <strong>$${escapeHtml(fees)}</strong></div>
+<h1 style="margin:0 0 6px;">${escapeHtml(orderId)}</h1>
+<div style="color:#444;margin-bottom:14px;">Created: ${escapeHtml(when)} • Status: <strong>${escapeHtml(st)}</strong> • Fees: <strong>$${escapeHtml(fees)}</strong></div>
 
-  <div style="border:1px solid #ddd;border-radius:14px;padding:14px;margin-bottom:14px;">
-    <h2 style="margin:0 0 8px;">Customer</h2>
-    <div><strong>Name:</strong> ${escapeHtml(o.customer?.fullName || "—")}</div>
-    <div><strong>Email:</strong> ${escapeHtml(o.customer?.email || "—")}</div>
-    <div><strong>Phone:</strong> ${escapeHtml(o.customer?.phone || "—")}</div>
-  </div>
+<div style="border:1px solid #ddd;border-radius:14px;padding:14px;margin-bottom:14px;">
+<h2 style="margin:0 0 8px;">Customer</h2>
+<div><strong>Name:</strong> ${escapeHtml(o.customer?.fullName || "—")}</div>
+<div><strong>Email:</strong> ${escapeHtml(o.customer?.email || "—")}</div>
+<div><strong>Phone:</strong> ${escapeHtml(o.customer?.phone || "—")}</div>
+</div>
 
-  <div style="border:1px solid #ddd;border-radius:14px;padding:14px;margin-bottom:14px;">
-    <h2 style="margin:0 0 8px;">Address</h2>
-    <div><strong>Town:</strong> ${escapeHtml(o.address?.town || "—")}</div>
-    <div><strong>Street:</strong> ${escapeHtml(o.address?.streetAddress || "—")}</div>
-    <div><strong>Zone:</strong> ${escapeHtml(o.address?.zone || "—")}</div>
-  </div>
+<div style="border:1px solid #ddd;border-radius:14px;padding:14px;margin-bottom:14px;">
+<h2 style="margin:0 0 8px;">Address</h2>
+<div><strong>Town:</strong> ${escapeHtml(o.address?.town || "—")}</div>
+<div><strong>Street:</strong> ${escapeHtml(o.address?.streetAddress || "—")}</div>
+<div><strong>Zone:</strong> ${escapeHtml(o.address?.zone || "—")}</div>
+</div>
 
-  <div style="border:1px solid #ddd;border-radius:14px;padding:14px;margin-bottom:14px;">
-    <h2 style="margin:0 0 8px;">Stores</h2>
-    <div><strong>Primary:</strong> ${escapeHtml(o.stores?.primary || "—")}</div>
-    <div><strong>Extra:</strong> ${escapeHtml(extra)}</div>
-  </div>
+<div style="border:1px solid #ddd;border-radius:14px;padding:14px;margin-bottom:14px;">
+<h2 style="margin:0 0 8px;">Stores</h2>
+<div><strong>Primary:</strong> ${escapeHtml(o.stores?.primary || "—")}</div>
+<div><strong>Extra:</strong> ${escapeHtml(extra)}</div>
+</div>
 
-  <div style="border:1px solid #ddd;border-radius:14px;padding:14px;margin-bottom:14px;">
-    <h2 style="margin:0 0 8px;">Preferences</h2>
-    <div><strong>Drop-off:</strong> ${escapeHtml(o.preferences?.dropoffPref || "—")}</div>
-    <div><strong>Substitutions:</strong> ${escapeHtml(o.preferences?.subsPref || "—")}</div>
-    <div><strong>Contact:</strong> ${escapeHtml(o.preferences?.contactPref || "—")}</div>
-  </div>
+<div style="border:1px solid #ddd;border-radius:14px;padding:14px;margin-bottom:14px;">
+<h2 style="margin:0 0 8px;">Preferences</h2>
+<div><strong>Drop-off:</strong> ${escapeHtml(o.preferences?.dropoffPref || "—")}</div>
+<div><strong>Substitutions:</strong> ${escapeHtml(o.preferences?.subsPref || "—")}</div>
+<div><strong>Contact:</strong> ${escapeHtml(o.preferences?.contactPref || "—")}</div>
+</div>
 
-  <div style="border:1px solid #ddd;border-radius:14px;padding:14px;margin-bottom:14px;">
-    <h2 style="margin:0 0 8px;">Grocery list</h2>
-    <pre style="white-space:pre-wrap;margin:0;background:#fafafa;border:1px solid #eee;border-radius:12px;padding:12px;">${escapeHtml(o.list?.groceryListText || "")}</pre>
-    ${fileBlock}
-  </div>
+<div style="border:1px solid #ddd;border-radius:14px;padding:14px;margin-bottom:14px;">
+<h2 style="margin:0 0 8px;">Grocery list</h2>
+<pre style="white-space:pre-wrap;margin:0;background:#fafafa;border:1px solid #eee;border-radius:12px;padding:12px;">${escapeHtml(o.list?.groceryListText || "")}</pre>
+${fileBlock}
+</div>
 </body></html>`);
 });
 
@@ -1301,14 +1276,12 @@ app.post("/webhooks/square", async (req, res) => {
     const eventType = String(evt.type || "");
     const subscription = evt?.data?.object?.subscription;
 
-    // idempotent deliveries
     if (eventId) {
       const exists = await WebhookEvent.findOne({ eventId }).lean();
       if (exists) return res.status(200).send("ok");
       await WebhookEvent.create({ eventId, type: eventType });
     }
 
-    // only subscription events
     if ((eventType !== "subscription.created" && eventType !== "subscription.updated") || !subscription) {
       return res.status(200).send("ok");
     }
@@ -1327,13 +1300,10 @@ app.post("/webhooks/square", async (req, res) => {
 
     const renewalDate = subscription.charged_through_date ? new Date(subscription.charged_through_date) : null;
 
-    // 1) match by previously stored square customer id
     let user = await User.findOne({ "profile.squareCustomerId": customerId });
 
-    // 2) fallback: lookup Square customer -> match email -> store squareCustomerId
     if (!user) {
       if (!SQUARE_ACCESS_TOKEN) return res.status(200).send("ok");
-
       const client = squareClient();
       const resp = await client.customersApi.retrieveCustomer(customerId);
       const cust = resp?.result?.customer;
@@ -1363,13 +1333,10 @@ app.post("/webhooks/square", async (req, res) => {
 });
 
 // =========================
-// Root
+// Root + Boot
 // =========================
-app.get("/", (req, res) => res.send("TGR backend up"));
+app.get("/", (_req, res) => res.send("TGR backend up"));
 
-// =========================
-// Boot
-// =========================
 async function main() {
   await mongoose.connect(MONGODB_URI);
   console.log("Connected to MongoDB");
