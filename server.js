@@ -1,26 +1,49 @@
-// ======= server.js (FULL FILE — Postmark + Postmark webhooks + Square webhook + useful extras) =======
-//
-// Added "recommended useful extras":
-// - Security headers (helmet)
-// - Compression (compression)
-// - Request logging (morgan) + request id
-// - Rate limiting (express-rate-limit) + tighter on /auth + /webhooks
-// - Safer CORS allowlist handling
-// - Robust JSON/raw-body handling for Square signature validation
-// - Upload temp cleanup (best-effort) if order fails
-// - Better error handler (JSON with request id)
-// - Real Admin page UI (runs + orders + status + payments + unmatched payments)
-// - /favicon.ico handler (quiet 404)
-// - /api/me includes profileMissing reasons to debug onboarding loops
-// - Postmark webhooks endpoint /webhooks/postmark (Delivery/Open/Click/Bounce/SpamComplaint/SubscriptionChange)
-//   - Basic Auth protection for Postmark webhook URL
-//   - Dedup / idempotency on webhook events
-//   - Suppression list: marks email suppressed on hard bounces + spam complaints
+// ======= server.js (FULL FILE) — TGR backend =======
+// Express + MongoDB + Google OAuth + Account Profile + Runs + Estimator + Orders + Admin UI
+// Square: pay links + Square webhook (auto-mark fees/groceries paid by Payment Link ID)
+// Postmark: sending + Postmark webhooks (Delivered/Open/Click/Bounce/SpamComplaint/SubscriptionChange)
 //
 // Required installs:
-//   npm i postmark square helmet compression morgan express-rate-limit
-// Optional:
+//   npm i express mongoose multer cookie-parser express-session cors connect-mongo passport passport-google-oauth20
+//   npm i square postmark helmet compression morgan express-rate-limit
+// Optional (recommended):
 //   npm i nanoid
+//
+// Render ENV (minimum):
+//   MONGO_URI (or MONGODB_URI)
+//   SESSION_SECRET
+//   GOOGLE_CLIENT_ID
+//   GOOGLE_CLIENT_SECRET
+//   GOOGLE_CALLBACK_URL=https://api.tobermorygroceryrun.ca/auth/google/callback
+//   PUBLIC_SITE_URL=https://tobermorygroceryrun.ca
+//
+// Postmark ENV:
+//   POSTMARK_SERVER_TOKEN
+//   POSTMARK_MESSAGE_STREAM=outbound   (your transactional stream id; outbound is the default)
+//   EMAIL_FROM=orders@tobermorygroceryrun.ca
+//   EMAIL_REPLY_TO=orders@tobermorygroceryrun.ca
+//   POSTMARK_WEBHOOK_USERNAME=...
+//   POSTMARK_WEBHOOK_PASSWORD=...
+//
+// Square ENV:
+//   SQUARE_ACCESS_TOKEN
+//   SQUARE_WEBHOOK_SIGNATURE_KEY
+//   SQUARE_WEBHOOK_NOTIFICATION_URL=https://api.tobermorygroceryrun.ca/webhooks/square
+//   SQUARE_PAY_FEES_SLUG=r92W6XGs
+//   SQUARE_PAY_GROCERIES_SLUG=R0hfr7x8
+//   SQUARE_PAY_FEES_LINK=https://square.link/u/r92W6XGs
+//   SQUARE_PAY_GROCERIES_LINK=https://square.link/u/R0hfr7x8
+//   SQUARE_LINK_STANDARD=https://square.link/u/iaziCZjG
+//   SQUARE_LINK_ROUTE=https://square.link/u/P5ROgqyp
+//   SQUARE_LINK_ACCESS=https://square.link/u/lHtHtvqG
+//   SQUARE_LINK_ACCESSPRO=https://square.link/u/S0Y5Fysa
+//
+// Admin ENV (optional):
+//   ADMIN_EMAILS=nickb@tobermorygroceryrun.ca,another@domain.com
+//
+// Notes:
+// - /webhooks/postmark is protected with Basic Auth if username/password are set.
+// - /admin is a real admin dashboard page (server-rendered) using /api/admin/* endpoints.
 
 const express = require("express");
 const mongoose = require("mongoose");
@@ -73,6 +96,8 @@ const SESSION_SECRET = process.env.SESSION_SECRET || "dev-secret";
 const TZ = process.env.TZ || "America/Toronto";
 const NODE_ENV = process.env.NODE_ENV || "production";
 
+const PUBLIC_SITE_URL = process.env.PUBLIC_SITE_URL || "https://tobermorygroceryrun.ca";
+
 // Google OAuth
 const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID || "";
 const GOOGLE_CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET || "";
@@ -84,7 +109,7 @@ const ADMIN_EMAILS = String(process.env.ADMIN_EMAILS || "")
   .map((s) => s.trim().toLowerCase())
   .filter(Boolean);
 
-// CORS
+// CORS allowlist
 const ALLOWED_ORIGINS = [
   "https://tobermorygroceryrun.ca",
   "https://www.tobermorygroceryrun.ca",
@@ -92,45 +117,39 @@ const ALLOWED_ORIGINS = [
   "http://localhost:3000",
 ];
 
-// Public site base (used in emails and redirects)
-const PUBLIC_SITE_URL = process.env.PUBLIC_SITE_URL || "https://tobermorygroceryrun.ca";
-
 // Uploads
 const UPLOAD_DIR = process.env.UPLOAD_DIR || "uploads";
 
-// Square redirect links (customer-facing)
-const SQUARE_PAY_LINKS = {
-  groceries: process.env.SQUARE_PAY_GROCERIES_LINK || "",
-  fees: process.env.SQUARE_PAY_FEES_LINK || "",
-};
-
-const SQUARE_MEMBERSHIP_LINKS = {
-  standard: process.env.SQUARE_LINK_STANDARD || "",
-  route: process.env.SQUARE_LINK_ROUTE || "",
-  access: process.env.SQUARE_LINK_ACCESS || "",
-  accesspro: process.env.SQUARE_LINK_ACCESSPRO || "",
-};
-
-// Square webhook + API token
-const SQUARE_WEBHOOK_SIGNATURE_KEY = process.env.SQUARE_WEBHOOK_SIGNATURE_KEY || "";
-const SQUARE_WEBHOOK_NOTIFICATION_URL =
-  process.env.SQUARE_WEBHOOK_NOTIFICATION_URL ||
-  "https://api.tobermorygroceryrun.ca/webhooks/square";
-const SQUARE_ACCESS_TOKEN = process.env.SQUARE_ACCESS_TOKEN || "";
-
-// Square payment link slugs (square.link/u/<slug>) used to map paymentLinkId
-const SQUARE_PAY_FEES_SLUG = process.env.SQUARE_PAY_FEES_SLUG || "r92W6XGs";
-const SQUARE_PAY_GROCERIES_SLUG = process.env.SQUARE_PAY_GROCERIES_SLUG || "R0hfr7x8";
-
-// Email (Postmark)
+// Postmark
 const POSTMARK_SERVER_TOKEN = process.env.POSTMARK_SERVER_TOKEN || "";
 const POSTMARK_MESSAGE_STREAM = process.env.POSTMARK_MESSAGE_STREAM || "outbound";
 const EMAIL_FROM = process.env.EMAIL_FROM || "orders@tobermorygroceryrun.ca";
 const EMAIL_REPLY_TO = process.env.EMAIL_REPLY_TO || EMAIL_FROM;
 
-// Postmark webhook protection (Basic Auth)
 const POSTMARK_WEBHOOK_USERNAME = process.env.POSTMARK_WEBHOOK_USERNAME || "";
 const POSTMARK_WEBHOOK_PASSWORD = process.env.POSTMARK_WEBHOOK_PASSWORD || "";
+
+// Square links and webhook
+const SQUARE_ACCESS_TOKEN = process.env.SQUARE_ACCESS_TOKEN || "";
+const SQUARE_WEBHOOK_SIGNATURE_KEY = process.env.SQUARE_WEBHOOK_SIGNATURE_KEY || "";
+const SQUARE_WEBHOOK_NOTIFICATION_URL =
+  process.env.SQUARE_WEBHOOK_NOTIFICATION_URL ||
+  "https://api.tobermorygroceryrun.ca/webhooks/square";
+
+const SQUARE_PAY_FEES_SLUG = process.env.SQUARE_PAY_FEES_SLUG || "r92W6XGs";
+const SQUARE_PAY_GROCERIES_SLUG = process.env.SQUARE_PAY_GROCERIES_SLUG || "R0hfr7x8";
+
+const SQUARE_PAY_LINKS = {
+  fees: process.env.SQUARE_PAY_FEES_LINK || "https://square.link/u/r92W6XGs",
+  groceries: process.env.SQUARE_PAY_GROCERIES_LINK || "https://square.link/u/R0hfr7x8",
+};
+
+const SQUARE_MEMBERSHIP_LINKS = {
+  standard: process.env.SQUARE_LINK_STANDARD || "https://square.link/u/iaziCZjG",
+  route: process.env.SQUARE_LINK_ROUTE || "https://square.link/u/P5ROgqyp",
+  access: process.env.SQUARE_LINK_ACCESS || "https://square.link/u/lHtHtvqG",
+  accesspro: process.env.SQUARE_LINK_ACCESSPRO || "https://square.link/u/S0Y5Fysa",
+};
 
 // =========================
 // UTIL
@@ -182,14 +201,12 @@ function squareClient() {
 const app = express();
 app.set("trust proxy", 1);
 
-// Request ID
 app.use((req, res, next) => {
   req.id = req.get("x-request-id") || makeReqId();
   res.setHeader("x-request-id", req.id);
   next();
 });
 
-// Security headers (keep CSP off because we serve simple HTML pages)
 app.use(
   helmet({
     contentSecurityPolicy: false,
@@ -197,10 +214,8 @@ app.use(
   })
 );
 
-// Compression
 app.use(compression());
 
-// Logging
 app.use(
   morgan(
     ":date[iso] :remote-addr :method :url :status :res[content-length] - :response-time ms rid=:req[x-request-id]",
@@ -208,7 +223,6 @@ app.use(
   )
 );
 
-// Rate limiting
 const generalLimiter = rateLimit({
   windowMs: 60 * 1000,
   max: 240,
@@ -231,7 +245,6 @@ const webhookLimiter = rateLimit({
   legacyHeaders: false,
 });
 
-// CORS allowlist
 app.use(
   cors({
     origin: function (origin, cb) {
@@ -242,7 +255,7 @@ app.use(
   })
 );
 
-// Raw body capture for Square signature validation
+// raw body capture for Square signature verification
 app.use(
   express.json({
     limit: "6mb",
@@ -254,7 +267,6 @@ app.use(
 app.use(express.urlencoded({ extended: true }));
 app.use(cookieParser());
 
-// Sessions
 app.use(
   session({
     name: "tgr.sid",
@@ -276,7 +288,6 @@ app.use(
   })
 );
 
-// Quiet favicon
 app.get("/favicon.ico", (_req, res) => res.status(204).end());
 
 // =========================
@@ -358,7 +369,7 @@ function safeUnlink(filePath) {
 }
 
 // =========================
-// PRICING BASELINE
+// PRICING BASELINE (estimator snapshot)
 // =========================
 const PRICING = {
   serviceFee: 25,
@@ -498,7 +509,6 @@ const OrderSchema = new mongoose.Schema(
       default: [],
     },
 
-    // Email telemetry (Postmark) – last known lifecycle signals
     email: {
       lastMessageId: { type: String, default: "" },
       lastEvent: { type: String, default: "" },
@@ -542,11 +552,10 @@ const PaymentLinkCacheSchema = new mongoose.Schema(
   { timestamps: true }
 );
 
-// Postmark email event log + suppression list
 const EmailEventSchema = new mongoose.Schema(
   {
     provider: { type: String, default: "postmark" },
-    recordType: { type: String, default: "" }, // Delivered, Open, Click, Bounce, SpamComplaint, SubscriptionChange
+    recordType: { type: String, default: "" },
     messageId: { type: String, default: "" },
     messageStream: { type: String, default: "" },
     recipient: { type: String, default: "" },
@@ -602,7 +611,6 @@ function isProfileComplete(profile) {
   });
 
   const consentsOk = p.consentTerms === true && p.consentPrivacy === true;
-
   return !!fullName && !!phone && !!contactPref && contactAuth && hasAddress && consentsOk;
 }
 
@@ -627,7 +635,7 @@ function profileMissingReasons(profile) {
 }
 
 // =========================
-// RUN CALENDAR
+// RUN CALENDAR + AGG
 // =========================
 function nextDow(targetDow, from) {
   let d = dayjs(from).tz(TZ);
@@ -699,6 +707,7 @@ async function ensureUpcomingRuns() {
         { runKey },
         { $set: { bookedOrdersCount: c, bookedFeesTotal: fees, lastRecalcAt: new Date() } }
       );
+
       run.bookedOrdersCount = c;
       run.bookedFeesTotal = fees;
       run.lastRecalcAt = new Date();
@@ -796,13 +805,13 @@ function computeFeeBreakdown(input) {
 // =========================
 let postmarkClient = null;
 
-function canEmail() {
-  return !!(POSTMARK_SERVER_TOKEN && EMAIL_FROM);
-}
-
 function initEmail() {
   if (!POSTMARK_SERVER_TOKEN) return;
   postmarkClient = new postmark.ServerClient(POSTMARK_SERVER_TOKEN);
+}
+
+function canEmail() {
+  return !!(POSTMARK_SERVER_TOKEN && EMAIL_FROM && postmarkClient);
 }
 
 async function isSuppressedEmail(email) {
@@ -813,9 +822,9 @@ async function isSuppressedEmail(email) {
 }
 
 async function sendEmail({ to, subject, html, text, tag, metadata, messageStream }) {
-  if (!canEmail() || !postmarkClient) return { ok: false, skipped: true, reason: "email_not_configured" };
+  if (!canEmail()) return { ok: false, skipped: true, reason: "email_not_configured" };
 
-  const recipient = String(to || "").trim();
+  const recipient = String(to || "").trim().toLowerCase();
   if (!recipient) return { ok: false, skipped: true, reason: "missing_to" };
 
   if (await isSuppressedEmail(recipient)) {
@@ -834,7 +843,6 @@ async function sendEmail({ to, subject, html, text, tag, metadata, messageStream
     Metadata: metadata || undefined,
   };
 
-  // Postmark returns MessageID (useful for matching)
   const r = await postmarkClient.sendEmail(payload);
   return { ok: true, messageId: r?.MessageID || "" };
 }
@@ -892,7 +900,7 @@ function deliveredEmail(order) {
 }
 
 // =========================
-// PAYMENT LINK RESOLUTION (Square)
+// PAYMENT LINK RESOLUTION (Square listPaymentLinks → map slug → paymentLinkId)
 // =========================
 const paymentLinkState = {
   fees: { slug: SQUARE_PAY_FEES_SLUG, paymentLinkId: "", url: "" },
@@ -1252,21 +1260,14 @@ app.post("/api/payments/checkout", (req, res) => {
   const allowed = new Set(["groceries", "fees"]);
   if (!allowed.has(kind)) return res.status(400).json({ ok: false, error: "Invalid payment kind" });
 
-  const url = SQUARE_PAY_LINKS[kind];
+  const url = kind === "fees" ? SQUARE_PAY_LINKS.fees : SQUARE_PAY_LINKS.groceries;
   if (!url) return res.status(500).json({ ok: false, error: "Missing Square pay link for " + kind });
 
   res.json({ ok: true, kind, checkoutUrl: url });
 });
 
-app.get("/pay/groceries", (_req, res) => {
-  if (!SQUARE_PAY_LINKS.groceries) return res.status(500).send("Missing SQUARE_PAY_GROCERIES_LINK");
-  res.redirect(SQUARE_PAY_LINKS.groceries);
-});
-
-app.get("/pay/fees", (_req, res) => {
-  if (!SQUARE_PAY_LINKS.fees) return res.status(500).send("Missing SQUARE_PAY_FEES_LINK");
-  res.redirect(SQUARE_PAY_LINKS.fees);
-});
+app.get("/pay/groceries", (_req, res) => res.redirect(SQUARE_PAY_LINKS.groceries));
+app.get("/pay/fees", (_req, res) => res.redirect(SQUARE_PAY_LINKS.fees));
 
 // =========================
 // ORDERS
@@ -1283,7 +1284,17 @@ app.post("/api/orders", requireLogin, requireProfileComplete, upload.single("gro
       return res.status(400).json({ ok: false, error: "All required consents must be accepted." });
     }
 
-    const required = ["town","streetAddress","zone","runType","primaryStore","groceryList","dropoffPref","subsPref","contactPref"];
+    const required = [
+      "town",
+      "streetAddress",
+      "zone",
+      "runType",
+      "primaryStore",
+      "groceryList",
+      "dropoffPref",
+      "subsPref",
+      "contactPref",
+    ];
     for (const k of required) {
       if (!String(b[k] || "").trim()) {
         safeUnlink(uploadedPath);
@@ -1318,8 +1329,7 @@ app.post("/api/orders", requireLogin, requireProfileComplete, upload.single("gro
         size: req.file.size,
         path: req.file.path,
       };
-      // Keep attachment on disk for now
-      uploadedPath = "";
+      uploadedPath = ""; // keep file for now
     }
 
     const pricingSnapshot = computeFeeBreakdown({
@@ -1377,16 +1387,13 @@ app.post("/api/orders", requireLogin, requireProfileComplete, upload.single("gro
       statusHistory: [{ state: "submitted", note: "", at: new Date(), by: "customer" }],
     });
 
-    // Postmark: include Tag + Metadata so webhooks can link to orderId across lifecycle
-    // (Webhook payload includes Tag + Metadata where applicable.)
-    let pm = null;
+    // Postmark email with Tag + Metadata for webhook linking
     try {
-      const html = orderReceivedEmail(created);
-      pm = await sendEmail({
+      const pm = await sendEmail({
         to: created.customer.email,
         subject: `TGR Order Received: ${created.orderId}`,
-        html,
-        text: `TGR Order Received: ${created.orderId}\nTrack: ${PUBLIC_SITE_URL}/?tab=status`,
+        html: orderReceivedEmail(created),
+        text: `Order received: ${created.orderId}\nTrack: ${PUBLIC_SITE_URL}/?tab=status`,
         tag: "order_received",
         metadata: { orderId: created.orderId, runKey: created.runKey, runType: created.runType },
       });
@@ -1407,7 +1414,7 @@ app.post("/api/orders", requireLogin, requireProfileComplete, upload.single("gro
   }
 });
 
-// Public tracking by orderId (includes payments + statusHistory)
+// Public tracking by orderId
 app.get("/api/orders/:orderId", async (req, res) => {
   try {
     const orderId = String(req.params.orderId || "").trim().toUpperCase();
@@ -1439,29 +1446,6 @@ app.get("/api/orders/:orderId", async (req, res) => {
         email: order.email || {},
       },
     });
-  } catch (e) {
-    res.status(500).json({ ok: false, error: String(e) });
-  }
-});
-
-// Per-order payment launch: sets pending, returns Square URL
-app.post("/api/orders/:orderId/pay/:kind", async (req, res) => {
-  try {
-    const orderId = String(req.params.orderId || "").trim().toUpperCase();
-    const kind = String(req.params.kind || "").trim().toLowerCase();
-    if (!["fees", "groceries"].includes(kind)) return res.status(400).json({ ok: false, error: "Invalid kind" });
-
-    const order = await Order.findOne({ orderId });
-    if (!order) return res.status(404).json({ ok: false, error: "Order not found" });
-
-    const url = kind === "fees" ? SQUARE_PAY_LINKS.fees : SQUARE_PAY_LINKS.groceries;
-    if (!url) return res.status(500).json({ ok: false, error: "Pay link missing for " + kind });
-
-    order.payments[kind].status = "pending";
-    order.payments[kind].note = `Customer launched Square payment for ${kind}.`;
-    await order.save();
-
-    res.json({ ok: true, orderId, kind, checkoutUrl: url });
   } catch (e) {
     res.status(500).json({ ok: false, error: String(e) });
   }
@@ -1506,7 +1490,7 @@ app.patch("/api/admin/orders/:orderId/status", requireLogin, requireAdmin, async
 
     await order.save();
 
-    // Email status updates (use tags + metadata)
+    // Send status emails for high-value states
     try {
       if (order.customer?.email) {
         if (state === "out_for_delivery") {
@@ -1579,81 +1563,6 @@ app.get("/api/admin/unmatched-payments", requireLogin, requireAdmin, async (_req
   res.json({ ok: true, items });
 });
 
-// =========================
-// MEMBER + ADMIN PAGES (simple)
-// =========================
-app.get("/member", requireLogin, async (req, res) => {
-  const u = await User.findById(req.user._id).lean();
-  const email = String(u?.email || "").toLowerCase();
-  const orders = await Order.find({ "customer.email": email }).sort({ createdAt: -1 }).limit(25).lean();
-
-  const rows = orders
-    .map((o) => {
-      const status = o.status?.state || "submitted";
-      const when = fmtLocal(o.createdAt);
-      const primary = o.stores?.primary || "—";
-      const town = o.address?.town || "—";
-      const fees = typeof o.pricingSnapshot?.totalFees === "number" ? o.pricingSnapshot.totalFees.toFixed(2) : "0.00";
-      const fp = o.payments?.fees?.status || "unpaid";
-      const gp = o.payments?.groceries?.status || "unpaid";
-      return `<tr>
-        <td style="padding:10px 8px;border-top:1px solid #ddd;font-weight:900;">${escapeHtml(o.orderId)}</td>
-        <td style="padding:10px 8px;border-top:1px solid #ddd;">${escapeHtml(when)}</td>
-        <td style="padding:10px 8px;border-top:1px solid #ddd;">${escapeHtml(primary)}</td>
-        <td style="padding:10px 8px;border-top:1px solid #ddd;">${escapeHtml(town)}</td>
-        <td style="padding:10px 8px;border-top:1px solid #ddd;font-weight:900;">${escapeHtml(status)}</td>
-        <td style="padding:10px 8px;border-top:1px solid #ddd;">$${escapeHtml(fees)}</td>
-        <td style="padding:10px 8px;border-top:1px solid #ddd;">Fees: ${escapeHtml(fp)}<br>Groceries: ${escapeHtml(gp)}</td>
-      </tr>`;
-    })
-    .join("");
-
-  res.setHeader("Content-Type", "text/html; charset=utf-8");
-  res.send(`<!doctype html>
-<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>TGR Member Portal</title></head>
-<body style="font-family:system-ui,Segoe UI,Roboto,Arial,sans-serif;padding:18px;max-width:1100px;margin:0 auto;">
-<h1 style="margin:0 0 6px;">Member Portal</h1>
-<div style="color:#444;margin-bottom:14px;">Signed in as <strong>${escapeHtml(email)}</strong></div>
-
-<div style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:14px;">
-<a href="${PUBLIC_SITE_URL}/" style="padding:12px 14px;border:1px solid #ddd;border-radius:12px;text-decoration:none;color:#111;font-weight:900;">Back to site</a>
-<a href="/pay/groceries" style="padding:12px 14px;border:1px solid #e3342f;background:#e3342f;color:#fff;border-radius:12px;text-decoration:none;font-weight:900;">Pay Grocery Total</a>
-<a href="/pay/fees" style="padding:12px 14px;border:1px solid #ddd;border-radius:12px;text-decoration:none;color:#111;font-weight:900;">Pay Service & Delivery Fees</a>
-<a href="/logout?returnTo=${encodeURIComponent(PUBLIC_SITE_URL + "/")}" style="padding:12px 14px;border:1px solid #ddd;border-radius:12px;text-decoration:none;color:#111;font-weight:900;">Log out</a>
-</div>
-
-<h2 style="margin:0 0 8px;">Recent orders</h2>
-<table style="width:100%;border-collapse:collapse;">
-<thead><tr>
-<th style="text-align:left;padding:10px 8px;border-bottom:2px solid #ddd;">Order ID</th>
-<th style="text-align:left;padding:10px 8px;border-bottom:2px solid #ddd;">Created</th>
-<th style="text-align:left;padding:10px 8px;border-bottom:2px solid #ddd;">Store</th>
-<th style="text-align:left;padding:10px 8px;border-bottom:2px solid #ddd;">Town</th>
-<th style="text-align:left;padding:10px 8px;border-bottom:2px solid #ddd;">Status</th>
-<th style="text-align:left;padding:10px 8px;border-bottom:2px solid #ddd;">Fees</th>
-<th style="text-align:left;padding:10px 8px;border-bottom:2px solid #ddd;">Payments</th>
-</tr></thead>
-<tbody>${rows || `<tr><td colspan="7" style="padding:10px 8px;color:#666;">No orders yet.</td></tr>`}</tbody>
-</table>
-</body></html>`);
-});
-
-app.get("/admin", requireLogin, requireAdmin, async (req, res) => {
-  res.setHeader("Content-Type", "text/html; charset=utf-8");
-  res.send(`<!doctype html>
-<html>
-<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>TGR Admin</title></head>
-<body style="font-family:system-ui,Segoe UI,Roboto,Arial,sans-serif;padding:18px;max-width:980px;margin:0 auto;">
-<h1 style="margin:0 0 8px;">Admin</h1>
-<div style="color:#444;margin-bottom:14px;">Signed in as <strong>${escapeHtml(String(req.user.email||""))}</strong></div>
-<div style="margin-bottom:10px;">Admin API endpoints: <code>/api/admin/*</code></div>
-<div>Postmark webhook events: <code>/api/admin/email-events</code> • Suppressions: <code>/api/admin/suppressions</code></div>
-<div style="margin-top:14px;"><a href="/logout?returnTo=${encodeURIComponent(PUBLIC_SITE_URL + "/")}">Log out</a></div>
-</body></html>`);
-});
-
-// Admin views for email telemetry
 app.get("/api/admin/email-events", requireLogin, requireAdmin, async (req, res) => {
   const orderId = String(req.query.orderId || "").trim().toUpperCase();
   const recipient = String(req.query.recipient || "").trim().toLowerCase();
@@ -1673,6 +1582,7 @@ app.post("/api/admin/suppressions", requireLogin, requireAdmin, async (req, res)
   const email = String(req.body?.email || "").toLowerCase().trim();
   const reason = String(req.body?.reason || "manual").trim();
   if (!email) return res.status(400).json({ ok: false, error: "Missing email" });
+
   await SuppressedEmail.updateOne(
     { email },
     { $set: { email, reason, provider: "postmark", lastAt: new Date() }, $setOnInsert: { firstAt: new Date() } },
@@ -1689,7 +1599,259 @@ app.delete("/api/admin/suppressions", requireLogin, requireAdmin, async (req, re
 });
 
 // =========================
-// SQUARE WEBHOOK (auto-mark paid by payment link)
+// MEMBER PAGE
+// =========================
+app.get("/member", requireLogin, async (req, res) => {
+  const u = await User.findById(req.user._id).lean();
+  const email = String(u?.email || "").toLowerCase();
+  res.setHeader("Content-Type", "text/html; charset=utf-8");
+  res.send(`<!doctype html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>TGR Member Portal</title></head>
+<body style="font-family:system-ui,Segoe UI,Roboto,Arial,sans-serif;padding:18px;max-width:900px;margin:0 auto;">
+<h1 style="margin:0 0 8px;">Member Portal</h1>
+<div style="color:#444;margin-bottom:14px;">Signed in as <strong>${escapeHtml(email)}</strong></div>
+<div style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:14px;">
+  <a href="${PUBLIC_SITE_URL}/" style="padding:12px 14px;border:1px solid #ddd;border-radius:12px;text-decoration:none;color:#111;font-weight:900;">Back to site</a>
+  <a href="/pay/groceries" style="padding:12px 14px;border:1px solid #e3342f;background:#e3342f;color:#fff;border-radius:12px;text-decoration:none;font-weight:900;">Pay Grocery Total</a>
+  <a href="/pay/fees" style="padding:12px 14px;border:1px solid #ddd;border-radius:12px;text-decoration:none;color:#111;font-weight:900;">Pay Service & Delivery Fees</a>
+  <a href="/logout?returnTo=${encodeURIComponent(PUBLIC_SITE_URL + "/")}" style="padding:12px 14px;border:1px solid #ddd;border-radius:12px;text-decoration:none;color:#111;font-weight:900;">Log out</a>
+</div>
+<div style="color:#444;">Tracking is on the public site under “Live Status” using your Order ID.</div>
+</body></html>`);
+});
+
+// =========================
+// ADMIN UI (REAL DASHBOARD)
+// =========================
+app.get("/admin", requireLogin, requireAdmin, async (req, res) => {
+  res.setHeader("Content-Type", "text/html; charset=utf-8");
+  res.send(`<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>TGR Admin</title>
+</head>
+<body style="font-family:system-ui,Segoe UI,Roboto,Arial,sans-serif;padding:18px;max-width:1200px;margin:0 auto;">
+  <h1 style="margin:0 0 8px;">Admin</h1>
+  <div style="color:#444;margin-bottom:14px;">Signed in as <strong>${escapeHtml(String(req.user.email||""))}</strong></div>
+
+  <div style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:14px;">
+    <a href="${PUBLIC_SITE_URL}/" style="padding:10px 12px;border:1px solid #ddd;border-radius:10px;text-decoration:none;color:#111;font-weight:800;">Back to site</a>
+    <a href="/api/admin/email-events" style="padding:10px 12px;border:1px solid #ddd;border-radius:10px;text-decoration:none;color:#111;font-weight:800;">Email events</a>
+    <a href="/api/admin/suppressions" style="padding:10px 12px;border:1px solid #ddd;border-radius:10px;text-decoration:none;color:#111;font-weight:800;">Suppressions</a>
+    <a href="/logout?returnTo=${encodeURIComponent(PUBLIC_SITE_URL + "/")}" style="padding:10px 12px;border:1px solid #ddd;border-radius:10px;text-decoration:none;color:#111;font-weight:800;">Log out</a>
+  </div>
+
+  <div style="border:1px solid #ddd;border-radius:12px;padding:12px;">
+    <div style="display:flex;gap:12px;flex-wrap:wrap;align-items:flex-end;">
+      <div>
+        <label style="font-weight:800;">Run</label><br>
+        <select id="runKeySel" style="padding:10px;border-radius:10px;border:1px solid #ddd;min-width:280px;"></select>
+      </div>
+      <div>
+        <label style="font-weight:800;">Status filter</label><br>
+        <select id="statusSel" style="padding:10px;border-radius:10px;border:1px solid #ddd;min-width:220px;">
+          <option value="">All</option>
+          ${AllowedStates.map(s=>`<option value="${s}">${s}</option>`).join("")}
+        </select>
+      </div>
+      <button id="refreshBtn" style="padding:10px 12px;border-radius:10px;border:1px solid #111;background:#111;color:#fff;font-weight:900;cursor:pointer;">Refresh</button>
+    </div>
+  </div>
+
+  <h2 style="margin:16px 0 8px;">Orders</h2>
+  <div id="ordersMeta" style="color:#444;margin-bottom:8px;">Loading…</div>
+  <div style="overflow:auto;border:1px solid #ddd;border-radius:12px;">
+    <table style="width:100%;border-collapse:collapse;min-width:1100px;">
+      <thead>
+        <tr style="background:#f7f7f7;">
+          <th style="text-align:left;padding:10px;border-bottom:1px solid #ddd;">Order</th>
+          <th style="text-align:left;padding:10px;border-bottom:1px solid #ddd;">Run</th>
+          <th style="text-align:left;padding:10px;border-bottom:1px solid #ddd;">Town/Zone</th>
+          <th style="text-align:left;padding:10px;border-bottom:1px solid #ddd;">Store</th>
+          <th style="text-align:left;padding:10px;border-bottom:1px solid #ddd;">Fees</th>
+          <th style="text-align:left;padding:10px;border-bottom:1px solid #ddd;">Payments</th>
+          <th style="text-align:left;padding:10px;border-bottom:1px solid #ddd;">Status</th>
+          <th style="text-align:left;padding:10px;border-bottom:1px solid #ddd;">Actions</th>
+        </tr>
+      </thead>
+      <tbody id="ordersBody"></tbody>
+    </table>
+  </div>
+
+  <h2 style="margin:18px 0 8px;">Unmatched payments</h2>
+  <div id="unmatchedBox" style="border:1px solid #ddd;border-radius:12px;padding:12px;">Loading…</div>
+
+<script>
+  async function j(url, opts){
+    const r = await fetch(url, Object.assign({ credentials:"include" }, opts||{}));
+    const d = await r.json().catch(()=>({}));
+    if(!r.ok || d.ok === false) throw new Error(d.error || ("HTTP "+r.status));
+    return d;
+  }
+
+  const runKeySel = document.getElementById("runKeySel");
+  const statusSel = document.getElementById("statusSel");
+  const ordersBody = document.getElementById("ordersBody");
+  const ordersMeta = document.getElementById("ordersMeta");
+  const unmatchedBox = document.getElementById("unmatchedBox");
+
+  function esc(s){
+    return String(s||"").replaceAll("&","&amp;").replaceAll("<","&lt;").replaceAll(">","&gt;").replaceAll('"',"&quot;").replaceAll("'","&#039;");
+  }
+  function money(n){
+    const x = Math.round((Number(n||0)+Number.EPSILON)*100)/100;
+    return "$"+x.toFixed(2);
+  }
+
+  async function loadRuns(){
+    const data = await j("/api/admin/runs");
+    const runs = data.runs || {};
+    const options = [];
+    for(const k of ["local","owen"]){
+      const r = runs[k];
+      if(!r) continue;
+      options.push({ label: r.runKey + " ("+r.type+")", value: r.runKey });
+    }
+    runKeySel.innerHTML = options.map(o => "<option value='"+esc(o.value)+"'>"+esc(o.label)+"</option>").join("");
+  }
+
+  async function setStatus(orderId, state){
+    const note = prompt("Optional note for status change:", "");
+    await j("/api/admin/orders/"+encodeURIComponent(orderId)+"/status", {
+      method:"PATCH",
+      headers:{ "Content-Type":"application/json" },
+      body: JSON.stringify({ state, note: note || "" })
+    });
+    await refreshAll();
+  }
+
+  async function setPaid(orderId, kind, status){
+    const note = prompt("Optional note:", "");
+    await j("/api/admin/orders/"+encodeURIComponent(orderId)+"/payment", {
+      method:"PATCH",
+      headers:{ "Content-Type":"application/json" },
+      body: JSON.stringify({ kind, status, note: note || "" })
+    });
+    await refreshAll();
+  }
+
+  function actionBtns(order){
+    const id = order.orderId;
+
+    const statusButtons = ["confirmed","shopping","packed","out_for_delivery","delivered","issue","cancelled"]
+      .map(st => "<button data-st='"+st+"' style='padding:8px 10px;border-radius:10px;border:1px solid #ddd;background:#fff;font-weight:900;cursor:pointer;'>"+st+"</button>")
+      .join(" ");
+
+    const payButtons =
+      "<div style='margin-top:8px;display:flex;gap:8px;flex-wrap:wrap;'>" +
+      "<button data-pay='fees:paid' style='padding:8px 10px;border-radius:10px;border:1px solid #ddd;background:#fff;font-weight:900;cursor:pointer;'>Fees paid</button>" +
+      "<button data-pay='fees:unpaid' style='padding:8px 10px;border-radius:10px;border:1px solid #ddd;background:#fff;font-weight:900;cursor:pointer;'>Fees unpaid</button>" +
+      "<button data-pay='groceries:paid' style='padding:8px 10px;border-radius:10px;border:1px solid #ddd;background:#fff;font-weight:900;cursor:pointer;'>Groceries paid</button>" +
+      "<button data-pay='groceries:unpaid' style='padding:8px 10px;border-radius:10px;border:1px solid #ddd;background:#fff;font-weight:900;cursor:pointer;'>Groceries unpaid</button>" +
+      "</div>";
+
+    return "<div data-oid='"+esc(id)+"'>" +
+      "<div style='display:flex;gap:8px;flex-wrap:wrap;'>" + statusButtons + "</div>" +
+      payButtons +
+      "</div>";
+  }
+
+  function row(order){
+    const id = esc(order.orderId);
+    const runKey = esc(order.runKey || "—");
+    const town = esc(order.address?.town || "—");
+    const zone = esc(order.address?.zone || "—");
+    const store = esc(order.stores?.primary || "—");
+    const fees = money(order.pricingSnapshot?.totalFees || 0);
+
+    const feesPay = esc(order.payments?.fees?.status || "unpaid");
+    const grocPay = esc(order.payments?.groceries?.status || "unpaid");
+
+    const st = esc(order.status?.state || "submitted");
+
+    return "<tr>" +
+      "<td style='padding:10px;border-top:1px solid #eee;font-weight:1000;white-space:nowrap;'>" + id + "</td>" +
+      "<td style='padding:10px;border-top:1px solid #eee;white-space:nowrap;'>" + runKey + "</td>" +
+      "<td style='padding:10px;border-top:1px solid #eee;'>" + town + " / " + zone + "</td>" +
+      "<td style='padding:10px;border-top:1px solid #eee;'>" + store + "</td>" +
+      "<td style='padding:10px;border-top:1px solid #eee;font-weight:900;'>" + fees + "</td>" +
+      "<td style='padding:10px;border-top:1px solid #eee;'><div><strong>Fees:</strong> "+feesPay+"</div><div><strong>Groceries:</strong> "+grocPay+"</div></td>" +
+      "<td style='padding:10px;border-top:1px solid #eee;font-weight:900;white-space:nowrap;'>" + st + "</td>" +
+      "<td style='padding:10px;border-top:1px solid #eee;'>" + actionBtns(order) + "</td>" +
+    "</tr>";
+  }
+
+  async function loadOrders(){
+    const runKey = runKeySel.value;
+    const status = statusSel.value;
+    const qs = new URLSearchParams();
+    if(runKey) qs.set("runKey", runKey);
+    if(status) qs.set("status", status);
+
+    const data = await j("/api/admin/orders?"+qs.toString());
+    const orders = data.orders || [];
+    ordersMeta.textContent = orders.length + " orders";
+    ordersBody.innerHTML = orders.map(row).join("");
+
+    ordersBody.querySelectorAll("button[data-st]").forEach(btn => {
+      btn.addEventListener("click", async () => {
+        const wrap = btn.closest("[data-oid]");
+        const oid = wrap.getAttribute("data-oid");
+        const st = btn.getAttribute("data-st");
+        await setStatus(oid, st);
+      });
+    });
+
+    ordersBody.querySelectorAll("button[data-pay]").forEach(btn => {
+      btn.addEventListener("click", async () => {
+        const wrap = btn.closest("[data-oid]");
+        const oid = wrap.getAttribute("data-oid");
+        const spec = btn.getAttribute("data-pay");
+        const parts = spec.split(":");
+        await setPaid(oid, parts[0], parts[1]);
+      });
+    });
+  }
+
+  async function loadUnmatched(){
+    const data = await j("/api/admin/unmatched-payments");
+    const items = data.items || [];
+    if(!items.length){
+      unmatchedBox.textContent = "None";
+      return;
+    }
+    unmatchedBox.innerHTML = items.slice(0,50).map(x => {
+      return "<div style='padding:10px;border-top:1px solid #eee;'>" +
+        "<div style='font-weight:900;'>"+esc(x.squarePaymentId || "payment")+"</div>" +
+        "<div style='color:#444;'>"+esc(x.squareEventType || "")+" • "+esc(x.reason || "")+"</div>" +
+        "<div style='color:#444;'>note: "+esc(x.note || "")+"</div>" +
+        "</div>";
+    }).join("");
+  }
+
+  async function refreshAll(){
+    await loadOrders();
+    await loadUnmatched();
+  }
+
+  document.getElementById("refreshBtn").addEventListener("click", refreshAll);
+  runKeySel.addEventListener("change", loadOrders);
+  statusSel.addEventListener("change", loadOrders);
+
+  (async function boot(){
+    await loadRuns();
+    await refreshAll();
+  })();
+</script>
+</body>
+</html>`);
+});
+
+// =========================
+// SQUARE WEBHOOK (auto mark paid)
 // =========================
 app.post("/webhooks/square", webhookLimiter, async (req, res) => {
   try {
@@ -1734,38 +1896,15 @@ app.post("/webhooks/square", webhookLimiter, async (req, res) => {
 
     const bucket = pickBucketByPaymentLinkId(paymentLinkId);
 
-    if (!paymentId) {
+    if (!paymentId || !orderId || !bucket) {
       await UnmatchedPayment.create({
         squareEventId: eventId,
         squareEventType: eventType,
-        note,
-        extractedOrderId: orderId,
-        reason: "No paymentId found",
-        raw: evt,
-      });
-      return res.status(200).send("ok");
-    }
-    if (!orderId) {
-      await UnmatchedPayment.create({
-        squareEventId: eventId,
-        squareEventType: eventType,
-        squarePaymentId: paymentId,
-        paymentLinkId,
-        note,
-        reason: "No TGR orderId in note",
-        raw: evt,
-      });
-      return res.status(200).send("ok");
-    }
-    if (!bucket) {
-      await UnmatchedPayment.create({
-        squareEventId: eventId,
-        squareEventType: eventType,
-        squarePaymentId: paymentId,
-        paymentLinkId,
-        note,
-        extractedOrderId: orderId,
-        reason: "Could not map paymentLinkId",
+        squarePaymentId: paymentId || "",
+        paymentLinkId: paymentLinkId || "",
+        note: note || "",
+        extractedOrderId: orderId || "",
+        reason: !paymentId ? "No paymentId" : !orderId ? "No TGR orderId in note" : "Could not map paymentLinkId",
         raw: evt,
       });
       return res.status(200).send("ok");
@@ -1808,12 +1947,8 @@ app.post("/webhooks/square", webhookLimiter, async (req, res) => {
 // =========================
 // POSTMARK WEBHOOK (ALL EVENTS)
 // =========================
-//
-// Postmark modular webhooks send different RecordType values (Delivered/Open/Click/Bounce/SpamComplaint/SubscriptionChange).
-// We protect this endpoint with Basic Auth (set username/password in Postmark webhook URL settings).
-//
 function basicAuthOk(req) {
-  if (!POSTMARK_WEBHOOK_USERNAME || !POSTMARK_WEBHOOK_PASSWORD) return true; // allow if not configured
+  if (!POSTMARK_WEBHOOK_USERNAME || !POSTMARK_WEBHOOK_PASSWORD) return true;
   const hdr = req.get("authorization") || "";
   if (!hdr.toLowerCase().startsWith("basic ")) return false;
   const b64 = hdr.slice(6).trim();
@@ -1838,7 +1973,6 @@ function makeEventKey({ recordType, messageId, recipient, occurredAt, tag }) {
     String(tag || "").toLowerCase(),
     occurredAt ? new Date(occurredAt).toISOString() : "",
   ].join("|");
-  // lightweight stable hash
   let h = 0;
   for (let i = 0; i < base.length; i++) h = (h * 31 + base.charCodeAt(i)) >>> 0;
   return "pm_" + h.toString(16);
@@ -1850,13 +1984,7 @@ async function upsertSuppression(email, reason, details) {
   await SuppressedEmail.updateOne(
     { email: e },
     {
-      $set: {
-        email: e,
-        provider: "postmark",
-        reason,
-        lastAt: new Date(),
-        lastDetails: String(details || ""),
-      },
+      $set: { email: e, provider: "postmark", reason, lastAt: new Date(), lastDetails: String(details || "") },
       $setOnInsert: { firstAt: new Date() },
     },
     { upsert: true }
@@ -1873,12 +2001,16 @@ app.post("/webhooks/postmark", webhookLimiter, async (req, res) => {
     const payload = req.body || {};
     const recordType = String(payload.RecordType || payload.record_type || "").trim();
 
-    // Normalize common fields across webhook types
     const messageId = String(payload.MessageID || payload.MessageId || payload.message_id || "").trim();
     const messageStream = String(payload.MessageStream || payload.MessageStreamID || payload.MessageStreamId || "").trim();
-    const recipient = String(payload.Recipient || payload.Recepient || payload.Email || payload.email || "").trim().toLowerCase();
+
+    const recipient = String(payload.Recipient || payload.Email || payload.email || "")
+      .trim()
+      .toLowerCase();
+
     const tag = String(payload.Tag || "").trim();
     const metadata = payload.Metadata || payload.metadata || {};
+
     const occurredAt =
       payload.DeliveredAt ||
       payload.ReceivedAt ||
@@ -1890,15 +2022,15 @@ app.post("/webhooks/postmark", webhookLimiter, async (req, res) => {
       new Date().toISOString();
 
     let details = "";
-    if (recordType.toLowerCase() === "delivered") details = String(payload.Details || payload.details || "");
-    if (recordType.toLowerCase() === "bounce") details = String(payload.Description || payload.Details || payload.details || "");
-    if (recordType.toLowerCase() === "spamcomplaint") details = String(payload.Description || payload.details || "");
-    if (recordType.toLowerCase() === "click") details = String(payload.OriginalLink || payload.Link || payload.Url || "");
-    if (recordType.toLowerCase() === "subscriptionchange") details = String(payload.SuppressionReason || payload.ChangeType || payload.Description || "");
+    const rt = recordType.toLowerCase();
+    if (rt === "delivered") details = String(payload.Details || payload.details || "");
+    if (rt === "bounce") details = String(payload.Description || payload.Details || payload.details || "");
+    if (rt === "spamcomplaint") details = String(payload.Description || payload.details || "");
+    if (rt === "click") details = String(payload.OriginalLink || payload.Link || payload.Url || "");
+    if (rt === "subscriptionchange") details = String(payload.SuppressionReason || payload.ChangeType || payload.Description || "");
 
     const eventKey = makeEventKey({ recordType, messageId, recipient, occurredAt, tag });
 
-    // Idempotent insert
     try {
       await EmailEvent.create({
         provider: "postmark",
@@ -1914,12 +2046,10 @@ app.post("/webhooks/postmark", webhookLimiter, async (req, res) => {
         raw: payload,
       });
     } catch (e) {
-      // Duplicate key = already processed
-      if (String(e?.code) === "11000") return res.status(200).send("ok");
+      if (String(e?.code) === "11000") return res.status(200).send("ok"); // duplicate
       throw e;
     }
 
-    // If we can link to an order, update the order email telemetry
     const orderIdFromMeta = metadata?.orderId ? String(metadata.orderId).trim().toUpperCase() : "";
     if (orderIdFromMeta) {
       await Order.updateOne(
@@ -1935,10 +2065,10 @@ app.post("/webhooks/postmark", webhookLimiter, async (req, res) => {
       );
     }
 
-    // Suppress logic:
-    // - SpamComplaint => suppress immediately
-    // - Bounce => suppress if "HardBounce" / "Hard bounce" / "Permanent" indicates hard
-    if (recordType.toLowerCase() === "spamcomplaint") {
+    // Suppression rules:
+    // - SpamComplaint: always suppress
+    // - Bounce: suppress if hard/permanent
+    if (rt === "spamcomplaint") {
       if (recipient) await upsertSuppression(recipient, "spam-complaint", details);
       if (orderIdFromMeta) {
         await Order.updateOne(
@@ -1948,7 +2078,7 @@ app.post("/webhooks/postmark", webhookLimiter, async (req, res) => {
       }
     }
 
-    if (recordType.toLowerCase() === "bounce") {
+    if (rt === "bounce") {
       const bounceType = String(payload.Type || payload.BounceType || "").toLowerCase();
       const isHard =
         bounceType.includes("hard") ||
@@ -1995,9 +2125,6 @@ main().catch((err) => {
   process.exit(1);
 });
 
-// =========================
-// FALLBACK ERROR HANDLER
-// =========================
 app.use((err, req, res, _next) => {
   console.error("Unhandled error rid=" + req.id, err);
   if (res.headersSent) return;
