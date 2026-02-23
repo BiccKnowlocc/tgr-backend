@@ -1,4 +1,22 @@
-// ======= server.js (FULL FILE) =======
+// ======= server.js (FULL FILE — Postmark + useful extras) =======
+//
+// Extras added:
+// - Security headers (helmet)
+// - Compression (compression)
+// - Rate limiting (express-rate-limit) + stricter on /auth and /webhooks
+// - Request logging (morgan) + request id
+// - Safer CORS allowlist handling
+// - Robust JSON/raw-body handling for Square webhooks
+// - Upload temp cleanup (best-effort) after order creation/failure
+// - Better error handler (JSON)
+// - Real Admin page UI (runs + orders + status + payments + unmatched)
+// - /favicon.ico handler (no noisy 404)
+// - /api/debug/profile-complete (quickly tells you why completion fails) (admin-only)
+//
+// Required installs:
+//   npm i postmark square helmet compression morgan express-rate-limit
+// Optional (recommended):
+//   npm i nanoid
 
 const express = require("express");
 const mongoose = require("mongoose");
@@ -6,6 +24,8 @@ const multer = require("multer");
 const cookieParser = require("cookie-parser");
 const session = require("express-session");
 const cors = require("cors");
+const fs = require("fs");
+const path = require("path");
 
 const MongoStorePkg = require("connect-mongo");
 const MongoStore = MongoStorePkg.default || MongoStorePkg;
@@ -13,13 +33,20 @@ const MongoStore = MongoStorePkg.default || MongoStorePkg;
 const passport = require("passport");
 const GoogleStrategy = require("passport-google-oauth20").Strategy;
 
-const { Client, Environment, WebhooksHelper } = require("square");
+const helmet = require("helmet");
+const compression = require("compression");
+const morgan = require("morgan");
+const rateLimit = require("express-rate-limit");
 
-let sendgrid = null;
+const { Client, Environment, WebhooksHelper } = require("square");
+const postmark = require("postmark");
+
+// Try nanoid; fallback to random string if not installed
+let nanoid = null;
 try {
-  sendgrid = require("@sendgrid/mail");
+  nanoid = require("nanoid").nanoid;
 } catch {
-  // ok if not installed yet
+  nanoid = null;
 }
 
 const User = require("./models/User");
@@ -42,6 +69,7 @@ const MONGODB_URI =
 
 const SESSION_SECRET = process.env.SESSION_SECRET || "dev-secret";
 const TZ = process.env.TZ || "America/Toronto";
+const NODE_ENV = process.env.NODE_ENV || "production";
 
 // Google OAuth
 const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID || "";
@@ -58,6 +86,8 @@ const ADMIN_EMAILS = String(process.env.ADMIN_EMAILS || "")
 const ALLOWED_ORIGINS = [
   "https://tobermorygroceryrun.ca",
   "https://www.tobermorygroceryrun.ca",
+  "http://localhost:8888",
+  "http://localhost:3000",
 ];
 
 // Square redirect links (customer-facing)
@@ -85,12 +115,55 @@ const SQUARE_ACCESS_TOKEN = process.env.SQUARE_ACCESS_TOKEN || "";
 const SQUARE_PAY_FEES_SLUG = process.env.SQUARE_PAY_FEES_SLUG || "r92W6XGs";
 const SQUARE_PAY_GROCERIES_SLUG = process.env.SQUARE_PAY_GROCERIES_SLUG || "R0hfr7x8";
 
-// Email (SendGrid)
-const SENDGRID_API_KEY = process.env.SENDGRID_API_KEY || "";
+// Email (Postmark)
+const POSTMARK_SERVER_TOKEN = process.env.POSTMARK_SERVER_TOKEN || "";
 const EMAIL_FROM = process.env.EMAIL_FROM || "orders@tobermorygroceryrun.ca";
 const EMAIL_REPLY_TO = process.env.EMAIL_REPLY_TO || EMAIL_FROM;
 const PUBLIC_SITE_URL = process.env.PUBLIC_SITE_URL || "https://tobermorygroceryrun.ca";
 
+// Uploads
+const UPLOAD_DIR = process.env.UPLOAD_DIR || "uploads";
+
+// =========================
+// UTIL: ids / helpers
+// =========================
+function makeReqId() {
+  if (nanoid) return nanoid(12);
+  return Math.random().toString(16).slice(2) + Date.now().toString(16);
+}
+
+function escapeHtml(s) {
+  return String(s || "")
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#039;");
+}
+
+function yn(v) {
+  return v === true || String(v || "").toLowerCase() === "yes";
+}
+
+function isAdminEmail(email) {
+  const e = String(email || "").toLowerCase().trim();
+  if (!e) return false;
+  if (!ADMIN_EMAILS.length) return true;
+  return ADMIN_EMAILS.includes(e);
+}
+
+function nowTz() {
+  return dayjs().tz(TZ);
+}
+
+function fmtLocal(d) {
+  if (!d) return "";
+  return dayjs(d).tz(TZ).format("ddd MMM D, h:mma");
+}
+
+// =========================
+// UTIL: Square client
+// =========================
 function squareClient() {
   return new Client({
     accessToken: SQUARE_ACCESS_TOKEN,
@@ -103,6 +176,59 @@ function squareClient() {
 // =========================
 const app = express();
 
+app.set("trust proxy", 1);
+
+// Request ID + attach early
+app.use((req, res, next) => {
+  req.id = req.get("x-request-id") || makeReqId();
+  res.setHeader("x-request-id", req.id);
+  next();
+});
+
+// Security headers
+app.use(
+  helmet({
+    // You’re serving HTML from backend for /admin and /member; keep defaults
+    contentSecurityPolicy: false,
+    crossOriginEmbedderPolicy: false,
+  })
+);
+
+// Compression
+app.use(compression());
+
+// Logging
+app.use(
+  morgan(
+    ":date[iso] :remote-addr :method :url :status :res[content-length] - :response-time ms rid=:req[x-request-id]",
+    { skip: () => NODE_ENV === "test" }
+  )
+);
+
+// Rate limiting (general)
+const generalLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 240, // per minute per IP
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+app.use(generalLimiter);
+
+// Tighter limiters
+const authLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 80,
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+const webhookLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 600, // webhooks can burst; keep higher
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+
+// CORS (allowlist)
 app.use(
   cors({
     origin: function (origin, cb) {
@@ -113,7 +239,7 @@ app.use(
   })
 );
 
-// Capture rawBody for Square signature validation
+// Raw body capture for Square signature validation
 app.use(
   express.json({
     limit: "5mb",
@@ -122,11 +248,10 @@ app.use(
     },
   })
 );
-
 app.use(express.urlencoded({ extended: true }));
 app.use(cookieParser());
-app.set("trust proxy", 1);
 
+// Sessions
 app.use(
   session({
     name: "tgr.sid",
@@ -147,6 +272,9 @@ app.use(
     },
   })
 );
+
+// Quiet favicon 404 spam
+app.get("/favicon.ico", (_req, res) => res.status(204).end());
 
 // =========================
 // PASSPORT (GOOGLE OAUTH)
@@ -210,13 +338,25 @@ app.use(passport.session());
 // =========================
 // UPLOADS
 // =========================
+if (!fs.existsSync(UPLOAD_DIR)) {
+  try {
+    fs.mkdirSync(UPLOAD_DIR, { recursive: true });
+  } catch {}
+}
+
 const upload = multer({
-  dest: "uploads/",
-  limits: { fileSize: 15 * 1024 * 1024 },
+  dest: UPLOAD_DIR,
+  limits: { fileSize: 15 * 1024 * 1024 }, // 15MB
 });
 
+// Best-effort cleanup of temp uploads (don’t let disk fill)
+function safeUnlink(filePath) {
+  if (!filePath) return;
+  fs.unlink(filePath, () => {});
+}
+
 // =========================
-// PRICING BASELINE (fee estimator)
+// PRICING BASELINE
 // =========================
 const PRICING = {
   serviceFee: 25,
@@ -371,8 +511,6 @@ const UnmatchedPaymentSchema = new mongoose.Schema(
     squareEventType: { type: String, default: "" },
     squarePaymentId: { type: String, default: "" },
     paymentLinkId: { type: String, default: "" },
-    amount: { type: Number, default: 0 },
-    currency: { type: String, default: "CAD" },
     note: { type: String, default: "" },
     extractedOrderId: { type: String, default: "" },
     reason: { type: String, default: "" },
@@ -400,26 +538,53 @@ const UnmatchedPayment = mongoose.model("UnmatchedPayment", UnmatchedPaymentSche
 const PaymentLinkCache = mongoose.model("PaymentLinkCache", PaymentLinkCacheSchema);
 
 // =========================
-// HELPERS
+// PROFILE COMPLETION LOGIC + DEBUG
 // =========================
-function escapeHtml(s) {
-  return String(s || "")
-    .replaceAll("&", "&amp;")
-    .replaceAll("<", "&lt;")
-    .replaceAll(">", "&gt;")
-    .replaceAll('"', "&quot;")
-    .replaceAll("'", "&#039;");
+function isProfileComplete(profile) {
+  const p = profile || {};
+  if (p.complete === true) return true;
+
+  const fullName = String(p.fullName || "").trim();
+  const phone = String(p.phone || "").trim();
+  const contactPref = String(p.contactPref || "").trim();
+  const contactAuth = p.contactAuth === true;
+
+  const addresses = Array.isArray(p.addresses) ? p.addresses : [];
+  const hasAddress = addresses.some((a) => {
+    const street = String(a.streetAddress || "").trim();
+    const town = String(a.town || "").trim();
+    const zone = String(a.zone || "").trim();
+    return !!street && !!town && !!zone;
+  });
+
+  const consentsOk = p.consentTerms === true && p.consentPrivacy === true;
+
+  return !!fullName && !!phone && !!contactPref && contactAuth && hasAddress && consentsOk;
 }
 
-function nowTz() {
-  return dayjs().tz(TZ);
+function profileMissingReasons(profile) {
+  const p = profile || {};
+  const reasons = [];
+  if (!String(p.fullName || "").trim()) reasons.push("missing fullName");
+  if (!String(p.phone || "").trim()) reasons.push("missing phone");
+  if (!String(p.contactPref || "").trim()) reasons.push("missing contactPref");
+  if (p.contactAuth !== true) reasons.push("contactAuth not true");
+  const addresses = Array.isArray(p.addresses) ? p.addresses : [];
+  const hasAddress = addresses.some((a) => {
+    const street = String(a.streetAddress || "").trim();
+    const town = String(a.town || "").trim();
+    const zone = String(a.zone || "").trim();
+    return !!street && !!town && !!zone;
+  });
+  if (!hasAddress) reasons.push("missing valid address (street/town/zone)");
+  if (p.consentTerms !== true) reasons.push("consentTerms not true");
+  if (p.consentPrivacy !== true) reasons.push("consentPrivacy not true");
+  return reasons;
 }
 
-function fmtLocal(d) {
-  if (!d) return "";
-  return dayjs(d).tz(TZ).format("ddd MMM D, h:mma");
-}
-
+// =========================
+// RUN CALENDAR
+// =========================
 function nextDow(targetDow, from) {
   let d = dayjs(from).tz(TZ);
   const current = d.day();
@@ -501,7 +666,11 @@ async function ensureUpcomingRuns() {
 }
 
 async function nextOrderId() {
-  const c = await Counter.findOneAndUpdate({ key: "orders" }, { $inc: { seq: 1 } }, { upsert: true, new: true }).lean();
+  const c = await Counter.findOneAndUpdate(
+    { key: "orders" },
+    { $inc: { seq: 1 } },
+    { upsert: true, new: true }
+  ).lean();
   return "TGR-" + String(c.seq).padStart(5, "0");
 }
 
@@ -578,56 +747,35 @@ function computeFeeBreakdown(input) {
   };
 }
 
-function isProfileComplete(profile) {
-  const p = profile || {};
-  if (p.complete === true) return true;
+// =========================
+// EMAIL (Postmark)
+// =========================
+let postmarkClient = null;
 
-  const fullName = String(p.fullName || "").trim();
-  const phone = String(p.phone || "").trim();
-  const contactPref = String(p.contactPref || "").trim();
-  const contactAuth = p.contactAuth === true;
+function canEmail() {
+  return !!(POSTMARK_SERVER_TOKEN && EMAIL_FROM);
+}
 
-  const addresses = Array.isArray(p.addresses) ? p.addresses : [];
-  const hasAddress = addresses.some((a) => {
-    const street = String(a.streetAddress || "").trim();
-    const town = String(a.town || "").trim();
-    const zone = String(a.zone || "").trim();
-    return !!street && !!town && !!zone;
+function initEmail() {
+  if (!POSTMARK_SERVER_TOKEN) return;
+  postmarkClient = new postmark.ServerClient(POSTMARK_SERVER_TOKEN);
+}
+
+async function sendEmail(to, subject, html) {
+  if (!canEmail() || !postmarkClient) return { ok: false, skipped: true };
+
+  await postmarkClient.sendEmail({
+    From: EMAIL_FROM,
+    To: to,
+    ReplyTo: EMAIL_REPLY_TO || undefined,
+    Subject: subject,
+    HtmlBody: html,
+    MessageStream: "outbound",
   });
 
-  const consentsOk = p.consentTerms === true && p.consentPrivacy === true;
-
-  return !!fullName && !!phone && !!contactPref && contactAuth && hasAddress && consentsOk;
-}
-
-function isAdminEmail(email) {
-  const e = String(email || "").toLowerCase().trim();
-  if (!e) return false;
-  if (!ADMIN_EMAILS.length) return true;
-  return ADMIN_EMAILS.includes(e);
-}
-
-// ✅ accepts boolean true OR "yes"
-function yn(v) {
-  return v === true || String(v || "").toLowerCase() === "yes";
-}
-
-// =========================
-// EMAIL (SendGrid)
-// =========================
-function canEmail() {
-  return !!(sendgrid && SENDGRID_API_KEY && EMAIL_FROM);
-}
-function initEmail() {
-  if (sendgrid && SENDGRID_API_KEY) {
-    sendgrid.setApiKey(SENDGRID_API_KEY);
-  }
-}
-async function sendEmail(to, subject, html) {
-  if (!canEmail()) return { ok: false, skipped: true };
-  await sendgrid.send({ to, from: EMAIL_FROM, replyTo: EMAIL_REPLY_TO, subject, html });
   return { ok: true };
 }
+
 function emailShell(title, bodyHtml) {
   return `
   <div style="font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;background:#0b0b0b;padding:18px;">
@@ -640,6 +788,7 @@ function emailShell(title, bodyHtml) {
     </div>
   </div>`;
 }
+
 function orderReceivedEmail(order) {
   const orderId = escapeHtml(order.orderId);
   const trackUrl = `${PUBLIC_SITE_URL}/?tab=status`;
@@ -656,6 +805,7 @@ function orderReceivedEmail(order) {
   `;
   return emailShell("Order received", body);
 }
+
 function outForDeliveryEmail(order) {
   const orderId = escapeHtml(order.orderId);
   const trackUrl = `${PUBLIC_SITE_URL}/?tab=status`;
@@ -667,6 +817,7 @@ function outForDeliveryEmail(order) {
   `;
   return emailShell("Out for delivery", body);
 }
+
 function deliveredEmail(order) {
   const orderId = escapeHtml(order.orderId);
   const body = `
@@ -714,7 +865,15 @@ async function refreshPaymentLinkIds() {
     paymentLinkState.fees.url = String(found.fees.url || "");
     await PaymentLinkCache.updateOne(
       { key: "fees" },
-      { $set: { key: "fees", slug: paymentLinkState.fees.slug, paymentLinkId: paymentLinkState.fees.paymentLinkId, paymentLinkUrl: paymentLinkState.fees.url, refreshedAt: new Date() } },
+      {
+        $set: {
+          key: "fees",
+          slug: paymentLinkState.fees.slug,
+          paymentLinkId: paymentLinkState.fees.paymentLinkId,
+          paymentLinkUrl: paymentLinkState.fees.url,
+          refreshedAt: new Date(),
+        },
+      },
       { upsert: true }
     );
   }
@@ -724,7 +883,15 @@ async function refreshPaymentLinkIds() {
     paymentLinkState.groceries.url = String(found.groceries.url || "");
     await PaymentLinkCache.updateOne(
       { key: "groceries" },
-      { $set: { key: "groceries", slug: paymentLinkState.groceries.slug, paymentLinkId: paymentLinkState.groceries.paymentLinkId, paymentLinkUrl: paymentLinkState.groceries.url, refreshedAt: new Date() } },
+      {
+        $set: {
+          key: "groceries",
+          slug: paymentLinkState.groceries.slug,
+          paymentLinkId: paymentLinkState.groceries.paymentLinkId,
+          paymentLinkUrl: paymentLinkState.groceries.url,
+          refreshedAt: new Date(),
+        },
+      },
       { upsert: true }
     );
   }
@@ -783,10 +950,7 @@ function tryExtractPaymentId(evt) {
 }
 
 function tryExtractNote(evt) {
-  const candidates = [
-    evt?.data?.object?.payment?.note,
-    evt?.data?.object?.order?.note,
-  ];
+  const candidates = [evt?.data?.object?.payment?.note, evt?.data?.object?.order?.note];
   for (const c of candidates) {
     const v = String(c || "").trim();
     if (v) return v;
@@ -833,7 +997,7 @@ function requireProfileComplete(req, res, next) {
 // =========================
 // AUTH ROUTES
 // =========================
-app.get("/auth/google", (req, res, next) => {
+app.get("/auth/google", authLimiter, (req, res, next) => {
   if (!GOOGLE_CLIENT_ID || !GOOGLE_CLIENT_SECRET || !GOOGLE_CALLBACK_URL) {
     return res.status(500).send("Google auth is not configured on this server.");
   }
@@ -843,6 +1007,7 @@ app.get("/auth/google", (req, res, next) => {
 
 app.get(
   "/auth/google/callback",
+  authLimiter,
   passport.authenticate("google", { failureRedirect: PUBLIC_SITE_URL + "/?login=failed" }),
   async (req, res) => {
     const rt = req.session.returnTo || (PUBLIC_SITE_URL + "/");
@@ -879,6 +1044,7 @@ app.get("/api/me", (req, res) => {
     membershipStatus: u?.membershipStatus || "inactive",
     renewalDate: u?.renewalDate || null,
     profileComplete: isProfileComplete(u?.profile || {}),
+    profileMissing: u?.profile ? profileMissingReasons(u.profile) : [],
     isAdmin: !!u?.email && isAdminEmail(u.email),
   });
 });
@@ -889,6 +1055,7 @@ app.get("/api/profile", requireLogin, async (req, res) => {
     ok: true,
     profile: u?.profile || {},
     profileComplete: isProfileComplete(u?.profile || {}),
+    profileMissing: u?.profile ? profileMissingReasons(u.profile) : [],
     email: u?.email || "",
     name: u?.name || "",
     photo: u?.photo || "",
@@ -909,7 +1076,6 @@ app.post("/api/profile", requireLogin, async (req, res) => {
     profile.altPhone = String(b.altPhone || "").trim();
     profile.contactPref = String(b.contactPref || "").trim();
 
-    // ✅ accept boolean true OR "yes"
     profile.contactAuth = yn(b.contactAuth);
 
     profile.subsDefault = String(b.subsDefault || "").trim();
@@ -929,11 +1095,7 @@ app.post("/api/profile", requireLogin, async (req, res) => {
     }));
 
     profile.defaultId = String(b.defaultId || "").trim();
-
-    // ✅ auto-default defaultId if missing
-    if (!profile.defaultId && profile.addresses.length) {
-      profile.defaultId = profile.addresses[0].id;
-    }
+    if (!profile.defaultId && profile.addresses.length) profile.defaultId = profile.addresses[0].id;
 
     profile.consentTerms = yn(b.consentTerms);
     profile.consentPrivacy = yn(b.consentPrivacy);
@@ -947,16 +1109,38 @@ app.post("/api/profile", requireLogin, async (req, res) => {
     u.profile = profile;
     await u.save();
 
-    res.json({ ok: true, profileComplete: profile.complete === true, profile: u.profile });
+    res.json({
+      ok: true,
+      profileComplete: profile.complete === true,
+      profileMissing: profileMissingReasons(profile),
+      profile: u.profile,
+    });
   } catch (e) {
     res.status(500).json({ ok: false, error: String(e) });
   }
 });
 
+// Admin-only debug endpoint (handy when diagnosing user account issues)
+app.get("/api/debug/profile-complete", requireLogin, requireAdmin, async (req, res) => {
+  const email = String(req.query.email || "").toLowerCase().trim();
+  if (!email) return res.status(400).json({ ok: false, error: "Provide ?email=" });
+  const u = await User.findOne({ email }).lean();
+  if (!u) return res.status(404).json({ ok: false, error: "User not found" });
+  res.json({
+    ok: true,
+    email,
+    profileComplete: isProfileComplete(u.profile || {}),
+    missing: profileMissingReasons(u.profile || {}),
+    profile: u.profile || {},
+  });
+});
+
 // =========================
 // HEALTH
 // =========================
-app.get("/health", (_req, res) => res.json({ ok: true }));
+app.get("/health", (_req, res) =>
+  res.json({ ok: true, rid: _req.id, now: new Date().toISOString(), uptime: process.uptime() })
+);
 
 // =========================
 // RUNS + ESTIMATOR
@@ -1007,7 +1191,7 @@ app.post("/api/estimator", (req, res) => {
 });
 
 // =========================
-// CHECKOUT LINKS (membership + pay)
+// CHECKOUT LINKS
 // =========================
 app.post("/api/memberships/checkout", (req, res) => {
   const tier = String(req.body?.tier || "").trim().toLowerCase();
@@ -1045,29 +1229,38 @@ app.get("/pay/fees", (_req, res) => {
 // ORDERS
 // =========================
 app.post("/api/orders", requireLogin, requireProfileComplete, upload.single("groceryFile"), async (req, res) => {
+  let uploadedPath = req.file?.path || "";
   try {
     const b = req.body || {};
     const user = await User.findById(req.user._id).lean();
     const profile = user?.profile || {};
 
     if (!yn(b.consent_terms) || !yn(b.consent_accuracy) || !yn(b.consent_dropoff)) {
+      safeUnlink(uploadedPath);
       return res.status(400).json({ ok: false, error: "All required consents must be accepted." });
     }
 
     const required = ["town","streetAddress","zone","runType","primaryStore","groceryList","dropoffPref","subsPref","contactPref"];
     for (const k of required) {
-      if (!String(b[k] || "").trim()) return res.status(400).json({ ok: false, error: "Missing required field: " + k });
+      if (!String(b[k] || "").trim()) {
+        safeUnlink(uploadedPath);
+        return res.status(400).json({ ok: false, error: "Missing required field: " + k });
+      }
     }
 
     const runs = await ensureUpcomingRuns();
     const runType = String(b.runType || "");
     const run = runs[runType];
-    if (!run) return res.status(400).json({ ok: false, error: "Invalid runType." });
+    if (!run) {
+      safeUnlink(uploadedPath);
+      return res.status(400).json({ ok: false, error: "Invalid runType." });
+    }
 
     const now = nowTz();
     const opensAt = dayjs(run.opensAt).tz(TZ);
     const cutoffAt = dayjs(run.cutoffAt).tz(TZ);
     if (!(now.isAfter(opensAt) && now.isBefore(cutoffAt))) {
+      safeUnlink(uploadedPath);
       return res.status(403).json({ ok: false, error: "Ordering is closed for this run." });
     }
 
@@ -1082,6 +1275,9 @@ app.post("/api/orders", requireLogin, requireProfileComplete, upload.single("gro
         size: req.file.size,
         path: req.file.path,
       };
+      // We keep the file on disk for now; you can later move this to S3/R2.
+      // If you want to auto-delete after X days, tell me and I’ll add a cleanup job.
+      uploadedPath = "";
     }
 
     const pricingSnapshot = computeFeeBreakdown({
@@ -1102,7 +1298,10 @@ app.post("/api/orders", requireLogin, requireProfileComplete, upload.single("gro
       { new: true }
     ).lean();
 
-    if (!runUpdate) return res.status(409).json({ ok: false, error: "This run is full." });
+    if (!runUpdate) {
+      safeUnlink(uploadedPath);
+      return res.status(409).json({ ok: false, error: "This run is full." });
+    }
 
     const created = await Order.create({
       orderId,
@@ -1136,19 +1335,23 @@ app.post("/api/orders", requireLogin, requireProfileComplete, upload.single("gro
       statusHistory: [{ state: "submitted", note: "", at: new Date(), by: "customer" }],
     });
 
+    // transactional email: order received
     try {
       if (created?.customer?.email) {
         await sendEmail(created.customer.email, `TGR Order Received: ${created.orderId}`, orderReceivedEmail(created));
       }
-    } catch {}
+    } catch (e) {
+      console.error("Email send failed:", String(e));
+    }
 
     res.json({ ok: true, orderId, runKey: run.runKey });
   } catch (e) {
+    safeUnlink(uploadedPath);
     res.status(500).json({ ok: false, error: String(e) });
   }
 });
 
-// Tracking endpoint (public by orderId)
+// Public tracking by orderId
 app.get("/api/orders/:orderId", async (req, res) => {
   try {
     const orderId = String(req.params.orderId || "").trim().toUpperCase();
@@ -1184,7 +1387,7 @@ app.get("/api/orders/:orderId", async (req, res) => {
   }
 });
 
-// Per-order payment launch (sets pending + returns url)
+// Per-order payment launch: sets pending, returns Square URL
 app.post("/api/orders/:orderId/pay/:kind", async (req, res) => {
   try {
     const orderId = String(req.params.orderId || "").trim().toUpperCase();
@@ -1208,7 +1411,7 @@ app.post("/api/orders/:orderId/pay/:kind", async (req, res) => {
 });
 
 // =========================
-// ADMIN API (minimal)
+// ADMIN API
 // =========================
 app.get("/api/admin/runs", requireLogin, requireAdmin, async (_req, res) => {
   const runs = await ensureUpcomingRuns();
@@ -1255,7 +1458,9 @@ app.patch("/api/admin/orders/:orderId/status", requireLogin, requireAdmin, async
           await sendEmail(order.customer.email, `TGR Delivered: ${order.orderId}`, deliveredEmail(order));
         }
       }
-    } catch {}
+    } catch (e) {
+      console.error("Email send failed:", String(e));
+    }
 
     res.json({ ok: true });
   } catch (e) {
@@ -1350,23 +1555,235 @@ app.get("/member", requireLogin, async (req, res) => {
 </body></html>`);
 });
 
+// Real Admin UI
 app.get("/admin", requireLogin, requireAdmin, async (req, res) => {
   res.setHeader("Content-Type", "text/html; charset=utf-8");
   res.send(`<!doctype html>
-<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>TGR Admin</title></head>
-<body style="font-family:system-ui,Segoe UI,Roboto,Arial,sans-serif;padding:18px;max-width:900px;margin:0 auto;">
-<h1 style="margin:0 0 8px;">Admin</h1>
-<div style="color:#444;margin-bottom:14px;">Signed in as <strong>${escapeHtml(String(req.user.email||""))}</strong></div>
-<div>Use admin API endpoints under <code>/api/admin/*</code>.</div>
-<div style="margin-top:14px;"><a href="/logout?returnTo=${encodeURIComponent(PUBLIC_SITE_URL + "/")}">Log out</a></div>
-</body></html>`);
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>TGR Admin</title>
+</head>
+<body style="font-family:system-ui,Segoe UI,Roboto,Arial,sans-serif;padding:18px;max-width:1200px;margin:0 auto;">
+  <h1 style="margin:0 0 8px;">Admin</h1>
+  <div style="color:#444;margin-bottom:14px;">Signed in as <strong>${escapeHtml(String(req.user.email||""))}</strong></div>
+
+  <div style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:14px;">
+    <a href="${PUBLIC_SITE_URL}/" style="padding:10px 12px;border:1px solid #ddd;border-radius:10px;text-decoration:none;color:#111;font-weight:800;">Back to site</a>
+    <a href="/logout?returnTo=${encodeURIComponent(PUBLIC_SITE_URL + "/")}" style="padding:10px 12px;border:1px solid #ddd;border-radius:10px;text-decoration:none;color:#111;font-weight:800;">Log out</a>
+  </div>
+
+  <div style="border:1px solid #ddd;border-radius:12px;padding:12px;">
+    <div style="display:flex;gap:12px;flex-wrap:wrap;align-items:flex-end;">
+      <div>
+        <label style="font-weight:800;">Run</label><br>
+        <select id="runKeySel" style="padding:10px;border-radius:10px;border:1px solid #ddd;min-width:280px;"></select>
+      </div>
+      <div>
+        <label style="font-weight:800;">Status filter</label><br>
+        <select id="statusSel" style="padding:10px;border-radius:10px;border:1px solid #ddd;min-width:220px;">
+          <option value="">All</option>
+          ${AllowedStates.map(s=>`<option value="${s}">${s}</option>`).join("")}
+        </select>
+      </div>
+      <button id="refreshBtn" style="padding:10px 12px;border-radius:10px;border:1px solid #111;background:#111;color:#fff;font-weight:900;cursor:pointer;">Refresh</button>
+    </div>
+  </div>
+
+  <h2 style="margin:16px 0 8px;">Orders</h2>
+  <div id="ordersMeta" style="color:#444;margin-bottom:8px;">Loading…</div>
+  <div style="overflow:auto;border:1px solid #ddd;border-radius:12px;">
+    <table style="width:100%;border-collapse:collapse;min-width:1100px;">
+      <thead>
+        <tr style="background:#f7f7f7;">
+          <th style="text-align:left;padding:10px;border-bottom:1px solid #ddd;">Order</th>
+          <th style="text-align:left;padding:10px;border-bottom:1px solid #ddd;">Run</th>
+          <th style="text-align:left;padding:10px;border-bottom:1px solid #ddd;">Town/Zone</th>
+          <th style="text-align:left;padding:10px;border-bottom:1px solid #ddd;">Store</th>
+          <th style="text-align:left;padding:10px;border-bottom:1px solid #ddd;">Fees</th>
+          <th style="text-align:left;padding:10px;border-bottom:1px solid #ddd;">Payments</th>
+          <th style="text-align:left;padding:10px;border-bottom:1px solid #ddd;">Status</th>
+          <th style="text-align:left;padding:10px;border-bottom:1px solid #ddd;">Actions</th>
+        </tr>
+      </thead>
+      <tbody id="ordersBody"></tbody>
+    </table>
+  </div>
+
+  <h2 style="margin:18px 0 8px;">Unmatched payments</h2>
+  <div id="unmatchedBox" style="border:1px solid #ddd;border-radius:12px;padding:12px;">Loading…</div>
+
+<script>
+  async function j(url, opts){
+    const r = await fetch(url, Object.assign({ credentials:"include" }, opts||{}));
+    const d = await r.json().catch(()=>({}));
+    if(!r.ok || d.ok === false) throw new Error(d.error || ("HTTP "+r.status));
+    return d;
+  }
+
+  const runKeySel = document.getElementById("runKeySel");
+  const statusSel = document.getElementById("statusSel");
+  const ordersBody = document.getElementById("ordersBody");
+  const ordersMeta = document.getElementById("ordersMeta");
+  const unmatchedBox = document.getElementById("unmatchedBox");
+
+  function esc(s){
+    return String(s||"").replaceAll("&","&amp;").replaceAll("<","&lt;").replaceAll(">","&gt;").replaceAll('"',"&quot;").replaceAll("'","&#039;");
+  }
+  function money(n){
+    const x = Math.round((Number(n||0)+Number.EPSILON)*100)/100;
+    return "$"+x.toFixed(2);
+  }
+
+  async function loadRuns(){
+    const data = await j("/api/admin/runs");
+    const runs = data.runs || {};
+    const options = [];
+    for(const k of ["local","owen"]){
+      const r = runs[k];
+      if(!r) continue;
+      options.push({ label: r.runKey + " ("+r.type+")", value: r.runKey });
+    }
+    runKeySel.innerHTML = options.map(o => "<option value='"+esc(o.value)+"'>"+esc(o.label)+"</option>").join("");
+  }
+
+  async function setStatus(orderId, state){
+    const note = prompt("Optional note for status change:", "");
+    await j("/api/admin/orders/"+encodeURIComponent(orderId)+"/status", {
+      method:"PATCH",
+      headers:{ "Content-Type":"application/json" },
+      body: JSON.stringify({ state, note: note || "" })
+    });
+    await refreshAll();
+  }
+
+  async function setPaid(orderId, kind, status){
+    const note = prompt("Optional note:", "");
+    await j("/api/admin/orders/"+encodeURIComponent(orderId)+"/payment", {
+      method:"PATCH",
+      headers:{ "Content-Type":"application/json" },
+      body: JSON.stringify({ kind, status, note: note || "" })
+    });
+    await refreshAll();
+  }
+
+  function actionBtns(order){
+    const id = order.orderId;
+
+    const statusButtons = ["confirmed","shopping","packed","out_for_delivery","delivered","issue","cancelled"]
+      .map(st => "<button data-st='"+st+"' style='padding:8px 10px;border-radius:10px;border:1px solid #ddd;background:#fff;font-weight:900;cursor:pointer;'>"+st+"</button>")
+      .join(" ");
+
+    const payButtons =
+      "<div style='margin-top:8px;display:flex;gap:8px;flex-wrap:wrap;'>" +
+      "<button data-pay='fees:paid' style='padding:8px 10px;border-radius:10px;border:1px solid #ddd;background:#fff;font-weight:900;cursor:pointer;'>Fees paid</button>" +
+      "<button data-pay='fees:unpaid' style='padding:8px 10px;border-radius:10px;border:1px solid #ddd;background:#fff;font-weight:900;cursor:pointer;'>Fees unpaid</button>" +
+      "<button data-pay='groceries:paid' style='padding:8px 10px;border-radius:10px;border:1px solid #ddd;background:#fff;font-weight:900;cursor:pointer;'>Groceries paid</button>" +
+      "<button data-pay='groceries:unpaid' style='padding:8px 10px;border-radius:10px;border:1px solid #ddd;background:#fff;font-weight:900;cursor:pointer;'>Groceries unpaid</button>" +
+      "</div>";
+
+    return "<div data-oid='"+esc(id)+"'>" +
+      "<div style='display:flex;gap:8px;flex-wrap:wrap;'>" + statusButtons + "</div>" +
+      payButtons +
+      "</div>";
+  }
+
+  function row(order){
+    const id = esc(order.orderId);
+    const runKey = esc(order.runKey || "—");
+    const town = esc(order.address?.town || "—");
+    const zone = esc(order.address?.zone || "—");
+    const store = esc(order.stores?.primary || "—");
+    const fees = money(order.pricingSnapshot?.totalFees || 0);
+
+    const feesPay = esc(order.payments?.fees?.status || "unpaid");
+    const grocPay = esc(order.payments?.groceries?.status || "unpaid");
+
+    const st = esc(order.status?.state || "submitted");
+
+    return "<tr>" +
+      "<td style='padding:10px;border-top:1px solid #eee;font-weight:1000;white-space:nowrap;'>" + id + "</td>" +
+      "<td style='padding:10px;border-top:1px solid #eee;white-space:nowrap;'>" + runKey + "</td>" +
+      "<td style='padding:10px;border-top:1px solid #eee;'>" + town + " / " + zone + "</td>" +
+      "<td style='padding:10px;border-top:1px solid #eee;'>" + store + "</td>" +
+      "<td style='padding:10px;border-top:1px solid #eee;font-weight:900;'>" + fees + "</td>" +
+      "<td style='padding:10px;border-top:1px solid #eee;'><div><strong>Fees:</strong> "+feesPay+"</div><div><strong>Groceries:</strong> "+grocPay+"</div></td>" +
+      "<td style='padding:10px;border-top:1px solid #eee;font-weight:900;white-space:nowrap;'>" + st + "</td>" +
+      "<td style='padding:10px;border-top:1px solid #eee;'>" + actionBtns(order) + "</td>" +
+    "</tr>";
+  }
+
+  async function loadOrders(){
+    const runKey = runKeySel.value;
+    const status = statusSel.value;
+    const qs = new URLSearchParams();
+    if(runKey) qs.set("runKey", runKey);
+    if(status) qs.set("status", status);
+
+    const data = await j("/api/admin/orders?"+qs.toString());
+    const orders = data.orders || [];
+    ordersMeta.textContent = orders.length + " orders";
+    ordersBody.innerHTML = orders.map(row).join("");
+
+    ordersBody.querySelectorAll("button[data-st]").forEach(btn => {
+      btn.addEventListener("click", async () => {
+        const wrap = btn.closest("[data-oid]");
+        const oid = wrap.getAttribute("data-oid");
+        const st = btn.getAttribute("data-st");
+        await setStatus(oid, st);
+      });
+    });
+
+    ordersBody.querySelectorAll("button[data-pay]").forEach(btn => {
+      btn.addEventListener("click", async () => {
+        const wrap = btn.closest("[data-oid]");
+        const oid = wrap.getAttribute("data-oid");
+        const spec = btn.getAttribute("data-pay");
+        const [kind, st] = spec.split(":");
+        await setPaid(oid, kind, st);
+      });
+    });
+  }
+
+  async function loadUnmatched(){
+    const data = await j("/api/admin/unmatched-payments");
+    const items = data.items || [];
+    if(!items.length){
+      unmatchedBox.textContent = "None 🎉";
+      return;
+    }
+    unmatchedBox.innerHTML = items.slice(0,50).map(x => {
+      return "<div style='padding:10px;border-top:1px solid #eee;'>" +
+        "<div style='font-weight:900;'>"+esc(x.squarePaymentId || "payment")+"</div>" +
+        "<div style='color:#444;'>"+esc(x.squareEventType || "")+" • "+esc(x.reason || "")+"</div>" +
+        "<div style='color:#444;'>note: "+esc(x.note || "")+"</div>" +
+        "</div>";
+    }).join("");
+  }
+
+  async function refreshAll(){
+    await loadOrders();
+    await loadUnmatched();
+  }
+
+  document.getElementById("refreshBtn").addEventListener("click", refreshAll);
+  runKeySel.addEventListener("change", loadOrders);
+  statusSel.addEventListener("change", loadOrders);
+
+  (async function boot(){
+    await loadRuns();
+    await refreshAll();
+  })();
+</script>
+</body>
+</html>`);
 });
 
 // =========================
 // SQUARE WEBHOOK (auto-mark paid by payment link)
 // =========================
-app.post("/webhooks/square", async (req, res) => {
+app.post("/webhooks/square", webhookLimiter, async (req, res) => {
   try {
     const signatureHeader = req.get("x-square-hmacsha256-signature") || "";
     const body = req.rawBody || "";
@@ -1410,21 +1827,54 @@ app.post("/webhooks/square", async (req, res) => {
     const bucket = pickBucketByPaymentLinkId(paymentLinkId);
 
     if (!paymentId) {
-      await UnmatchedPayment.create({ squareEventId: eventId, squareEventType: eventType, note, extractedOrderId: orderId, reason: "No paymentId found", raw: evt });
+      await UnmatchedPayment.create({
+        squareEventId: eventId,
+        squareEventType: eventType,
+        note,
+        extractedOrderId: orderId,
+        reason: "No paymentId found",
+        raw: evt,
+      });
       return res.status(200).send("ok");
     }
     if (!orderId) {
-      await UnmatchedPayment.create({ squareEventId: eventId, squareEventType: eventType, squarePaymentId: paymentId, paymentLinkId, note, reason: "No TGR orderId in note", raw: evt });
+      await UnmatchedPayment.create({
+        squareEventId: eventId,
+        squareEventType: eventType,
+        squarePaymentId: paymentId,
+        paymentLinkId,
+        note,
+        reason: "No TGR orderId in note",
+        raw: evt,
+      });
       return res.status(200).send("ok");
     }
     if (!bucket) {
-      await UnmatchedPayment.create({ squareEventId: eventId, squareEventType: eventType, squarePaymentId: paymentId, paymentLinkId, note, extractedOrderId: orderId, reason: "Could not map paymentLinkId", raw: evt });
+      await UnmatchedPayment.create({
+        squareEventId: eventId,
+        squareEventType: eventType,
+        squarePaymentId: paymentId,
+        paymentLinkId,
+        note,
+        extractedOrderId: orderId,
+        reason: "Could not map paymentLinkId",
+        raw: evt,
+      });
       return res.status(200).send("ok");
     }
 
     const order = await Order.findOne({ orderId });
     if (!order) {
-      await UnmatchedPayment.create({ squareEventId: eventId, squareEventType: eventType, squarePaymentId: paymentId, paymentLinkId, note, extractedOrderId: orderId, reason: "Order not found", raw: evt });
+      await UnmatchedPayment.create({
+        squareEventId: eventId,
+        squareEventType: eventType,
+        squarePaymentId: paymentId,
+        paymentLinkId,
+        note,
+        extractedOrderId: orderId,
+        reason: "Order not found",
+        raw: evt,
+      });
       return res.status(200).send("ok");
     }
 
@@ -1448,10 +1898,13 @@ app.post("/webhooks/square", async (req, res) => {
 });
 
 // =========================
-// ROOT + BOOT
+// ROOT
 // =========================
 app.get("/", (_req, res) => res.send("TGR backend up"));
 
+// =========================
+// BOOT
+// =========================
 async function main() {
   await mongoose.connect(MONGODB_URI);
   console.log("Connected to MongoDB");
@@ -1468,4 +1921,13 @@ async function main() {
 main().catch((err) => {
   console.error(err);
   process.exit(1);
+});
+
+// =========================
+// FALLBACK ERROR HANDLER
+// =========================
+app.use((err, req, res, _next) => {
+  console.error("Unhandled error rid=" + req.id, err);
+  if (res.headersSent) return;
+  res.status(500).json({ ok: false, error: "Internal server error", rid: req.id });
 });
