@@ -1,5 +1,5 @@
 // ======= server.js (FULL FILE) — TGR backend =======
-// Express + MongoDB + Google OAuth + Account Profile + Runs + Estimator + Orders + Admin UI
+// Express + MongoDB + Google OAuth + Account Profile (FIXED persistence for Mixed) + Runs + Estimator + Orders + Admin UI
 // Square: pay links + Square webhook (auto-mark fees/groceries paid by Payment Link ID)
 // Postmark: sending + Postmark webhooks (Delivered/Open/Click/Bounce/SpamComplaint/SubscriptionChange)
 //
@@ -19,7 +19,7 @@
 //
 // Postmark ENV:
 //   POSTMARK_SERVER_TOKEN
-//   POSTMARK_MESSAGE_STREAM=outbound   (your transactional stream id; outbound is the default)
+//   POSTMARK_MESSAGE_STREAM=outbound
 //   EMAIL_FROM=orders@tobermorygroceryrun.ca
 //   EMAIL_REPLY_TO=orders@tobermorygroceryrun.ca
 //   POSTMARK_WEBHOOK_USERNAME=...
@@ -40,10 +40,6 @@
 //
 // Admin ENV (optional):
 //   ADMIN_EMAILS=nickb@tobermorygroceryrun.ca,another@domain.com
-//
-// Notes:
-// - /webhooks/postmark is protected with Basic Auth if username/password are set.
-// - /admin is a real admin dashboard page (server-rendered) using /api/admin/* endpoints.
 
 const express = require("express");
 const mongoose = require("mongoose");
@@ -621,6 +617,7 @@ function profileMissingReasons(profile) {
   if (!String(p.phone || "").trim()) reasons.push("missing phone");
   if (!String(p.contactPref || "").trim()) reasons.push("missing contactPref");
   if (p.contactAuth !== true) reasons.push("contactAuth not true");
+
   const addresses = Array.isArray(p.addresses) ? p.addresses : [];
   const hasAddress = addresses.some((a) => {
     const street = String(a.streetAddress || "").trim();
@@ -629,6 +626,7 @@ function profileMissingReasons(profile) {
     return !!street && !!town && !!zone;
   });
   if (!hasAddress) reasons.push("missing valid address (street/town/zone)");
+
   if (p.consentTerms !== true) reasons.push("consentTerms not true");
   if (p.consentPrivacy !== true) reasons.push("consentPrivacy not true");
   return reasons;
@@ -1133,53 +1131,63 @@ app.get("/api/profile", requireLogin, async (req, res) => {
   });
 });
 
+/**
+ * IMPORTANT FIX:
+ * User.profile is Schema.Types.Mixed, so Mongoose may NOT persist nested mutations reliably.
+ * We replace the whole object and markModified("profile") before save.
+ */
 app.post("/api/profile", requireLogin, async (req, res) => {
   try {
     const b = req.body || {};
     const u = await User.findById(req.user._id);
     if (!u) return res.status(404).json({ ok: false, error: "User not found" });
 
-    const profile = (u.profile && typeof u.profile === "object") ? u.profile : { version: 1 };
+    const newProfile = {
+      version: 1,
 
-    profile.fullName = String(b.fullName || "").trim();
-    profile.preferredName = String(b.preferredName || "").trim();
-    profile.phone = String(b.phone || "").trim();
-    profile.altPhone = String(b.altPhone || "").trim();
-    profile.contactPref = String(b.contactPref || "").trim();
-    profile.contactAuth = yn(b.contactAuth);
+      fullName: String(b.fullName || "").trim(),
+      preferredName: String(b.preferredName || "").trim(),
 
-    const addresses = Array.isArray(b.addresses) ? b.addresses : [];
-    profile.addresses = addresses.map((a) => ({
-      id: String(a.id || "").trim() || String(Math.random()).slice(2),
-      label: String(a.label || "").trim(),
-      town: String(a.town || "").trim(),
-      zone: String(a.zone || "").trim(),
-      streetAddress: String(a.streetAddress || "").trim(),
-      unit: String(a.unit || "").trim(),
-      instructions: String(a.instructions || "").trim(),
-      gateCode: String(a.gateCode || "").trim(),
-    }));
+      phone: String(b.phone || "").trim(),
+      altPhone: String(b.altPhone || "").trim(),
 
-    profile.defaultId = String(b.defaultId || "").trim();
-    if (!profile.defaultId && profile.addresses.length) profile.defaultId = profile.addresses[0].id;
+      contactPref: String(b.contactPref || "").trim(),
+      contactAuth: yn(b.contactAuth),
 
-    profile.consentTerms = yn(b.consentTerms);
-    profile.consentPrivacy = yn(b.consentPrivacy);
-    profile.consentMarketing = yn(b.consentMarketing);
+      addresses: (Array.isArray(b.addresses) ? b.addresses : []).map((a) => ({
+        id: String(a.id || "").trim() || String(Math.random()).slice(2),
+        label: String(a.label || "").trim(),
+        town: String(a.town || "").trim(),
+        zone: String(a.zone || "").trim(),
+        streetAddress: String(a.streetAddress || "").trim(),
+        unit: String(a.unit || "").trim(),
+        instructions: String(a.instructions || "").trim(),
+        gateCode: String(a.gateCode || "").trim(),
+      })),
 
-    profile.complete = isProfileComplete(profile);
-    profile.completedAt = profile.complete
-      ? (profile.completedAt || new Date().toISOString())
-      : (profile.completedAt || null);
+      defaultId: String(b.defaultId || "").trim(),
 
-    u.profile = profile;
+      consentTerms: yn(b.consentTerms),
+      consentPrivacy: yn(b.consentPrivacy),
+      consentMarketing: yn(b.consentMarketing),
+    };
+
+    if (!newProfile.defaultId && newProfile.addresses.length) {
+      newProfile.defaultId = newProfile.addresses[0].id;
+    }
+
+    newProfile.complete = isProfileComplete(newProfile);
+    newProfile.completedAt = newProfile.complete ? new Date().toISOString() : null;
+
+    u.profile = newProfile;
+    u.markModified("profile");
     await u.save();
 
     res.json({
       ok: true,
-      profileComplete: profile.complete === true,
-      profileMissing: profileMissingReasons(profile),
-      profile: u.profile,
+      profileComplete: newProfile.complete === true,
+      profileMissing: profileMissingReasons(newProfile),
+      profile: newProfile,
     });
   } catch (e) {
     res.status(500).json({ ok: false, error: String(e) });
@@ -1542,7 +1550,8 @@ app.patch("/api/admin/orders/:orderId/payment", requireLogin, requireAdmin, asyn
     const kind = String(req.body?.kind || "").trim().toLowerCase();
     const status = String(req.body?.status || "").trim().toLowerCase();
     if (!["fees", "groceries"].includes(kind)) return res.status(400).json({ ok: false, error: "Invalid kind" });
-    if (!["unpaid", "pending", "paid"].includes(status)) return res.status(400).json({ ok: false, error: "Invalid status" });
+    if (!["unpaid", "pending", "paid"].includes(status))
+      return res.status(400).json({ ok: false, error: "Invalid status" });
 
     const order = await Order.findOne({ orderId });
     if (!order) return res.status(404).json({ ok: false, error: "Order not found" });
@@ -1576,26 +1585,6 @@ app.get("/api/admin/email-events", requireLogin, requireAdmin, async (req, res) 
 app.get("/api/admin/suppressions", requireLogin, requireAdmin, async (_req, res) => {
   const items = await SuppressedEmail.find({}).sort({ lastAt: -1 }).limit(500).lean();
   res.json({ ok: true, items });
-});
-
-app.post("/api/admin/suppressions", requireLogin, requireAdmin, async (req, res) => {
-  const email = String(req.body?.email || "").toLowerCase().trim();
-  const reason = String(req.body?.reason || "manual").trim();
-  if (!email) return res.status(400).json({ ok: false, error: "Missing email" });
-
-  await SuppressedEmail.updateOne(
-    { email },
-    { $set: { email, reason, provider: "postmark", lastAt: new Date() }, $setOnInsert: { firstAt: new Date() } },
-    { upsert: true }
-  );
-  res.json({ ok: true });
-});
-
-app.delete("/api/admin/suppressions", requireLogin, requireAdmin, async (req, res) => {
-  const email = String(req.query.email || "").toLowerCase().trim();
-  if (!email) return res.status(400).json({ ok: false, error: "Missing email" });
-  await SuppressedEmail.deleteOne({ email });
-  res.json({ ok: true });
 });
 
 // =========================
