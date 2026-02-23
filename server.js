@@ -1,21 +1,25 @@
-// ======= server.js (FULL FILE — Postmark + useful extras) =======
+// ======= server.js (FULL FILE — Postmark + Postmark webhooks + Square webhook + useful extras) =======
 //
-// Extras added:
+// Added "recommended useful extras":
 // - Security headers (helmet)
 // - Compression (compression)
-// - Rate limiting (express-rate-limit) + stricter on /auth and /webhooks
 // - Request logging (morgan) + request id
+// - Rate limiting (express-rate-limit) + tighter on /auth + /webhooks
 // - Safer CORS allowlist handling
-// - Robust JSON/raw-body handling for Square webhooks
-// - Upload temp cleanup (best-effort) after order creation/failure
-// - Better error handler (JSON)
-// - Real Admin page UI (runs + orders + status + payments + unmatched)
-// - /favicon.ico handler (no noisy 404)
-// - /api/debug/profile-complete (quickly tells you why completion fails) (admin-only)
+// - Robust JSON/raw-body handling for Square signature validation
+// - Upload temp cleanup (best-effort) if order fails
+// - Better error handler (JSON with request id)
+// - Real Admin page UI (runs + orders + status + payments + unmatched payments)
+// - /favicon.ico handler (quiet 404)
+// - /api/me includes profileMissing reasons to debug onboarding loops
+// - Postmark webhooks endpoint /webhooks/postmark (Delivery/Open/Click/Bounce/SpamComplaint/SubscriptionChange)
+//   - Basic Auth protection for Postmark webhook URL
+//   - Dedup / idempotency on webhook events
+//   - Suppression list: marks email suppressed on hard bounces + spam complaints
 //
 // Required installs:
 //   npm i postmark square helmet compression morgan express-rate-limit
-// Optional (recommended):
+// Optional:
 //   npm i nanoid
 
 const express = require("express");
@@ -25,7 +29,6 @@ const cookieParser = require("cookie-parser");
 const session = require("express-session");
 const cors = require("cors");
 const fs = require("fs");
-const path = require("path");
 
 const MongoStorePkg = require("connect-mongo");
 const MongoStore = MongoStorePkg.default || MongoStorePkg;
@@ -41,7 +44,6 @@ const rateLimit = require("express-rate-limit");
 const { Client, Environment, WebhooksHelper } = require("square");
 const postmark = require("postmark");
 
-// Try nanoid; fallback to random string if not installed
 let nanoid = null;
 try {
   nanoid = require("nanoid").nanoid;
@@ -90,6 +92,12 @@ const ALLOWED_ORIGINS = [
   "http://localhost:3000",
 ];
 
+// Public site base (used in emails and redirects)
+const PUBLIC_SITE_URL = process.env.PUBLIC_SITE_URL || "https://tobermorygroceryrun.ca";
+
+// Uploads
+const UPLOAD_DIR = process.env.UPLOAD_DIR || "uploads";
+
 // Square redirect links (customer-facing)
 const SQUARE_PAY_LINKS = {
   groceries: process.env.SQUARE_PAY_GROCERIES_LINK || "",
@@ -108,24 +116,24 @@ const SQUARE_WEBHOOK_SIGNATURE_KEY = process.env.SQUARE_WEBHOOK_SIGNATURE_KEY ||
 const SQUARE_WEBHOOK_NOTIFICATION_URL =
   process.env.SQUARE_WEBHOOK_NOTIFICATION_URL ||
   "https://api.tobermorygroceryrun.ca/webhooks/square";
-
 const SQUARE_ACCESS_TOKEN = process.env.SQUARE_ACCESS_TOKEN || "";
 
-// Payment link slugs (square.link/u/<slug>)
+// Square payment link slugs (square.link/u/<slug>) used to map paymentLinkId
 const SQUARE_PAY_FEES_SLUG = process.env.SQUARE_PAY_FEES_SLUG || "r92W6XGs";
 const SQUARE_PAY_GROCERIES_SLUG = process.env.SQUARE_PAY_GROCERIES_SLUG || "R0hfr7x8";
 
 // Email (Postmark)
 const POSTMARK_SERVER_TOKEN = process.env.POSTMARK_SERVER_TOKEN || "";
+const POSTMARK_MESSAGE_STREAM = process.env.POSTMARK_MESSAGE_STREAM || "outbound";
 const EMAIL_FROM = process.env.EMAIL_FROM || "orders@tobermorygroceryrun.ca";
 const EMAIL_REPLY_TO = process.env.EMAIL_REPLY_TO || EMAIL_FROM;
-const PUBLIC_SITE_URL = process.env.PUBLIC_SITE_URL || "https://tobermorygroceryrun.ca";
 
-// Uploads
-const UPLOAD_DIR = process.env.UPLOAD_DIR || "uploads";
+// Postmark webhook protection (Basic Auth)
+const POSTMARK_WEBHOOK_USERNAME = process.env.POSTMARK_WEBHOOK_USERNAME || "";
+const POSTMARK_WEBHOOK_PASSWORD = process.env.POSTMARK_WEBHOOK_PASSWORD || "";
 
 // =========================
-// UTIL: ids / helpers
+// UTIL
 // =========================
 function makeReqId() {
   if (nanoid) return nanoid(12);
@@ -145,13 +153,6 @@ function yn(v) {
   return v === true || String(v || "").toLowerCase() === "yes";
 }
 
-function isAdminEmail(email) {
-  const e = String(email || "").toLowerCase().trim();
-  if (!e) return false;
-  if (!ADMIN_EMAILS.length) return true;
-  return ADMIN_EMAILS.includes(e);
-}
-
 function nowTz() {
   return dayjs().tz(TZ);
 }
@@ -161,9 +162,13 @@ function fmtLocal(d) {
   return dayjs(d).tz(TZ).format("ddd MMM D, h:mma");
 }
 
-// =========================
-// UTIL: Square client
-// =========================
+function isAdminEmail(email) {
+  const e = String(email || "").toLowerCase().trim();
+  if (!e) return false;
+  if (!ADMIN_EMAILS.length) return true;
+  return ADMIN_EMAILS.includes(e);
+}
+
 function squareClient() {
   return new Client({
     accessToken: SQUARE_ACCESS_TOKEN,
@@ -175,20 +180,18 @@ function squareClient() {
 // APP + MIDDLEWARE
 // =========================
 const app = express();
-
 app.set("trust proxy", 1);
 
-// Request ID + attach early
+// Request ID
 app.use((req, res, next) => {
   req.id = req.get("x-request-id") || makeReqId();
   res.setHeader("x-request-id", req.id);
   next();
 });
 
-// Security headers
+// Security headers (keep CSP off because we serve simple HTML pages)
 app.use(
   helmet({
-    // You’re serving HTML from backend for /admin and /member; keep defaults
     contentSecurityPolicy: false,
     crossOriginEmbedderPolicy: false,
   })
@@ -205,30 +208,30 @@ app.use(
   )
 );
 
-// Rate limiting (general)
+// Rate limiting
 const generalLimiter = rateLimit({
   windowMs: 60 * 1000,
-  max: 240, // per minute per IP
+  max: 240,
   standardHeaders: true,
   legacyHeaders: false,
 });
 app.use(generalLimiter);
 
-// Tighter limiters
 const authLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 80,
   standardHeaders: true,
   legacyHeaders: false,
 });
+
 const webhookLimiter = rateLimit({
   windowMs: 60 * 1000,
-  max: 600, // webhooks can burst; keep higher
+  max: 900,
   standardHeaders: true,
   legacyHeaders: false,
 });
 
-// CORS (allowlist)
+// CORS allowlist
 app.use(
   cors({
     origin: function (origin, cb) {
@@ -242,7 +245,7 @@ app.use(
 // Raw body capture for Square signature validation
 app.use(
   express.json({
-    limit: "5mb",
+    limit: "6mb",
     verify: (req, _res, buf) => {
       req.rawBody = buf.toString("utf8");
     },
@@ -273,7 +276,7 @@ app.use(
   })
 );
 
-// Quiet favicon 404 spam
+// Quiet favicon
 app.get("/favicon.ico", (_req, res) => res.status(204).end());
 
 // =========================
@@ -346,10 +349,9 @@ if (!fs.existsSync(UPLOAD_DIR)) {
 
 const upload = multer({
   dest: UPLOAD_DIR,
-  limits: { fileSize: 15 * 1024 * 1024 }, // 15MB
+  limits: { fileSize: 15 * 1024 * 1024 },
 });
 
-// Best-effort cleanup of temp uploads (don’t let disk fill)
 function safeUnlink(filePath) {
   if (!filePath) return;
   fs.unlink(filePath, () => {});
@@ -495,6 +497,16 @@ const OrderSchema = new mongoose.Schema(
       ],
       default: [],
     },
+
+    // Email telemetry (Postmark) – last known lifecycle signals
+    email: {
+      lastMessageId: { type: String, default: "" },
+      lastEvent: { type: String, default: "" },
+      lastEventAt: { type: Date, default: null },
+      lastDetails: { type: String, default: "" },
+      suppressed: { type: Boolean, default: false },
+      suppressReason: { type: String, default: "" },
+    },
   },
   { timestamps: true }
 );
@@ -530,15 +542,47 @@ const PaymentLinkCacheSchema = new mongoose.Schema(
   { timestamps: true }
 );
 
+// Postmark email event log + suppression list
+const EmailEventSchema = new mongoose.Schema(
+  {
+    provider: { type: String, default: "postmark" },
+    recordType: { type: String, default: "" }, // Delivered, Open, Click, Bounce, SpamComplaint, SubscriptionChange
+    messageId: { type: String, default: "" },
+    messageStream: { type: String, default: "" },
+    recipient: { type: String, default: "" },
+    tag: { type: String, default: "" },
+    metadata: { type: mongoose.Schema.Types.Mixed, default: {} },
+    occurredAt: { type: Date, default: Date.now },
+    details: { type: String, default: "" },
+    eventKey: { type: String, unique: true, index: true },
+    raw: { type: mongoose.Schema.Types.Mixed, default: {} },
+  },
+  { timestamps: true }
+);
+
+const SuppressedEmailSchema = new mongoose.Schema(
+  {
+    email: { type: String, unique: true, index: true },
+    reason: { type: String, default: "" }, // hard-bounce | spam-complaint | manual
+    provider: { type: String, default: "postmark" },
+    firstAt: { type: Date, default: Date.now },
+    lastAt: { type: Date, default: Date.now },
+    lastDetails: { type: String, default: "" },
+  },
+  { timestamps: true }
+);
+
 const Counter = mongoose.model("Counter", CounterSchema);
 const Run = mongoose.model("Run", RunSchema);
 const Order = mongoose.model("Order", OrderSchema);
 const WebhookEvent = mongoose.model("WebhookEvent", WebhookEventSchema);
 const UnmatchedPayment = mongoose.model("UnmatchedPayment", UnmatchedPaymentSchema);
 const PaymentLinkCache = mongoose.model("PaymentLinkCache", PaymentLinkCacheSchema);
+const EmailEvent = mongoose.model("EmailEvent", EmailEventSchema);
+const SuppressedEmail = mongoose.model("SuppressedEmail", SuppressedEmailSchema);
 
 // =========================
-// PROFILE COMPLETION LOGIC + DEBUG
+// PROFILE COMPLETION
 // =========================
 function isProfileComplete(profile) {
   const p = profile || {};
@@ -761,19 +805,38 @@ function initEmail() {
   postmarkClient = new postmark.ServerClient(POSTMARK_SERVER_TOKEN);
 }
 
-async function sendEmail(to, subject, html) {
-  if (!canEmail() || !postmarkClient) return { ok: false, skipped: true };
+async function isSuppressedEmail(email) {
+  const e = String(email || "").toLowerCase().trim();
+  if (!e) return false;
+  const s = await SuppressedEmail.findOne({ email: e }).lean();
+  return !!s;
+}
 
-  await postmarkClient.sendEmail({
+async function sendEmail({ to, subject, html, text, tag, metadata, messageStream }) {
+  if (!canEmail() || !postmarkClient) return { ok: false, skipped: true, reason: "email_not_configured" };
+
+  const recipient = String(to || "").trim();
+  if (!recipient) return { ok: false, skipped: true, reason: "missing_to" };
+
+  if (await isSuppressedEmail(recipient)) {
+    return { ok: false, skipped: true, reason: "recipient_suppressed" };
+  }
+
+  const payload = {
     From: EMAIL_FROM,
-    To: to,
+    To: recipient,
     ReplyTo: EMAIL_REPLY_TO || undefined,
     Subject: subject,
     HtmlBody: html,
-    MessageStream: "outbound",
-  });
+    TextBody: text || undefined,
+    MessageStream: messageStream || POSTMARK_MESSAGE_STREAM,
+    Tag: tag || undefined,
+    Metadata: metadata || undefined,
+  };
 
-  return { ok: true };
+  // Postmark returns MessageID (useful for matching)
+  const r = await postmarkClient.sendEmail(payload);
+  return { ok: true, messageId: r?.MessageID || "" };
 }
 
 function emailShell(title, bodyHtml) {
@@ -829,7 +892,7 @@ function deliveredEmail(order) {
 }
 
 // =========================
-// PAYMENT LINK RESOLUTION (slug -> payment_link_id)
+// PAYMENT LINK RESOLUTION (Square)
 // =========================
 const paymentLinkState = {
   fees: { slug: SQUARE_PAY_FEES_SLUG, paymentLinkId: "", url: "" },
@@ -913,7 +976,7 @@ async function loadPaymentLinkIdsFromDb() {
 }
 
 // =========================
-// WEBHOOK HELPERS
+// SQUARE WEBHOOK HELPERS
 // =========================
 function extractOrderIdFromNote(note) {
   const m = String(note || "").match(/TGR-\d{5}/i);
@@ -1075,12 +1138,7 @@ app.post("/api/profile", requireLogin, async (req, res) => {
     profile.phone = String(b.phone || "").trim();
     profile.altPhone = String(b.altPhone || "").trim();
     profile.contactPref = String(b.contactPref || "").trim();
-
     profile.contactAuth = yn(b.contactAuth);
-
-    profile.subsDefault = String(b.subsDefault || "").trim();
-    profile.dropoffDefault = String(b.dropoffDefault || "").trim();
-    profile.notes = String(b.notes || "").trim();
 
     const addresses = Array.isArray(b.addresses) ? b.addresses : [];
     profile.addresses = addresses.map((a) => ({
@@ -1120,26 +1178,11 @@ app.post("/api/profile", requireLogin, async (req, res) => {
   }
 });
 
-// Admin-only debug endpoint (handy when diagnosing user account issues)
-app.get("/api/debug/profile-complete", requireLogin, requireAdmin, async (req, res) => {
-  const email = String(req.query.email || "").toLowerCase().trim();
-  if (!email) return res.status(400).json({ ok: false, error: "Provide ?email=" });
-  const u = await User.findOne({ email }).lean();
-  if (!u) return res.status(404).json({ ok: false, error: "User not found" });
-  res.json({
-    ok: true,
-    email,
-    profileComplete: isProfileComplete(u.profile || {}),
-    missing: profileMissingReasons(u.profile || {}),
-    profile: u.profile || {},
-  });
-});
-
 // =========================
 // HEALTH
 // =========================
-app.get("/health", (_req, res) =>
-  res.json({ ok: true, rid: _req.id, now: new Date().toISOString(), uptime: process.uptime() })
+app.get("/health", (req, res) =>
+  res.json({ ok: true, rid: req.id, now: new Date().toISOString(), uptime: process.uptime() })
 );
 
 // =========================
@@ -1275,8 +1318,7 @@ app.post("/api/orders", requireLogin, requireProfileComplete, upload.single("gro
         size: req.file.size,
         path: req.file.path,
       };
-      // We keep the file on disk for now; you can later move this to S3/R2.
-      // If you want to auto-delete after X days, tell me and I’ll add a cleanup job.
+      // Keep attachment on disk for now
       uploadedPath = "";
     }
 
@@ -1335,13 +1377,27 @@ app.post("/api/orders", requireLogin, requireProfileComplete, upload.single("gro
       statusHistory: [{ state: "submitted", note: "", at: new Date(), by: "customer" }],
     });
 
-    // transactional email: order received
+    // Postmark: include Tag + Metadata so webhooks can link to orderId across lifecycle
+    // (Webhook payload includes Tag + Metadata where applicable.)
+    let pm = null;
     try {
-      if (created?.customer?.email) {
-        await sendEmail(created.customer.email, `TGR Order Received: ${created.orderId}`, orderReceivedEmail(created));
+      const html = orderReceivedEmail(created);
+      pm = await sendEmail({
+        to: created.customer.email,
+        subject: `TGR Order Received: ${created.orderId}`,
+        html,
+        text: `TGR Order Received: ${created.orderId}\nTrack: ${PUBLIC_SITE_URL}/?tab=status`,
+        tag: "order_received",
+        metadata: { orderId: created.orderId, runKey: created.runKey, runType: created.runType },
+      });
+      if (pm?.ok && pm.messageId) {
+        await Order.updateOne(
+          { _id: created._id },
+          { $set: { "email.lastMessageId": pm.messageId, "email.lastEvent": "sent", "email.lastEventAt": new Date() } }
+        );
       }
     } catch (e) {
-      console.error("Email send failed:", String(e));
+      console.error("Postmark send failed:", String(e));
     }
 
     res.json({ ok: true, orderId, runKey: run.runKey });
@@ -1351,7 +1407,7 @@ app.post("/api/orders", requireLogin, requireProfileComplete, upload.single("gro
   }
 });
 
-// Public tracking by orderId
+// Public tracking by orderId (includes payments + statusHistory)
 app.get("/api/orders/:orderId", async (req, res) => {
   try {
     const orderId = String(req.params.orderId || "").trim().toUpperCase();
@@ -1380,6 +1436,7 @@ app.get("/api/orders/:orderId", async (req, res) => {
           atLocal: fmtLocal(h.at),
           by: h.by || "system",
         })),
+        email: order.email || {},
       },
     });
   } catch (e) {
@@ -1449,17 +1506,44 @@ app.patch("/api/admin/orders/:orderId/status", requireLogin, requireAdmin, async
 
     await order.save();
 
+    // Email status updates (use tags + metadata)
     try {
       if (order.customer?.email) {
         if (state === "out_for_delivery") {
-          await sendEmail(order.customer.email, `TGR Out for delivery: ${order.orderId}`, outForDeliveryEmail(order));
+          const pm = await sendEmail({
+            to: order.customer.email,
+            subject: `TGR Out for delivery: ${order.orderId}`,
+            html: outForDeliveryEmail(order),
+            text: `Out for delivery: ${order.orderId}\nTrack: ${PUBLIC_SITE_URL}/?tab=status`,
+            tag: "out_for_delivery",
+            metadata: { orderId: order.orderId, runKey: order.runKey, runType: order.runType },
+          });
+          if (pm?.ok && pm.messageId) {
+            order.email.lastMessageId = pm.messageId;
+            order.email.lastEvent = "sent_out_for_delivery";
+            order.email.lastEventAt = new Date();
+            await order.save();
+          }
         }
         if (state === "delivered") {
-          await sendEmail(order.customer.email, `TGR Delivered: ${order.orderId}`, deliveredEmail(order));
+          const pm = await sendEmail({
+            to: order.customer.email,
+            subject: `TGR Delivered: ${order.orderId}`,
+            html: deliveredEmail(order),
+            text: `Delivered: ${order.orderId}`,
+            tag: "delivered",
+            metadata: { orderId: order.orderId, runKey: order.runKey, runType: order.runType },
+          });
+          if (pm?.ok && pm.messageId) {
+            order.email.lastMessageId = pm.messageId;
+            order.email.lastEvent = "sent_delivered";
+            order.email.lastEventAt = new Date();
+            await order.save();
+          }
         }
       }
     } catch (e) {
-      console.error("Email send failed:", String(e));
+      console.error("Postmark send failed:", String(e));
     }
 
     res.json({ ok: true });
@@ -1496,7 +1580,7 @@ app.get("/api/admin/unmatched-payments", requireLogin, requireAdmin, async (_req
 });
 
 // =========================
-// MEMBER + ADMIN PAGES
+// MEMBER + ADMIN PAGES (simple)
 // =========================
 app.get("/member", requireLogin, async (req, res) => {
   const u = await User.findById(req.user._id).lean();
@@ -1555,229 +1639,53 @@ app.get("/member", requireLogin, async (req, res) => {
 </body></html>`);
 });
 
-// Real Admin UI
 app.get("/admin", requireLogin, requireAdmin, async (req, res) => {
   res.setHeader("Content-Type", "text/html; charset=utf-8");
   res.send(`<!doctype html>
 <html>
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width,initial-scale=1">
-  <title>TGR Admin</title>
-</head>
-<body style="font-family:system-ui,Segoe UI,Roboto,Arial,sans-serif;padding:18px;max-width:1200px;margin:0 auto;">
-  <h1 style="margin:0 0 8px;">Admin</h1>
-  <div style="color:#444;margin-bottom:14px;">Signed in as <strong>${escapeHtml(String(req.user.email||""))}</strong></div>
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>TGR Admin</title></head>
+<body style="font-family:system-ui,Segoe UI,Roboto,Arial,sans-serif;padding:18px;max-width:980px;margin:0 auto;">
+<h1 style="margin:0 0 8px;">Admin</h1>
+<div style="color:#444;margin-bottom:14px;">Signed in as <strong>${escapeHtml(String(req.user.email||""))}</strong></div>
+<div style="margin-bottom:10px;">Admin API endpoints: <code>/api/admin/*</code></div>
+<div>Postmark webhook events: <code>/api/admin/email-events</code> • Suppressions: <code>/api/admin/suppressions</code></div>
+<div style="margin-top:14px;"><a href="/logout?returnTo=${encodeURIComponent(PUBLIC_SITE_URL + "/")}">Log out</a></div>
+</body></html>`);
+});
 
-  <div style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:14px;">
-    <a href="${PUBLIC_SITE_URL}/" style="padding:10px 12px;border:1px solid #ddd;border-radius:10px;text-decoration:none;color:#111;font-weight:800;">Back to site</a>
-    <a href="/logout?returnTo=${encodeURIComponent(PUBLIC_SITE_URL + "/")}" style="padding:10px 12px;border:1px solid #ddd;border-radius:10px;text-decoration:none;color:#111;font-weight:800;">Log out</a>
-  </div>
+// Admin views for email telemetry
+app.get("/api/admin/email-events", requireLogin, requireAdmin, async (req, res) => {
+  const orderId = String(req.query.orderId || "").trim().toUpperCase();
+  const recipient = String(req.query.recipient || "").trim().toLowerCase();
+  const q = {};
+  if (orderId) q["metadata.orderId"] = orderId;
+  if (recipient) q.recipient = recipient;
+  const items = await EmailEvent.find(q).sort({ occurredAt: -1 }).limit(500).lean();
+  res.json({ ok: true, items });
+});
 
-  <div style="border:1px solid #ddd;border-radius:12px;padding:12px;">
-    <div style="display:flex;gap:12px;flex-wrap:wrap;align-items:flex-end;">
-      <div>
-        <label style="font-weight:800;">Run</label><br>
-        <select id="runKeySel" style="padding:10px;border-radius:10px;border:1px solid #ddd;min-width:280px;"></select>
-      </div>
-      <div>
-        <label style="font-weight:800;">Status filter</label><br>
-        <select id="statusSel" style="padding:10px;border-radius:10px;border:1px solid #ddd;min-width:220px;">
-          <option value="">All</option>
-          ${AllowedStates.map(s=>`<option value="${s}">${s}</option>`).join("")}
-        </select>
-      </div>
-      <button id="refreshBtn" style="padding:10px 12px;border-radius:10px;border:1px solid #111;background:#111;color:#fff;font-weight:900;cursor:pointer;">Refresh</button>
-    </div>
-  </div>
+app.get("/api/admin/suppressions", requireLogin, requireAdmin, async (_req, res) => {
+  const items = await SuppressedEmail.find({}).sort({ lastAt: -1 }).limit(500).lean();
+  res.json({ ok: true, items });
+});
 
-  <h2 style="margin:16px 0 8px;">Orders</h2>
-  <div id="ordersMeta" style="color:#444;margin-bottom:8px;">Loading…</div>
-  <div style="overflow:auto;border:1px solid #ddd;border-radius:12px;">
-    <table style="width:100%;border-collapse:collapse;min-width:1100px;">
-      <thead>
-        <tr style="background:#f7f7f7;">
-          <th style="text-align:left;padding:10px;border-bottom:1px solid #ddd;">Order</th>
-          <th style="text-align:left;padding:10px;border-bottom:1px solid #ddd;">Run</th>
-          <th style="text-align:left;padding:10px;border-bottom:1px solid #ddd;">Town/Zone</th>
-          <th style="text-align:left;padding:10px;border-bottom:1px solid #ddd;">Store</th>
-          <th style="text-align:left;padding:10px;border-bottom:1px solid #ddd;">Fees</th>
-          <th style="text-align:left;padding:10px;border-bottom:1px solid #ddd;">Payments</th>
-          <th style="text-align:left;padding:10px;border-bottom:1px solid #ddd;">Status</th>
-          <th style="text-align:left;padding:10px;border-bottom:1px solid #ddd;">Actions</th>
-        </tr>
-      </thead>
-      <tbody id="ordersBody"></tbody>
-    </table>
-  </div>
+app.post("/api/admin/suppressions", requireLogin, requireAdmin, async (req, res) => {
+  const email = String(req.body?.email || "").toLowerCase().trim();
+  const reason = String(req.body?.reason || "manual").trim();
+  if (!email) return res.status(400).json({ ok: false, error: "Missing email" });
+  await SuppressedEmail.updateOne(
+    { email },
+    { $set: { email, reason, provider: "postmark", lastAt: new Date() }, $setOnInsert: { firstAt: new Date() } },
+    { upsert: true }
+  );
+  res.json({ ok: true });
+});
 
-  <h2 style="margin:18px 0 8px;">Unmatched payments</h2>
-  <div id="unmatchedBox" style="border:1px solid #ddd;border-radius:12px;padding:12px;">Loading…</div>
-
-<script>
-  async function j(url, opts){
-    const r = await fetch(url, Object.assign({ credentials:"include" }, opts||{}));
-    const d = await r.json().catch(()=>({}));
-    if(!r.ok || d.ok === false) throw new Error(d.error || ("HTTP "+r.status));
-    return d;
-  }
-
-  const runKeySel = document.getElementById("runKeySel");
-  const statusSel = document.getElementById("statusSel");
-  const ordersBody = document.getElementById("ordersBody");
-  const ordersMeta = document.getElementById("ordersMeta");
-  const unmatchedBox = document.getElementById("unmatchedBox");
-
-  function esc(s){
-    return String(s||"").replaceAll("&","&amp;").replaceAll("<","&lt;").replaceAll(">","&gt;").replaceAll('"',"&quot;").replaceAll("'","&#039;");
-  }
-  function money(n){
-    const x = Math.round((Number(n||0)+Number.EPSILON)*100)/100;
-    return "$"+x.toFixed(2);
-  }
-
-  async function loadRuns(){
-    const data = await j("/api/admin/runs");
-    const runs = data.runs || {};
-    const options = [];
-    for(const k of ["local","owen"]){
-      const r = runs[k];
-      if(!r) continue;
-      options.push({ label: r.runKey + " ("+r.type+")", value: r.runKey });
-    }
-    runKeySel.innerHTML = options.map(o => "<option value='"+esc(o.value)+"'>"+esc(o.label)+"</option>").join("");
-  }
-
-  async function setStatus(orderId, state){
-    const note = prompt("Optional note for status change:", "");
-    await j("/api/admin/orders/"+encodeURIComponent(orderId)+"/status", {
-      method:"PATCH",
-      headers:{ "Content-Type":"application/json" },
-      body: JSON.stringify({ state, note: note || "" })
-    });
-    await refreshAll();
-  }
-
-  async function setPaid(orderId, kind, status){
-    const note = prompt("Optional note:", "");
-    await j("/api/admin/orders/"+encodeURIComponent(orderId)+"/payment", {
-      method:"PATCH",
-      headers:{ "Content-Type":"application/json" },
-      body: JSON.stringify({ kind, status, note: note || "" })
-    });
-    await refreshAll();
-  }
-
-  function actionBtns(order){
-    const id = order.orderId;
-
-    const statusButtons = ["confirmed","shopping","packed","out_for_delivery","delivered","issue","cancelled"]
-      .map(st => "<button data-st='"+st+"' style='padding:8px 10px;border-radius:10px;border:1px solid #ddd;background:#fff;font-weight:900;cursor:pointer;'>"+st+"</button>")
-      .join(" ");
-
-    const payButtons =
-      "<div style='margin-top:8px;display:flex;gap:8px;flex-wrap:wrap;'>" +
-      "<button data-pay='fees:paid' style='padding:8px 10px;border-radius:10px;border:1px solid #ddd;background:#fff;font-weight:900;cursor:pointer;'>Fees paid</button>" +
-      "<button data-pay='fees:unpaid' style='padding:8px 10px;border-radius:10px;border:1px solid #ddd;background:#fff;font-weight:900;cursor:pointer;'>Fees unpaid</button>" +
-      "<button data-pay='groceries:paid' style='padding:8px 10px;border-radius:10px;border:1px solid #ddd;background:#fff;font-weight:900;cursor:pointer;'>Groceries paid</button>" +
-      "<button data-pay='groceries:unpaid' style='padding:8px 10px;border-radius:10px;border:1px solid #ddd;background:#fff;font-weight:900;cursor:pointer;'>Groceries unpaid</button>" +
-      "</div>";
-
-    return "<div data-oid='"+esc(id)+"'>" +
-      "<div style='display:flex;gap:8px;flex-wrap:wrap;'>" + statusButtons + "</div>" +
-      payButtons +
-      "</div>";
-  }
-
-  function row(order){
-    const id = esc(order.orderId);
-    const runKey = esc(order.runKey || "—");
-    const town = esc(order.address?.town || "—");
-    const zone = esc(order.address?.zone || "—");
-    const store = esc(order.stores?.primary || "—");
-    const fees = money(order.pricingSnapshot?.totalFees || 0);
-
-    const feesPay = esc(order.payments?.fees?.status || "unpaid");
-    const grocPay = esc(order.payments?.groceries?.status || "unpaid");
-
-    const st = esc(order.status?.state || "submitted");
-
-    return "<tr>" +
-      "<td style='padding:10px;border-top:1px solid #eee;font-weight:1000;white-space:nowrap;'>" + id + "</td>" +
-      "<td style='padding:10px;border-top:1px solid #eee;white-space:nowrap;'>" + runKey + "</td>" +
-      "<td style='padding:10px;border-top:1px solid #eee;'>" + town + " / " + zone + "</td>" +
-      "<td style='padding:10px;border-top:1px solid #eee;'>" + store + "</td>" +
-      "<td style='padding:10px;border-top:1px solid #eee;font-weight:900;'>" + fees + "</td>" +
-      "<td style='padding:10px;border-top:1px solid #eee;'><div><strong>Fees:</strong> "+feesPay+"</div><div><strong>Groceries:</strong> "+grocPay+"</div></td>" +
-      "<td style='padding:10px;border-top:1px solid #eee;font-weight:900;white-space:nowrap;'>" + st + "</td>" +
-      "<td style='padding:10px;border-top:1px solid #eee;'>" + actionBtns(order) + "</td>" +
-    "</tr>";
-  }
-
-  async function loadOrders(){
-    const runKey = runKeySel.value;
-    const status = statusSel.value;
-    const qs = new URLSearchParams();
-    if(runKey) qs.set("runKey", runKey);
-    if(status) qs.set("status", status);
-
-    const data = await j("/api/admin/orders?"+qs.toString());
-    const orders = data.orders || [];
-    ordersMeta.textContent = orders.length + " orders";
-    ordersBody.innerHTML = orders.map(row).join("");
-
-    ordersBody.querySelectorAll("button[data-st]").forEach(btn => {
-      btn.addEventListener("click", async () => {
-        const wrap = btn.closest("[data-oid]");
-        const oid = wrap.getAttribute("data-oid");
-        const st = btn.getAttribute("data-st");
-        await setStatus(oid, st);
-      });
-    });
-
-    ordersBody.querySelectorAll("button[data-pay]").forEach(btn => {
-      btn.addEventListener("click", async () => {
-        const wrap = btn.closest("[data-oid]");
-        const oid = wrap.getAttribute("data-oid");
-        const spec = btn.getAttribute("data-pay");
-        const [kind, st] = spec.split(":");
-        await setPaid(oid, kind, st);
-      });
-    });
-  }
-
-  async function loadUnmatched(){
-    const data = await j("/api/admin/unmatched-payments");
-    const items = data.items || [];
-    if(!items.length){
-      unmatchedBox.textContent = "None 🎉";
-      return;
-    }
-    unmatchedBox.innerHTML = items.slice(0,50).map(x => {
-      return "<div style='padding:10px;border-top:1px solid #eee;'>" +
-        "<div style='font-weight:900;'>"+esc(x.squarePaymentId || "payment")+"</div>" +
-        "<div style='color:#444;'>"+esc(x.squareEventType || "")+" • "+esc(x.reason || "")+"</div>" +
-        "<div style='color:#444;'>note: "+esc(x.note || "")+"</div>" +
-        "</div>";
-    }).join("");
-  }
-
-  async function refreshAll(){
-    await loadOrders();
-    await loadUnmatched();
-  }
-
-  document.getElementById("refreshBtn").addEventListener("click", refreshAll);
-  runKeySel.addEventListener("change", loadOrders);
-  statusSel.addEventListener("change", loadOrders);
-
-  (async function boot(){
-    await loadRuns();
-    await refreshAll();
-  })();
-</script>
-</body>
-</html>`);
+app.delete("/api/admin/suppressions", requireLogin, requireAdmin, async (req, res) => {
+  const email = String(req.query.email || "").toLowerCase().trim();
+  if (!email) return res.status(400).json({ ok: false, error: "Missing email" });
+  await SuppressedEmail.deleteOne({ email });
+  res.json({ ok: true });
 });
 
 // =========================
@@ -1898,13 +1806,177 @@ app.post("/webhooks/square", webhookLimiter, async (req, res) => {
 });
 
 // =========================
-// ROOT
+// POSTMARK WEBHOOK (ALL EVENTS)
+// =========================
+//
+// Postmark modular webhooks send different RecordType values (Delivered/Open/Click/Bounce/SpamComplaint/SubscriptionChange).
+// We protect this endpoint with Basic Auth (set username/password in Postmark webhook URL settings).
+//
+function basicAuthOk(req) {
+  if (!POSTMARK_WEBHOOK_USERNAME || !POSTMARK_WEBHOOK_PASSWORD) return true; // allow if not configured
+  const hdr = req.get("authorization") || "";
+  if (!hdr.toLowerCase().startsWith("basic ")) return false;
+  const b64 = hdr.slice(6).trim();
+  let decoded = "";
+  try {
+    decoded = Buffer.from(b64, "base64").toString("utf8");
+  } catch {
+    return false;
+  }
+  const idx = decoded.indexOf(":");
+  if (idx < 0) return false;
+  const user = decoded.slice(0, idx);
+  const pass = decoded.slice(idx + 1);
+  return user === POSTMARK_WEBHOOK_USERNAME && pass === POSTMARK_WEBHOOK_PASSWORD;
+}
+
+function makeEventKey({ recordType, messageId, recipient, occurredAt, tag }) {
+  const base = [
+    String(recordType || "").toLowerCase(),
+    String(messageId || "").toLowerCase(),
+    String(recipient || "").toLowerCase(),
+    String(tag || "").toLowerCase(),
+    occurredAt ? new Date(occurredAt).toISOString() : "",
+  ].join("|");
+  // lightweight stable hash
+  let h = 0;
+  for (let i = 0; i < base.length; i++) h = (h * 31 + base.charCodeAt(i)) >>> 0;
+  return "pm_" + h.toString(16);
+}
+
+async function upsertSuppression(email, reason, details) {
+  const e = String(email || "").toLowerCase().trim();
+  if (!e) return;
+  await SuppressedEmail.updateOne(
+    { email: e },
+    {
+      $set: {
+        email: e,
+        provider: "postmark",
+        reason,
+        lastAt: new Date(),
+        lastDetails: String(details || ""),
+      },
+      $setOnInsert: { firstAt: new Date() },
+    },
+    { upsert: true }
+  );
+}
+
+app.post("/webhooks/postmark", webhookLimiter, async (req, res) => {
+  try {
+    if (!basicAuthOk(req)) {
+      res.setHeader("WWW-Authenticate", 'Basic realm="Postmark Webhook"');
+      return res.status(401).send("Unauthorized");
+    }
+
+    const payload = req.body || {};
+    const recordType = String(payload.RecordType || payload.record_type || "").trim();
+
+    // Normalize common fields across webhook types
+    const messageId = String(payload.MessageID || payload.MessageId || payload.message_id || "").trim();
+    const messageStream = String(payload.MessageStream || payload.MessageStreamID || payload.MessageStreamId || "").trim();
+    const recipient = String(payload.Recipient || payload.Recepient || payload.Email || payload.email || "").trim().toLowerCase();
+    const tag = String(payload.Tag || "").trim();
+    const metadata = payload.Metadata || payload.metadata || {};
+    const occurredAt =
+      payload.DeliveredAt ||
+      payload.ReceivedAt ||
+      payload.BouncedAt ||
+      payload.ChangedAt ||
+      payload.FirstOpen ||
+      payload.OriginalTimestamp ||
+      payload.ClickedAt ||
+      new Date().toISOString();
+
+    let details = "";
+    if (recordType.toLowerCase() === "delivered") details = String(payload.Details || payload.details || "");
+    if (recordType.toLowerCase() === "bounce") details = String(payload.Description || payload.Details || payload.details || "");
+    if (recordType.toLowerCase() === "spamcomplaint") details = String(payload.Description || payload.details || "");
+    if (recordType.toLowerCase() === "click") details = String(payload.OriginalLink || payload.Link || payload.Url || "");
+    if (recordType.toLowerCase() === "subscriptionchange") details = String(payload.SuppressionReason || payload.ChangeType || payload.Description || "");
+
+    const eventKey = makeEventKey({ recordType, messageId, recipient, occurredAt, tag });
+
+    // Idempotent insert
+    try {
+      await EmailEvent.create({
+        provider: "postmark",
+        recordType,
+        messageId,
+        messageStream,
+        recipient,
+        tag,
+        metadata,
+        occurredAt: new Date(occurredAt),
+        details,
+        eventKey,
+        raw: payload,
+      });
+    } catch (e) {
+      // Duplicate key = already processed
+      if (String(e?.code) === "11000") return res.status(200).send("ok");
+      throw e;
+    }
+
+    // If we can link to an order, update the order email telemetry
+    const orderIdFromMeta = metadata?.orderId ? String(metadata.orderId).trim().toUpperCase() : "";
+    if (orderIdFromMeta) {
+      await Order.updateOne(
+        { orderId: orderIdFromMeta },
+        {
+          $set: {
+            "email.lastMessageId": messageId || "",
+            "email.lastEvent": recordType || "",
+            "email.lastEventAt": new Date(occurredAt),
+            "email.lastDetails": details || "",
+          },
+        }
+      );
+    }
+
+    // Suppress logic:
+    // - SpamComplaint => suppress immediately
+    // - Bounce => suppress if "HardBounce" / "Hard bounce" / "Permanent" indicates hard
+    if (recordType.toLowerCase() === "spamcomplaint") {
+      if (recipient) await upsertSuppression(recipient, "spam-complaint", details);
+      if (orderIdFromMeta) {
+        await Order.updateOne(
+          { orderId: orderIdFromMeta },
+          { $set: { "email.suppressed": true, "email.suppressReason": "spam-complaint" } }
+        );
+      }
+    }
+
+    if (recordType.toLowerCase() === "bounce") {
+      const bounceType = String(payload.Type || payload.BounceType || "").toLowerCase();
+      const isHard =
+        bounceType.includes("hard") ||
+        bounceType.includes("permanent") ||
+        String(payload.Description || "").toLowerCase().includes("hard");
+
+      if (isHard && recipient) {
+        await upsertSuppression(recipient, "hard-bounce", details);
+        if (orderIdFromMeta) {
+          await Order.updateOne(
+            { orderId: orderIdFromMeta },
+            { $set: { "email.suppressed": true, "email.suppressReason": "hard-bounce" } }
+          );
+        }
+      }
+    }
+
+    return res.status(200).send("ok");
+  } catch (e) {
+    return res.status(500).send("postmark webhook error: " + String(e));
+  }
+});
+
+// =========================
+// ROOT + BOOT
 // =========================
 app.get("/", (_req, res) => res.send("TGR backend up"));
 
-// =========================
-// BOOT
-// =========================
 async function main() {
   await mongoose.connect(MONGODB_URI);
   console.log("Connected to MongoDB");
