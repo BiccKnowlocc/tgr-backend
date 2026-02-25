@@ -1,11 +1,23 @@
 // ======= server.js (FULL CLEAN FILE) — TGR backend =======
-// Adds:
-// - Rich /member portal (active orders, past orders, tracking, cancel, pay buttons, membership info)
-// - Member endpoints:
-//    GET  /api/member/orders
-//    POST /api/member/orders/:orderId/cancel-token
-//    POST /api/member/membership/cancel
-// Does NOT change public index styling/structure.
+// Includes:
+// - Google OAuth login (/auth/google)
+// - Required onboarding/profile (/api/profile)
+// - Runs: /api/runs/active
+// - Estimator: /api/estimator
+// - Orders: POST /api/orders, GET /api/orders/:orderId, POST /api/orders/:orderId/cancel (signed token)
+// - Admin UI + APIs: /admin + /api/admin/orders + quick actions
+// - Member portal upgraded: /member + /api/member/orders + mint cancel token + cancel membership
+//
+// Required Render env:
+// - MONGO_URI or MONGODB_URI
+// - SESSION_SECRET
+// - GOOGLE_CLIENT_ID / GOOGLE_CLIENT_SECRET / GOOGLE_CALLBACK_URL
+// Optional:
+// - CANCEL_TOKEN_SECRET (defaults to SESSION_SECRET)
+// - ADMIN_EMAILS (comma-separated). If blank, any logged-in user is treated as admin.
+// - PUBLIC_SITE_URL (default https://tobermorygroceryrun.ca)
+// - SQUARE_PAY_GROCERIES_LINK / SQUARE_PAY_FEES_LINK (defaults to your provided links)
+// - SQUARE_LINK_STANDARD / ROUTE / ACCESS / ACCESSPRO (optional; used in member portal)
 
 const express = require("express");
 const mongoose = require("mongoose");
@@ -55,11 +67,9 @@ const ADMIN_EMAILS = String(process.env.ADMIN_EMAILS || "")
 
 const PUBLIC_SITE_URL = process.env.PUBLIC_SITE_URL || "https://tobermorygroceryrun.ca";
 
-// Square pay links (used in member portal buttons)
 const SQUARE_PAY_GROCERIES_LINK = process.env.SQUARE_PAY_GROCERIES_LINK || "https://square.link/u/R0hfr7x8";
 const SQUARE_PAY_FEES_LINK = process.env.SQUARE_PAY_FEES_LINK || "https://square.link/u/r92W6XGs";
 
-// Membership links (optional)
 const SQUARE_LINK_STANDARD = process.env.SQUARE_LINK_STANDARD || "https://square.link/u/iaziCZjG";
 const SQUARE_LINK_ROUTE = process.env.SQUARE_LINK_ROUTE || "https://square.link/u/P5ROgqyp";
 const SQUARE_LINK_ACCESS = process.env.SQUARE_LINK_ACCESS || "https://square.link/u/lHtHtvqG";
@@ -554,7 +564,7 @@ app.get("/auth/google", (req, res, next) => {
   if (!GOOGLE_CLIENT_ID || !GOOGLE_CLIENT_SECRET || !GOOGLE_CALLBACK_URL) {
     return res.status(500).send("Google auth is not configured on this server.");
   }
-  req.session.returnTo = String(req.query.returnTo || PUBLIC_SITE_URL + "/").trim();
+  req.session.returnTo = String(req.query.returnTo || (PUBLIC_SITE_URL + "/")).trim();
   return passport.authenticate("google", { scope: ["profile", "email"] })(req, res, next);
 });
 
@@ -876,7 +886,6 @@ app.get("/api/member/orders", requireLogin, async (req, res) => {
     const email = String(req.user?.email || "").toLowerCase().trim();
     const items = await Order.find({ "customer.email": email }).sort({ createdAt: -1 }).limit(50).lean();
 
-    // Split active vs history
     const active = [];
     const history = [];
     for (const o of items) {
@@ -908,7 +917,6 @@ app.get("/api/member/orders", requireLogin, async (req, res) => {
   }
 });
 
-// Mint a cancel token for the logged-in user’s own order (so member portal can cancel without localStorage token)
 app.post("/api/member/orders/:orderId/cancel-token", requireLogin, async (req, res) => {
   try {
     const orderId = String(req.params.orderId || "").trim().toUpperCase();
@@ -942,7 +950,6 @@ app.post("/api/member/orders/:orderId/cancel-token", requireLogin, async (req, r
   }
 });
 
-// Database-side membership cancellation request (does not cancel Square billing automatically)
 app.post("/api/member/membership/cancel", requireLogin, async (req, res) => {
   try {
     const u = await User.findById(req.user._id);
@@ -1019,9 +1026,7 @@ app.get("/member", requireLogin, async (req, res) => {
   th{ font-size:12px; color:rgba(255,255,255,.72); text-transform:uppercase; letter-spacing:.08em; text-align:left; }
   .toast{ margin-top:10px; padding:10px 12px; border-radius:12px; border:1px solid rgba(255,255,255,.18); background:rgba(0,0,0,.24); display:none; font-weight:900; }
   .toast.show{ display:block; }
-  @media(max-width:820px){
-    .btn{ width:100%; }
-  }
+  @media(max-width:820px){ .btn{ width:100%; } }
 </style>
 </head>
 <body>
@@ -1054,13 +1059,22 @@ app.get("/member", requireLogin, async (req, res) => {
         <div class="hr"></div>
 
         <div class="row">
-          <a class="btn primary" id="btnBuyMembership" href="${escapeHtml(PUBLIC_SITE_URL)}/?tab=membership">Buy / Change Plan</a>
+          <a class="btn primary" href="${escapeHtml(PUBLIC_SITE_URL)}/?tab=membership">Buy / Change Plan</a>
           <button class="btn secondary" id="btnCancelMembership" type="button">Cancel membership</button>
         </div>
 
         <div class="muted" style="font-size:13px; margin-top:10px;">
-          Note: cancelling here updates your TGR account status. If Square billing is ever enabled as a true subscription,
-          you’ll also cancel there. For now, contact support if anything looks wrong.
+          Note: cancelling here updates your TGR account status. If Square billing is later automated as a true subscription,
+          you’ll also cancel there.
+        </div>
+
+        <div class="hr"></div>
+
+        <div class="row">
+          <a class="btn ghost" href="${escapeHtml(SQUARE_LINK_STANDARD)}" target="_blank" rel="noopener">Standard</a>
+          <a class="btn ghost" href="${escapeHtml(SQUARE_LINK_ROUTE)}" target="_blank" rel="noopener">Route</a>
+          <a class="btn ghost" href="${escapeHtml(SQUARE_LINK_ACCESS)}" target="_blank" rel="noopener">Access</a>
+          <a class="btn ghost" href="${escapeHtml(SQUARE_LINK_ACCESSPRO)}" target="_blank" rel="noopener">Access Pro</a>
         </div>
       </div>
 
@@ -1111,7 +1125,7 @@ app.get("/member", requireLogin, async (req, res) => {
         </table>
       </div>
       <div class="muted" style="margin-top:10px; font-size:13px;">
-        Want full tracking? It’s coming. This portal already mirrors what the system knows about each order (status + payment flags).
+        This portal shows status + payment flags. Full “map tracking” can be added later.
       </div>
     </div>
 
@@ -1123,7 +1137,6 @@ app.get("/member", requireLogin, async (req, res) => {
   const API_MEMBER_ORDERS = "/api/member/orders";
   const API_CANCEL_TOKEN = (id) => "/api/member/orders/" + encodeURIComponent(id) + "/cancel-token";
   const API_CANCEL = (id) => "/api/orders/" + encodeURIComponent(id) + "/cancel";
-  const API_TRACK = (id) => "/api/orders/" + encodeURIComponent(id);
   const API_CANCEL_MEMBERSHIP = "/api/member/membership/cancel";
 
   const toast = (msg) => {
@@ -1162,7 +1175,6 @@ app.get("/member", requireLogin, async (req, res) => {
     const active = data.active || [];
     const history = data.history || [];
 
-    // Active cards
     const aw = document.getElementById("activeWrap");
     if(!active.length){
       aw.innerHTML = "<span class='muted'>No active orders right now.</span>";
@@ -1200,13 +1212,11 @@ app.get("/member", requireLogin, async (req, res) => {
           if(!ok) return;
           try{
             btn.disabled = true;
-            // Mint token for this member/order
             const tr = await fetch(API_CANCEL_TOKEN(orderId), { method:"POST", credentials:"include" });
             const td = await tr.json().catch(()=>({}));
             if(!tr.ok || td.ok === false) throw new Error(td.error || "Could not mint cancel token");
             const token = td.cancelToken;
 
-            // Cancel
             const cr = await fetch(API_CANCEL(orderId), {
               method:"POST",
               headers:{ "Content-Type":"application/json" },
@@ -1226,7 +1236,6 @@ app.get("/member", requireLogin, async (req, res) => {
       });
     }
 
-    // History table
     const tb = document.getElementById("histRows");
     tb.innerHTML = history.map(o => {
       const fees = o.pricingSnapshot?.totalFees ?? 0;
@@ -1252,7 +1261,7 @@ app.get("/member", requireLogin, async (req, res) => {
   }
 
   document.getElementById("btnCancelMembership").addEventListener("click", async ()=>{
-    const ok = confirm("Cancel your membership status in TGR? (If you have any Square billing in future, you may still need to cancel there too.)");
+    const ok = confirm("Cancel your membership status in TGR? (Square billing may still need cancellation if enabled later.)");
     if(!ok) return;
     try{
       const r = await fetch(API_CANCEL_MEMBERSHIP, { method:"POST", credentials:"include" });
@@ -1269,7 +1278,6 @@ app.get("/member", requireLogin, async (req, res) => {
     try{
       await loadMe();
       await loadOrders();
-      // Auto-refresh active orders periodically
       setInterval(loadOrders, 20000);
     } catch(e){
       toast("Portal error: " + String(e.message || e));
@@ -1282,14 +1290,469 @@ app.get("/member", requireLogin, async (req, res) => {
 });
 
 // =========================
-// ADMIN (unchanged in this snippet)
-// If your current server already has /admin and /api/admin/* from the last version, keep them.
+// ADMIN API + ADMIN PAGE (same as prior working admin with quick actions)
 // =========================
+app.get("/api/admin/orders", requireLogin, requireAdmin, async (req, res) => {
+  try {
+    const limit = Math.min(200, Math.max(1, Number(req.query.limit || 50)));
+    const q = String(req.query.q || "").trim();
+    const state = String(req.query.state || "").trim();
 
-// Minimal admin placeholder (keep your existing full admin if already deployed)
-app.get("/admin", requireLogin, requireAdmin, (_req, res) => {
+    const filter = {};
+    if (q) {
+      const re = new RegExp(q.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i");
+      filter.$or = [
+        { orderId: re },
+        { "customer.fullName": re },
+        { "customer.email": re },
+        { "customer.phone": re },
+        { "address.town": re },
+        { "address.streetAddress": re },
+      ];
+    }
+    if (state) filter["status.state"] = state;
+
+    const items = await Order.find(filter).sort({ createdAt: -1 }).limit(limit).lean();
+    res.json({ ok: true, items });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: String(e) });
+  }
+});
+
+app.post("/api/admin/orders/:orderId/status", requireLogin, requireAdmin, async (req, res) => {
+  try {
+    const orderId = String(req.params.orderId || "").trim().toUpperCase();
+    const state = String(req.body?.state || "").trim();
+    const note = String(req.body?.note || "").trim();
+    const by = String(req.user?.email || "admin").toLowerCase();
+
+    if (!AllowedStates.includes(state)) return res.status(400).json({ ok: false, error: "Invalid state" });
+
+    const order = await Order.findOne({ orderId });
+    if (!order) return res.status(404).json({ ok: false, error: "Order not found" });
+
+    order.status.state = state;
+    order.status.note = note || "";
+    order.status.updatedAt = new Date();
+    order.status.updatedBy = by;
+    order.statusHistory.push({ state, note: note || "", at: new Date(), by });
+
+    await order.save();
+    return res.json({ ok: true });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: String(e) });
+  }
+});
+
+app.post("/api/admin/orders/:orderId/cancel", requireLogin, requireAdmin, async (req, res) => {
+  try {
+    const orderId = String(req.params.orderId || "").trim().toUpperCase();
+    const reason = String(req.body?.reason || "").trim();
+    const by = String(req.user?.email || "admin").toLowerCase();
+
+    const order = await Order.findOne({ orderId });
+    if (!order) return res.status(404).json({ ok: false, error: "Order not found" });
+
+    const wasActive = ACTIVE_STATES.has(order.status?.state || "submitted");
+    const fees = Number(order.pricingSnapshot?.totalFees || 0);
+
+    if (wasActive) {
+      await Run.updateOne({ runKey: order.runKey }, { $inc: { bookedOrdersCount: -1, bookedFeesTotal: -fees }, $set: { lastRecalcAt: new Date() } });
+    }
+
+    order.status.state = "cancelled";
+    order.status.note = reason || "Cancelled by admin";
+    order.status.updatedAt = new Date();
+    order.status.updatedBy = by;
+    order.statusHistory.push({ state: "cancelled", note: reason || "Cancelled by admin", at: new Date(), by });
+
+    await order.save();
+    return res.json({ ok: true });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: String(e) });
+  }
+});
+
+app.delete("/api/admin/orders/:orderId", requireLogin, requireAdmin, async (req, res) => {
+  try {
+    const orderId = String(req.params.orderId || "").trim().toUpperCase();
+    const order = await Order.findOne({ orderId }).lean();
+    if (!order) return res.status(404).json({ ok: false, error: "Order not found" });
+
+    const wasActive = ACTIVE_STATES.has(order.status?.state || "submitted");
+    const fees = Number(order.pricingSnapshot?.totalFees || 0);
+
+    if (wasActive) {
+      await Run.updateOne({ runKey: order.runKey }, { $inc: { bookedOrdersCount: -1, bookedFeesTotal: -fees }, $set: { lastRecalcAt: new Date() } });
+    }
+
+    await Order.deleteOne({ orderId });
+    return res.json({ ok: true });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: String(e) });
+  }
+});
+
+app.post("/api/admin/orders/:orderId/payments", requireLogin, requireAdmin, async (req, res) => {
+  try {
+    const orderId = String(req.params.orderId || "").trim().toUpperCase();
+    const kind = String(req.body?.kind || "").trim(); // "fees" | "groceries"
+    const status = String(req.body?.status || "").trim(); // unpaid|pending|paid
+    const note = String(req.body?.note || "").trim();
+    const by = String(req.user?.email || "admin").toLowerCase();
+
+    if (!["fees", "groceries"].includes(kind)) return res.status(400).json({ ok: false, error: "Invalid kind" });
+    if (!["unpaid", "pending", "paid"].includes(status)) return res.status(400).json({ ok: false, error: "Invalid status" });
+
+    const order = await Order.findOne({ orderId });
+    if (!order) return res.status(404).json({ ok: false, error: "Order not found" });
+
+    order.payments = order.payments || { fees: {}, groceries: {} };
+    order.payments[kind] = order.payments[kind] || {};
+    order.payments[kind].status = status;
+    order.payments[kind].note = note || "";
+    order.payments[kind].paidAt = status === "paid" ? new Date() : null;
+
+    order.statusHistory.push({ state: order.status?.state || "submitted", note: `Payment ${kind}: ${status}${note ? " — " + note : ""}`, at: new Date(), by });
+
+    await order.save();
+    return res.json({ ok: true });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: String(e) });
+  }
+});
+
+app.get("/admin", requireLogin, requireAdmin, async (req, res) => {
+  const email = String(req.user?.email || "").toLowerCase();
   res.setHeader("Content-Type", "text/html; charset=utf-8");
-  res.send(`<h1>Admin</h1><p>Admin UI is already in your deployed version. Keep your existing /admin page code here.</p>`);
+  res.send(`<!doctype html>
+<html lang="en-CA">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>TGR Admin</title>
+  <style>
+    :root{
+      --bg:#0b0b0b; --panel:rgba(255,255,255,.06); --line:rgba(255,255,255,.14);
+      --text:#fff; --muted:rgba(255,255,255,.75);
+      --red:#e3342f; --red2:#ff4a44;
+      --radius:14px;
+    }
+    body{margin:0;background:var(--bg);color:var(--text);font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;}
+    .wrap{max-width:1100px;margin:0 auto;padding:16px;}
+    .card{border:1px solid var(--line);background:var(--panel);border-radius:var(--radius);padding:14px;}
+    .row{display:flex;gap:10px;flex-wrap:wrap;}
+    .btn{
+      border:1px solid rgba(255,255,255,.18);
+      background:rgba(255,255,255,.06);
+      color:#fff;font-weight:900;
+      border-radius:999px;
+      padding:10px 14px;
+      cursor:pointer;
+      text-decoration:none;
+    }
+    .btn.primary{background:linear-gradient(180deg,var(--red2),var(--red));border-color:rgba(0,0,0,.25);}
+    .btn.ghost{background:transparent;}
+    input,select{
+      width:100%;
+      padding:12px 12px;
+      border-radius:12px;
+      border:1px solid rgba(255,255,255,.18);
+      background:rgba(0,0,0,.25);
+      color:#fff;
+      font-size:16px;
+    }
+    .muted{color:var(--muted);}
+    table{width:100%;border-collapse:collapse;}
+    th,td{padding:10px 8px;border-bottom:1px solid rgba(255,255,255,.12);vertical-align:top;}
+    th{font-size:12px;color:rgba(255,255,255,.72);text-transform:uppercase;letter-spacing:.08em;text-align:left;}
+    .pill{display:inline-block;padding:4px 10px;border-radius:999px;border:1px solid rgba(255,255,255,.18);background:rgba(255,255,255,.06);font-weight:900;font-size:12px;}
+    .actions{display:flex;gap:8px;flex-wrap:wrap;margin-top:8px;}
+    .small{font-size:12px;padding:8px 10px}
+    .grid{display:grid;grid-template-columns:1fr;gap:12px;}
+    @media(min-width:900px){ .grid{grid-template-columns: 1fr 1fr;} }
+    .toast{margin-top:10px;padding:10px 12px;border-radius:12px;border:1px solid rgba(255,255,255,.18);background:rgba(0,0,0,.24);display:none;font-weight:900;}
+    .toast.show{display:block;}
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="card">
+      <div class="row" style="align-items:center;justify-content:space-between;">
+        <div>
+          <div style="font-weight:1000;font-size:22px;">Admin</div>
+          <div class="muted">Signed in as <strong>${escapeHtml(email)}</strong></div>
+        </div>
+        <div class="row">
+          <a class="btn ghost" href="${escapeHtml(PUBLIC_SITE_URL)}/">Back to site</a>
+          <a class="btn ghost" href="/logout?returnTo=${encodeURIComponent(PUBLIC_SITE_URL + "/")}">Log out</a>
+        </div>
+      </div>
+
+      <div class="toast" id="toast"></div>
+
+      <div class="grid" style="margin-top:12px;">
+        <div class="card" style="background:rgba(0,0,0,.22);">
+          <div style="font-weight:1000;">Search orders</div>
+          <div class="muted">Search by Order ID, last name, email, phone, town, address.</div>
+          <div class="row" style="margin-top:10px;">
+            <div style="flex:1 1 320px;">
+              <input id="q" placeholder="e.g., TGR-00123 or Bullock or 519..." />
+            </div>
+            <div style="flex:0 0 210px;">
+              <select id="state">
+                <option value="">Any status</option>
+                <option value="submitted">submitted</option>
+                <option value="confirmed">confirmed</option>
+                <option value="shopping">shopping</option>
+                <option value="packed">packed</option>
+                <option value="out_for_delivery">out_for_delivery</option>
+                <option value="delivered">delivered</option>
+                <option value="issue">issue</option>
+                <option value="cancelled">cancelled</option>
+              </select>
+            </div>
+            <button class="btn primary" id="searchBtn">Search</button>
+            <button class="btn" id="refreshBtn">Refresh</button>
+          </div>
+          <div class="muted" style="margin-top:8px;">Tip: click a row’s quick actions to update status instantly.</div>
+        </div>
+
+        <div class="card" style="background:rgba(0,0,0,.22);">
+          <div style="font-weight:1000;">Quick actions</div>
+          <div class="muted">Apply to the order currently selected below.</div>
+          <div style="margin-top:10px;">
+            <div class="muted">Selected:</div>
+            <div style="font-weight:1000;font-size:18px;" id="selId">None</div>
+            <div class="muted" id="selMeta" style="margin-top:4px;">Select an order row.</div>
+
+            <div class="actions" style="margin-top:10px;">
+              <button class="btn small" data-act="confirmed">Confirm</button>
+              <button class="btn small" data-act="shopping">Shopping</button>
+              <button class="btn small" data-act="packed">Packed</button>
+              <button class="btn small" data-act="out_for_delivery">Out for delivery</button>
+              <button class="btn small" data-act="delivered">Delivered</button>
+              <button class="btn small" data-act="issue">Issue</button>
+              <button class="btn small" data-act="cancel">Cancel</button>
+              <button class="btn small" data-act="delete">Delete</button>
+            </div>
+
+            <div class="hr" style="height:1px;background:rgba(255,255,255,.12);margin:12px 0;"></div>
+
+            <div style="font-weight:900;">Payments (manual)</div>
+            <div class="muted">Use if you confirmed payment outside Square notes.</div>
+            <div class="actions" style="margin-top:10px;">
+              <button class="btn small" data-pay="fees" data-paystatus="paid">Fees paid</button>
+              <button class="btn small" data-pay="fees" data-paystatus="unpaid">Fees unpaid</button>
+              <button class="btn small" data-pay="groceries" data-paystatus="paid">Groceries paid</button>
+              <button class="btn small" data-pay="groceries" data-paystatus="unpaid">Groceries unpaid</button>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="card" style="background:rgba(0,0,0,.22);margin-top:12px;">
+        <div style="font-weight:1000;">Orders</div>
+        <div class="muted" id="countLine" style="margin-top:6px;">Loading…</div>
+        <div style="overflow:auto;margin-top:10px;">
+          <table>
+            <thead>
+              <tr>
+                <th>Order</th>
+                <th>Customer</th>
+                <th>Run</th>
+                <th>Address</th>
+                <th>Status</th>
+                <th>Fees</th>
+                <th>Payments</th>
+              </tr>
+            </thead>
+            <tbody id="rows"></tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  </div>
+
+<script>
+  const api = {
+    list: "/api/admin/orders",
+    setStatus: (id) => "/api/admin/orders/" + encodeURIComponent(id) + "/status",
+    cancel: (id) => "/api/admin/orders/" + encodeURIComponent(id) + "/cancel",
+    del: (id) => "/api/admin/orders/" + encodeURIComponent(id),
+    pay: (id) => "/api/admin/orders/" + encodeURIComponent(id) + "/payments",
+  };
+
+  let selected = null;
+
+  const toast = (msg) => {
+    const el = document.getElementById("toast");
+    el.textContent = msg;
+    el.classList.add("show");
+    setTimeout(()=> el.classList.remove("show"), 3500);
+  };
+
+  function money(n){
+    const v = Number(n || 0);
+    return "$" + v.toFixed(2);
+  }
+
+  function setSelected(o){
+    selected = o;
+    document.getElementById("selId").textContent = o ? o.orderId : "None";
+    document.getElementById("selMeta").textContent = o
+      ? ((o.customer?.fullName || "—") + " • " + (o.address?.town || "—") + " • " + (o.runType || "—") + " " + (o.runKey || ""))
+      : "Select an order row.";
+  }
+
+  async function fetchOrders(){
+    const q = document.getElementById("q").value.trim();
+    const state = document.getElementById("state").value;
+
+    const url = new URL(location.origin + api.list);
+    if (q) url.searchParams.set("q", q);
+    if (state) url.searchParams.set("state", state);
+    url.searchParams.set("limit", "80");
+
+    const r = await fetch(url.toString(), { credentials: "include" });
+    const data = await r.json().catch(()=>({}));
+    if (!r.ok || data.ok === false) throw new Error(data.error || "Failed to load orders");
+
+    const items = data.items || [];
+    document.getElementById("countLine").textContent = items.length + " orders shown";
+    const tbody = document.getElementById("rows");
+    tbody.innerHTML = "";
+
+    items.forEach(o => {
+      const tr = document.createElement("tr");
+      tr.style.cursor = "pointer";
+      tr.addEventListener("click", ()=> setSelected(o));
+
+      const fees = o.pricingSnapshot?.totalFees ?? 0;
+      const payFees = o.payments?.fees?.status || "unpaid";
+      const payGro = o.payments?.groceries?.status || "unpaid";
+
+      tr.innerHTML = \`
+        <td>
+          <div style="font-weight:1000;">\${o.orderId}</div>
+          <div class="muted" style="font-size:12px;">\${new Date(o.createdAt).toLocaleString()}</div>
+        </td>
+        <td>
+          <div style="font-weight:900;">\${(o.customer?.fullName || "—")}</div>
+          <div class="muted" style="font-size:12px;">\${(o.customer?.email || "—")} • \${(o.customer?.phone || "—")}</div>
+        </td>
+        <td>
+          <span class="pill">\${(o.runType || "—")}</span>
+          <div class="muted" style="font-size:12px;margin-top:4px;">\${(o.runKey || "—")}</div>
+        </td>
+        <td>
+          <div style="font-weight:900;">\${(o.address?.town || "—")} (\${(o.address?.zone || "—")})</div>
+          <div class="muted" style="font-size:12px;">\${(o.address?.streetAddress || "—")}</div>
+        </td>
+        <td>
+          <span class="pill">\${(o.status?.state || "submitted")}</span>
+          <div class="muted" style="font-size:12px;margin-top:4px;">\${(o.status?.note || "")}</div>
+        </td>
+        <td>\${money(fees)}</td>
+        <td>
+          <div class="muted" style="font-size:12px;">Fees: <strong>\${payFees}</strong></div>
+          <div class="muted" style="font-size:12px;">Groceries: <strong>\${payGro}</strong></div>
+        </td>
+      \`;
+      tbody.appendChild(tr);
+    });
+
+    if (!selected && items.length) setSelected(items[0]);
+  }
+
+  async function setStatus(state){
+    if (!selected) return toast("Select an order first.");
+    const note = "";
+    const r = await fetch(api.setStatus(selected.orderId), {
+      method: "POST",
+      headers: { "Content-Type":"application/json" },
+      credentials: "include",
+      body: JSON.stringify({ state, note }),
+    });
+    const data = await r.json().catch(()=>({}));
+    if (!r.ok || data.ok === false) throw new Error(data.error || "Status update failed");
+    toast("Status updated → " + state);
+    await fetchOrders();
+  }
+
+  async function cancelOrder(){
+    if (!selected) return toast("Select an order first.");
+    const reason = prompt("Cancel reason (optional):", "Cancelled by admin") || "";
+    const r = await fetch(api.cancel(selected.orderId), {
+      method: "POST",
+      headers: { "Content-Type":"application/json" },
+      credentials: "include",
+      body: JSON.stringify({ reason }),
+    });
+    const data = await r.json().catch(()=>({}));
+    if (!r.ok || data.ok === false) throw new Error(data.error || "Cancel failed");
+    toast("Order cancelled");
+    await fetchOrders();
+  }
+
+  async function deleteOrder(){
+    if (!selected) return toast("Select an order first.");
+    const ok = confirm("Delete " + selected.orderId + "? This permanently removes it.");
+    if (!ok) return;
+    const r = await fetch(api.del(selected.orderId), { method: "DELETE", credentials: "include" });
+    const data = await r.json().catch(()=>({}));
+    if (!r.ok || data.ok === false) throw new Error(data.error || "Delete failed");
+    toast("Order deleted");
+    selected = null;
+    await fetchOrders();
+  }
+
+  async function setPayment(kind, status){
+    if (!selected) return toast("Select an order first.");
+    const r = await fetch(api.pay(selected.orderId), {
+      method: "POST",
+      headers: { "Content-Type":"application/json" },
+      credentials: "include",
+      body: JSON.stringify({ kind, status, note: "" }),
+    });
+    const data = await r.json().catch(()=>({}));
+    if (!r.ok || data.ok === false) throw new Error(data.error || "Payment update failed");
+    toast(kind + " → " + status);
+    await fetchOrders();
+  }
+
+  document.getElementById("searchBtn").addEventListener("click", ()=> fetchOrders().catch(e=>toast(String(e.message||e))));
+  document.getElementById("refreshBtn").addEventListener("click", ()=> fetchOrders().catch(e=>toast(String(e.message||e))));
+  document.getElementById("q").addEventListener("keydown", (e)=>{ if(e.key==="Enter"){ e.preventDefault(); fetchOrders().catch(err=>toast(String(err.message||err))); } });
+
+  document.querySelectorAll("[data-act]").forEach(btn=>{
+    btn.addEventListener("click", async ()=>{
+      try{
+        const act = btn.getAttribute("data-act");
+        if (act === "cancel") return await cancelOrder();
+        if (act === "delete") return await deleteOrder();
+        await setStatus(act);
+      } catch (e){
+        toast(String(e.message || e));
+      }
+    });
+  });
+
+  document.querySelectorAll("[data-pay]").forEach(btn=>{
+    btn.addEventListener("click", async ()=>{
+      try{
+        const kind = btn.getAttribute("data-pay");
+        const status = btn.getAttribute("data-paystatus");
+        await setPayment(kind, status);
+      } catch (e){
+        toast(String(e.message || e));
+      }
+    });
+  });
+
+  fetchOrders().catch(e=>toast(String(e.message||e)));
+</script>
+</body></html>`);
 });
 
 // =========================
