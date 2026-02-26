@@ -2,6 +2,13 @@
 // Implements: Google OAuth, required profile onboarding, runs, estimator, orders, cancel tokens
 // + FULL admin UI and admin endpoints (search/cancel/delete/export)
 // + MEMBER PORTAL (/member) restored + order list + cancel button (before cutoff)
+//
+// NEW (ONLY for Canada Post AddressComplete reliability):
+// - Proxies AddressComplete JS/CSS through this backend to avoid execution/caching/CSP issues.
+//   Endpoints:
+//     GET /vendor/addresscomplete.js
+//     GET /vendor/addresscomplete.css
+//     GET /api/public/addresscomplete  (returns URLs for frontend)
 
 const express = require("express");
 const mongoose = require("mongoose");
@@ -10,6 +17,7 @@ const cookieParser = require("cookie-parser");
 const session = require("express-session");
 const cors = require("cors");
 const crypto = require("crypto");
+const https = require("https");
 
 const MongoStorePkg = require("connect-mongo");
 const MongoStore = MongoStorePkg.default || MongoStorePkg;
@@ -75,6 +83,9 @@ const ALLOWED_ORIGINS = [
   "http://localhost:3000",
   "http://localhost:8888",
 ];
+
+// Canada Post AddressComplete key (your current one as fallback)
+const CANADAPOST_KEY = process.env.CANADAPOST_KEY || "mn86-az16-ku32-hj78";
 
 // =========================
 // APP + MIDDLEWARE
@@ -559,6 +570,57 @@ function verifyCancelToken(orderId, token) {
     return { ok: true, expMs };
   } catch { return { ok: false }; }
 }
+
+// =========================
+// NEW: AddressComplete proxy (server-side)
+// =========================
+function proxyRemote(url, res, contentType) {
+  // No caching: we want deterministic behavior while you’re stabilizing this
+  res.setHeader("Cache-Control", "no-store, max-age=0");
+  res.setHeader("Content-Type", contentType);
+
+  https
+    .get(url, (r) => {
+      if (r.statusCode && r.statusCode >= 300 && r.statusCode < 400 && r.headers.location) {
+        // follow redirect
+        return proxyRemote(r.headers.location, res, contentType);
+      }
+      if (r.statusCode !== 200) {
+        res.statusCode = 502;
+        let body = "";
+        r.on("data", (c) => (body += c.toString("utf8")));
+        r.on("end", () => {
+          res.end(`Upstream error (${r.statusCode}): ${body.slice(0, 400)}`);
+        });
+        return;
+      }
+      r.pipe(res);
+    })
+    .on("error", (e) => {
+      res.statusCode = 502;
+      res.end("Proxy error: " + String(e));
+    });
+}
+
+app.get("/vendor/addresscomplete.css", (_req, res) => {
+  const url = `https://ws1.postescanada-canadapost.ca/css/addresscomplete-2.50.min.css?key=${encodeURIComponent(CANADAPOST_KEY)}`;
+  proxyRemote(url, res, "text/css; charset=utf-8");
+});
+
+app.get("/vendor/addresscomplete.js", (_req, res) => {
+  const url = `https://ws1.postescanada-canadapost.ca/js/addresscomplete-2.50.min.js?key=${encodeURIComponent(CANADAPOST_KEY)}`;
+  proxyRemote(url, res, "application/javascript; charset=utf-8");
+});
+
+// helper for frontend so you can copy/paste the correct snippet
+app.get("/api/public/addresscomplete", (_req, res) => {
+  res.json({
+    ok: true,
+    css: `https://api.tobermorygroceryrun.ca/vendor/addresscomplete.css`,
+    js: `https://api.tobermorygroceryrun.ca/vendor/addresscomplete.js`,
+    note: "Use these URLs in index.html <head> instead of ws1.postescanada-canadapost.ca for more reliable execution.",
+  });
+});
 
 // =========================
 // PUBLIC CONFIG
