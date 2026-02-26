@@ -1,30 +1,12 @@
-// ======= server.js (FULL CLEAN FILE) — TGR backend =======
-// Includes:
-// - Google OAuth
-// - Required account onboarding (/api/profile)
-// - Runs (separate local/owen slot counts)
-// - Orders + cancel token + cancel/delete adjusts run slots
-// - Mapbox tracking (Policy 2): run Start/Stop + per-order packed->delivery mode + per-order override
-// - Routific Platform API integration:
-//   * Push run orders to Routific (Create orders)
-//   * Sync routes + timeline to store planned ETAs into orders
-// - NEW: Routific CSV export per runKey (deliveries only)
-//
-// Render env (minimum):
-// - MONGO_URI or MONGODB_URI
-// - SESSION_SECRET
-// - GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, GOOGLE_CALLBACK_URL
-//
-// Add for Mapbox:
-// - MAPBOX_PUBLIC_TOKEN
-//
-// Add for Routific:
-// - ROUTIFIC_WORKSPACE_ID=992814
-// - ROUTIFIC_API_TOKEN=Bearer <token>
-//
-// Optional:
-// - PUBLIC_SITE_URL
-// - ADMIN_EMAILS (comma-separated; if empty, any logged-in user is treated as admin)
+// ======= server.js (FULL FILE) — TGR backend =======
+// Implements: Google OAuth, required profile onboarding, runs, estimator, orders, cancel tokens
+// NEW in this version:
+// - Profile addresses include postalCode
+// - Order snapshot includes postalCode
+// - isProfileComplete requires postalCode
+// - /api/profile saves postalCode
+// - /api/orders requires postalCode (unless provided via profile fallback)
+// - Admin + Member routes kept (simple)
 
 const express = require("express");
 const mongoose = require("mongoose");
@@ -77,7 +59,7 @@ const PUBLIC_SITE_URL =
 
 const MAPBOX_PUBLIC_TOKEN = process.env.MAPBOX_PUBLIC_TOKEN || "";
 
-// Square links (your latest mapping)
+// Square links (use your current ones; can override via Render env)
 const SQUARE_PAY_GROCERIES_LINK =
   process.env.SQUARE_PAY_GROCERIES_LINK || "https://square.link/u/R0hfr7x8";
 const SQUARE_PAY_FEES_LINK =
@@ -91,11 +73,6 @@ const SQUARE_LINK_ACCESS =
   process.env.SQUARE_LINK_ACCESS || "https://square.link/u/lHtHtvqG";
 const SQUARE_LINK_ACCESSPRO =
   process.env.SQUARE_LINK_ACCESSPRO || "https://square.link/u/S0Y5Fysa";
-
-// Routific
-const ROUTIFIC_WORKSPACE_ID = String(process.env.ROUTIFIC_WORKSPACE_ID || "").trim();
-const ROUTIFIC_API_TOKEN_RAW = String(process.env.ROUTIFIC_API_TOKEN || "").trim();
-const ROUTIFIC_BASE = "https://planning-service.beta.routific.com/v1";
 
 const ALLOWED_ORIGINS = [
   "https://tobermorygroceryrun.ca",
@@ -148,10 +125,10 @@ app.use(
 
 app.get("/favicon.ico", (_req, res) => res.status(204).end());
 
-// Uploads (local disk)
+// Uploads
 const upload = multer({
   dest: "uploads/",
-  limits: { fileSize: 15 * 1024 * 1024 }, // 15MB
+  limits: { fileSize: 15 * 1024 * 1024 },
 });
 
 // =========================
@@ -224,18 +201,13 @@ app.use(passport.initialize());
 app.use(passport.session());
 
 // =========================
-// PRICING (SERVER TRUTH BASELINE)
+// PRICING BASELINE
 // =========================
 const PRICING = {
   serviceFee: 25,
   zone: { A: 20, B: 15, C: 10, D: 25 },
   owenRunFeePerOrder: 20,
-  addOns: {
-    extraStore: 8,
-    printingBase: 5,
-    printingFirst10: 1.25,
-    printingAfter10: 0.75,
-  },
+  addOns: { extraStore: 8, printingBase: 5, printingFirst10: 1.25, printingAfter10: 0.75 },
   groceryUnderMin: { threshold: 35, surcharge: 19 },
 };
 
@@ -244,29 +216,20 @@ function calcPrinting(pages) {
   if (p <= 0) return 0;
   const first = Math.min(p, 10);
   const rest = Math.max(0, p - 10);
-  return (
-    PRICING.addOns.printingBase +
-    first * PRICING.addOns.printingFirst10 +
-    rest * PRICING.addOns.printingAfter10
-  );
+  return PRICING.addOns.printingBase + first * PRICING.addOns.printingFirst10 + rest * PRICING.addOns.printingAfter10;
 }
 
 function membershipDiscounts(tier, applyPerkYes) {
-  if (!tier || !applyPerkYes)
-    return { serviceOff: 0, zoneOff: 0, freeAddonUpTo: 0, waitWaived: false };
-  if (tier === "standard")
-    return { serviceOff: 0, zoneOff: 10, freeAddonUpTo: 10, waitWaived: false };
-  if (tier === "route")
-    return { serviceOff: 5, zoneOff: 10, freeAddonUpTo: 10, waitWaived: false };
-  if (tier === "access")
-    return { serviceOff: 8, zoneOff: 10, freeAddonUpTo: 10, waitWaived: true };
-  if (tier === "accesspro")
-    return { serviceOff: 10, zoneOff: 0, freeAddonUpTo: 0, waitWaived: true };
+  if (!tier || !applyPerkYes) return { serviceOff: 0, zoneOff: 0, freeAddonUpTo: 0, waitWaived: false };
+  if (tier === "standard") return { serviceOff: 0, zoneOff: 10, freeAddonUpTo: 10, waitWaived: false };
+  if (tier === "route") return { serviceOff: 5, zoneOff: 10, freeAddonUpTo: 10, waitWaived: false };
+  if (tier === "access") return { serviceOff: 8, zoneOff: 10, freeAddonUpTo: 10, waitWaived: true };
+  if (tier === "accesspro") return { serviceOff: 10, zoneOff: 0, freeAddonUpTo: 0, waitWaived: true };
   return { serviceOff: 0, zoneOff: 0, freeAddonUpTo: 0, waitWaived: false };
 }
 
 // =========================
-// MONGO MODELS (IN FILE)
+// MODELS (IN FILE)
 // =========================
 const CounterSchema = new mongoose.Schema(
   { key: { type: String, unique: true }, seq: { type: Number, default: 0 } },
@@ -290,23 +253,6 @@ const RunSchema = new mongoose.Schema(
   { timestamps: true }
 );
 
-const RunLocationSchema = new mongoose.Schema(
-  {
-    runKey: { type: String, unique: true, index: true },
-    enabled: { type: Boolean, default: false },
-    enabledAt: { type: Date, default: null },
-    enabledBy: { type: String, default: "" },
-
-    lat: { type: Number, default: null },
-    lng: { type: Number, default: null },
-    accuracy: { type: Number, default: null },
-    heading: { type: Number, default: null },
-    speed: { type: Number, default: null },
-    updatedAt: { type: Date, default: null },
-  },
-  { timestamps: true }
-);
-
 const AllowedStates = [
   "submitted",
   "confirmed",
@@ -318,13 +264,7 @@ const AllowedStates = [
   "cancelled",
 ];
 
-const ACTIVE_STATES = new Set([
-  "submitted",
-  "confirmed",
-  "shopping",
-  "packed",
-  "out_for_delivery",
-]);
+const ACTIVE_STATES = new Set(["submitted", "confirmed", "shopping", "packed", "out_for_delivery"]);
 
 const OrderSchema = new mongoose.Schema(
   {
@@ -333,12 +273,18 @@ const OrderSchema = new mongoose.Schema(
     runType: { type: String, enum: ["local", "owen"], required: true },
 
     customer: { fullName: String, email: String, phone: String },
+
+    // NEW: postalCode stored on every order snapshot
     address: {
       town: String,
       streetAddress: String,
+      unit: { type: String, default: "" },
+      postalCode: { type: String, default: "" },
       zone: { type: String, enum: ["A", "B", "C", "D"] },
     },
+
     stores: { primary: String, extra: [String] },
+
     preferences: {
       dropoffPref: String,
       subsPref: String,
@@ -368,23 +314,6 @@ const OrderSchema = new mongoose.Schema(
       groceries: { status: { type: String, default: "unpaid" }, note: { type: String, default: "" }, paidAt: { type: Date, default: null } },
     },
 
-    trackingEnabled: { type: Boolean, default: false },
-    trackingEnabledAt: { type: Date, default: null },
-    trackingEnabledBy: { type: String, default: "" },
-
-    routific: {
-      pushedAt: { type: Date, default: null },
-      orderUuid: { type: String, default: "" },
-      lastSyncAt: { type: Date, default: null },
-      routeUuid: { type: String, default: "" },
-      plannedArrival: { type: Date, default: null },
-      plannedDeparture: { type: Date, default: null },
-      actualArrival: { type: Date, default: null },
-      actualDeparture: { type: Date, default: null },
-      stopStatus: { type: String, default: "" },
-      driverName: { type: String, default: "" },
-    },
-
     status: {
       state: { type: String, enum: AllowedStates, default: "submitted" },
       note: { type: String, default: "" },
@@ -402,36 +331,13 @@ const OrderSchema = new mongoose.Schema(
 
 const Counter = mongoose.model("Counter", CounterSchema);
 const Run = mongoose.model("Run", RunSchema);
-const RunLocation = mongoose.model("RunLocation", RunLocationSchema);
 const Order = mongoose.model("Order", OrderSchema);
 
 // =========================
 // HELPERS
 // =========================
-function escapeHtml(s) {
-  return String(s || "")
-    .replaceAll("&", "&amp;")
-    .replaceAll("<", "&lt;")
-    .replaceAll(">", "&gt;")
-    .replaceAll('"', "&quot;")
-    .replaceAll("'", "&#039;");
-}
-
-function csvEscape(val) {
-  const s = String(val ?? "");
-  if (s.includes('"') || s.includes(",") || s.includes("\n") || s.includes("\r")) {
-    return `"${s.replaceAll('"', '""')}"`;
-  }
-  return s;
-}
-
-function nowTz() {
-  return dayjs().tz(TZ);
-}
-function fmtLocal(d) {
-  if (!d) return "";
-  return dayjs(d).tz(TZ).format("ddd MMM D, h:mma");
-}
+function nowTz() { return dayjs().tz(TZ); }
+function fmtLocal(d) { if (!d) return ""; return dayjs(d).tz(TZ).format("ddd MMM D, h:mma"); }
 
 function nextDow(targetDow, from) {
   let d = dayjs(from).tz(TZ);
@@ -456,14 +362,12 @@ function buildRunTimes(type) {
 }
 
 function runMinimumConfig(type) {
-  if (type === "local")
-    return { minOrders: 6, minFees: 200, minLogic: "OR", minimumText: "Minimum: 6 orders OR $200 booked fees" };
+  if (type === "local") return { minOrders: 6, minFees: 200, minLogic: "OR", minimumText: "Minimum: 6 orders OR $200 booked fees" };
   return { minOrders: 6, minFees: 300, minLogic: "AND", minimumText: "Minimum: 6 orders AND $300 booked fees" };
 }
 
 function meetsMinimums(run) {
-  if (run.minLogic === "AND")
-    return run.bookedOrdersCount >= run.minOrders && run.bookedFeesTotal >= run.minFees;
+  if (run.minLogic === "AND") return run.bookedOrdersCount >= run.minOrders && run.bookedFeesTotal >= run.minFees;
   return run.bookedOrdersCount >= run.minOrders || run.bookedFeesTotal >= run.minFees;
 }
 
@@ -489,23 +393,16 @@ async function ensureUpcomingRuns() {
       run = created.toObject();
     }
 
-    const needsRecalc =
-      !run.lastRecalcAt ||
-      dayjs(run.lastRecalcAt).isBefore(nowTz().subtract(60, "second").toDate());
-
+    const needsRecalc = !run.lastRecalcAt || dayjs(run.lastRecalcAt).isBefore(nowTz().subtract(60, "second").toDate());
     if (needsRecalc) {
       const agg = await Order.aggregate([
         { $match: { runKey, "status.state": { $in: Array.from(ACTIVE_STATES) } } },
         { $group: { _id: "$runKey", c: { $sum: 1 }, fees: { $sum: "$pricingSnapshot.totalFees" } } },
       ]);
-
       const c = agg?.[0]?.c || 0;
       const fees = agg?.[0]?.fees || 0;
 
-      await Run.updateOne(
-        { runKey },
-        { $set: { bookedOrdersCount: c, bookedFeesTotal: fees, lastRecalcAt: new Date() } }
-      );
+      await Run.updateOne({ runKey }, { $set: { bookedOrdersCount: c, bookedFeesTotal: fees, lastRecalcAt: new Date() } });
       run.bookedOrdersCount = c;
       run.bookedFeesTotal = fees;
       run.lastRecalcAt = new Date();
@@ -517,11 +414,7 @@ async function ensureUpcomingRuns() {
 }
 
 async function nextOrderId() {
-  const c = await Counter.findOneAndUpdate(
-    { key: "orders" },
-    { $inc: { seq: 1 } },
-    { upsert: true, new: true }
-  ).lean();
+  const c = await Counter.findOneAndUpdate({ key: "orders" }, { $inc: { seq: 1 } }, { upsert: true, new: true }).lean();
   return "TGR-" + String(c.seq).padStart(5, "0");
 }
 
@@ -530,9 +423,7 @@ function safeJsonArray(str) {
     const v = JSON.parse(str || "[]");
     if (Array.isArray(v)) return v.map((x) => String(x || "").trim()).filter(Boolean);
     return [];
-  } catch {
-    return [];
-  }
+  } catch { return []; }
 }
 
 function computeFeeBreakdown(input) {
@@ -571,6 +462,11 @@ function computeFeeBreakdown(input) {
   return { totals: { serviceFee, zoneFee, runFee, addOnsFees, surcharges, discount, totalFees } };
 }
 
+function yn(v) {
+  return v === true || String(v || "").toLowerCase() === "yes";
+}
+
+// NEW: profileComplete requires postalCode
 function isProfileComplete(profile) {
   const p = profile || {};
   if (p.complete === true) return true;
@@ -585,10 +481,12 @@ function isProfileComplete(profile) {
     const street = String(a.streetAddress || "").trim();
     const town = String(a.town || "").trim();
     const zone = String(a.zone || "").trim();
-    return !!street && !!town && !!zone;
+    const postalCode = String(a.postalCode || "").trim();
+    return !!street && !!town && !!zone && !!postalCode;
   });
 
   const consentsOk = p.consentTerms === true && p.consentPrivacy === true;
+
   return !!fullName && !!phone && !!contactPref && contactAuth && hasAddress && consentsOk;
 }
 
@@ -596,47 +494,38 @@ function requireLogin(req, res, next) {
   if (!req.user) return res.status(401).json({ ok: false, error: "Sign-in required." });
   next();
 }
-
 function requireProfileComplete(req, res, next) {
   if (!isProfileComplete(req.user?.profile || {})) {
     return res.status(403).json({ ok: false, error: "Account setup required. Please complete your profile." });
   }
   next();
 }
-
 function isAdminEmail(email) {
   const e = String(email || "").toLowerCase().trim();
   if (!e) return false;
   if (!ADMIN_EMAILS.length) return true;
   return ADMIN_EMAILS.includes(e);
 }
-
 function requireAdmin(req, res, next) {
   const email = String(req.user?.email || "").toLowerCase().trim();
   if (!email || !isAdminEmail(email)) return res.status(403).send("Admin access required.");
   next();
 }
 
+// cancel token helpers
 function base64urlEncode(buf) {
-  return Buffer.from(buf)
-    .toString("base64")
-    .replaceAll("+", "-")
-    .replaceAll("/", "_")
-    .replaceAll("=", "");
+  return Buffer.from(buf).toString("base64").replaceAll("+", "-").replaceAll("/", "_").replaceAll("=", "");
 }
-
 function base64urlDecodeToString(b64url) {
   const pad = b64url.length % 4 ? "=".repeat(4 - (b64url.length % 4)) : "";
   const b64 = b64url.replaceAll("-", "+").replaceAll("_", "/") + pad;
   return Buffer.from(b64, "base64").toString("utf8");
 }
-
 function signCancelToken(orderId, expMs) {
   const payload = `${orderId}.${String(expMs)}`;
   const sig = crypto.createHmac("sha256", CANCEL_TOKEN_SECRET).update(payload).digest();
   return `${base64urlEncode(payload)}.${base64urlEncode(sig)}`;
 }
-
 function verifyCancelToken(orderId, token) {
   try {
     const parts = String(token || "").trim().split(".");
@@ -655,66 +544,7 @@ function verifyCancelToken(orderId, token) {
     if (a.length !== b.length) return { ok: false };
     if (!crypto.timingSafeEqual(a, b)) return { ok: false };
     return { ok: true, expMs };
-  } catch {
-    return { ok: false };
-  }
-}
-
-function yn(v) {
-  return v === true || String(v || "").toLowerCase() === "yes";
-}
-
-// =========================
-// ROUTIFIC CLIENT (kept for later)
-// =========================
-function routificAuthHeader() {
-  if (!ROUTIFIC_API_TOKEN_RAW) return "";
-  return ROUTIFIC_API_TOKEN_RAW.toLowerCase().startsWith("bearer ")
-    ? ROUTIFIC_API_TOKEN_RAW
-    : "Bearer " + ROUTIFIC_API_TOKEN_RAW;
-}
-
-async function routificRequest(path, { method = "GET", body = null } = {}) {
-  if (!ROUTIFIC_WORKSPACE_ID) throw new Error("Missing ROUTIFIC_WORKSPACE_ID");
-  if (!ROUTIFIC_API_TOKEN_RAW) throw new Error("Missing ROUTIFIC_API_TOKEN");
-
-  const url = ROUTIFIC_BASE + path;
-  const headers = { accept: "application/json", Authorization: routificAuthHeader() };
-
-  let payload = undefined;
-  if (body != null) {
-    headers["Content-Type"] = "application/json";
-    payload = JSON.stringify(body);
-  }
-
-  const r = await fetch(url, { method, headers, body: payload });
-  const text = await r.text();
-  let data = {};
-  try {
-    data = text ? JSON.parse(text) : {};
-  } catch {
-    data = { raw: text };
-  }
-
-  if (!r.ok) {
-    const msg = data?.message || data?.error || (typeof data === "string" ? data : JSON.stringify(data));
-    throw new Error(`Routific ${method} ${path} failed (${r.status}): ${msg}`);
-  }
-  return data;
-}
-
-async function routificCreateOrders(orderPayloads) {
-  const qs = `?workspaceId=${encodeURIComponent(ROUTIFIC_WORKSPACE_ID)}`;
-  return routificRequest(`/orders${qs}`, { method: "POST", body: orderPayloads });
-}
-
-async function routificFetchRoutes(dateYYYYMMDD) {
-  const qs = `?workspaceId=${encodeURIComponent(ROUTIFIC_WORKSPACE_ID)}&date=${encodeURIComponent(dateYYYYMMDD)}`;
-  return routificRequest(`/routes${qs}`, { method: "GET" });
-}
-
-async function routificFetchTimeline(routeUuid) {
-  return routificRequest(`/routes/${encodeURIComponent(routeUuid)}/timeline`, { method: "GET" });
+  } catch { return { ok: false }; }
 }
 
 // =========================
@@ -793,25 +623,45 @@ app.post("/api/profile", requireLogin, async (req, res) => {
     const u = await User.findById(req.user._id);
     if (!u) return res.status(404).json({ ok: false, error: "User not found" });
 
+    const addresses = Array.isArray(b.addresses) ? b.addresses : [];
+
     const newProfile = {
       version: 1,
+
+      // identity/contact
       fullName: String(b.fullName || "").trim(),
       preferredName: String(b.preferredName || "").trim(),
       phone: String(b.phone || "").trim(),
       altPhone: String(b.altPhone || "").trim(),
       contactPref: String(b.contactPref || "").trim(),
       contactAuth: yn(b.contactAuth),
-      addresses: (Array.isArray(b.addresses) ? b.addresses : []).map((a) => ({
+
+      // defaults
+      subsDefault: String(b.subsDefault || "").trim(),
+      dropoffDefault: String(b.dropoffDefault || "").trim(),
+
+      // optional operational notes
+      customerType: String(b.customerType || "").trim(),
+      accessibility: String(b.accessibility || "").trim(),
+      dietary: String(b.dietary || "").trim(),
+      notes: String(b.notes || "").trim(),
+
+      // address book (NEW includes postalCode + unit)
+      addresses: addresses.map((a) => ({
         id: String(a.id || "").trim() || String(Math.random()).slice(2),
         label: String(a.label || "").trim(),
         town: String(a.town || "").trim(),
         zone: String(a.zone || "").trim(),
         streetAddress: String(a.streetAddress || "").trim(),
         unit: String(a.unit || "").trim(),
+        postalCode: String(a.postalCode || "").trim(),
         instructions: String(a.instructions || "").trim(),
         gateCode: String(a.gateCode || "").trim(),
       })),
+
       defaultId: String(b.defaultId || "").trim(),
+
+      // consents
       consentTerms: yn(b.consentTerms),
       consentPrivacy: yn(b.consentPrivacy),
       consentMarketing: yn(b.consentMarketing),
@@ -848,9 +698,6 @@ app.get("/api/runs/active", async (_req, res) => {
       const slotsRemaining = Math.max(0, (run.maxSlots || 12) - (run.bookedOrdersCount || 0));
       const minCfg = runMinimumConfig(type);
 
-      const rl = await RunLocation.findOne({ runKey: run.runKey }).lean();
-      const trackingEnabled = !!rl?.enabled;
-
       out[type] = {
         runKey: run.runKey,
         type: run.type,
@@ -863,7 +710,6 @@ app.get("/api/runs/active", async (_req, res) => {
         cutoffAtLocal: fmtLocal(run.cutoffAt),
         meetsMinimums: meetsMinimums(run),
         minimumText: minCfg.minimumText,
-        trackingEnabled,
       };
     }
     res.json({ ok: true, runs: out });
@@ -882,21 +728,26 @@ app.post("/api/estimator", (req, res) => {
 });
 
 // =========================
-// ORDERS (customer)
+// ORDERS
 // =========================
+function pickDefaultAddress(profile) {
+  const p = profile || {};
+  const arr = Array.isArray(p.addresses) ? p.addresses : [];
+  if (!arr.length) return null;
+  const defId = String(p.defaultId || "").trim();
+  const found = defId ? arr.find((a) => String(a.id) === defId) : null;
+  return found || arr[0] || null;
+}
+
 app.post("/api/orders", requireLogin, requireProfileComplete, upload.single("groceryFile"), async (req, res) => {
   try {
     const b = req.body || {};
     const user = await User.findById(req.user._id).lean();
     const profile = user?.profile || {};
 
+    // required consents (order)
     if (!yn(b.consent_terms) || !yn(b.consent_accuracy) || !yn(b.consent_dropoff)) {
       return res.status(400).json({ ok: false, error: "All required consents must be accepted." });
-    }
-
-    const required = ["town","streetAddress","zone","runType","primaryStore","groceryList","dropoffPref","subsPref","contactPref"];
-    for (const k of required) {
-      if (!String(b[k] || "").trim()) return res.status(400).json({ ok: false, error: "Missing required field: " + k });
     }
 
     const runs = await ensureUpcomingRuns();
@@ -909,6 +760,45 @@ app.post("/api/orders", requireLogin, requireProfileComplete, upload.single("gro
     const cutoffAt = dayjs(run.cutoffAt).tz(TZ);
     if (!(now.isAfter(opensAt) && now.isBefore(cutoffAt))) {
       return res.status(403).json({ ok: false, error: "Ordering is closed for this run." });
+    }
+
+    // profile fallbacks (so autofill isn’t brittle)
+    const defAddr = pickDefaultAddress(profile);
+
+    const fullName = String(b.fullName || profile.fullName || user.name || "").trim();
+    const phone = String(b.phone || profile.phone || "").trim();
+
+    const town = String(b.town || defAddr?.town || "").trim();
+    const streetAddress = String(b.streetAddress || defAddr?.streetAddress || "").trim();
+    const unit = String(b.unit || defAddr?.unit || "").trim();
+    const postalCode = String(b.postalCode || defAddr?.postalCode || "").trim();
+    const zone = String(b.zone || defAddr?.zone || "").trim();
+
+    const primaryStore = String(b.primaryStore || "").trim();
+    const groceryList = String(b.groceryList || "").trim();
+
+    const dropoffPref = String(b.dropoffPref || profile.dropoffDefault || "").trim();
+    const subsPref = String(b.subsPref || profile.subsDefault || "").trim();
+    const contactPref = String(b.contactPref || profile.contactPref || "").trim();
+
+    // strict required for order submission (operational)
+    const required = [
+      ["fullName", fullName],
+      ["phone", phone],
+      ["town", town],
+      ["streetAddress", streetAddress],
+      ["postalCode", postalCode],
+      ["zone", zone],
+      ["runType", runType],
+      ["primaryStore", primaryStore],
+      ["groceryList", groceryList],
+      ["dropoffPref", dropoffPref],
+      ["subsPref", subsPref],
+      ["contactPref", contactPref],
+    ];
+
+    for (const [k, v] of required) {
+      if (!String(v || "").trim()) return res.status(400).json({ ok: false, error: "Missing required field: " + k });
     }
 
     const orderId = await nextOrderId();
@@ -925,8 +815,8 @@ app.post("/api/orders", requireLogin, requireProfileComplete, upload.single("gro
     }
 
     const pricingSnapshot = computeFeeBreakdown({
-      zone: b.zone,
-      runType: b.runType,
+      zone,
+      runType,
       extraStores,
       grocerySubtotal: Number(b.grocerySubtotal || 0),
       addon_printing: b.addon_printing || "no",
@@ -935,9 +825,8 @@ app.post("/api/orders", requireLogin, requireProfileComplete, upload.single("gro
       applyPerk: b.applyPerk || "yes",
     }).totals;
 
-    // Hard slot check per runKey, and only ACTIVE orders count
+    // slot gate per runKey
     const maxSlots = run.maxSlots || 12;
-
     const runUpdate = await Run.findOneAndUpdate(
       { runKey: run.runKey, bookedOrdersCount: { $lt: maxSlots } },
       { $inc: { bookedOrdersCount: 1, bookedFeesTotal: pricingSnapshot.totalFees }, $set: { lastRecalcAt: new Date() } },
@@ -950,28 +839,26 @@ app.post("/api/orders", requireLogin, requireProfileComplete, upload.single("gro
       orderId,
       runKey: run.runKey,
       runType,
+
       customer: {
-        fullName: String(profile.fullName || user.name || "").trim(),
+        fullName,
         email: String(user.email || "").trim().toLowerCase(),
-        phone: String(profile.phone || "").trim(),
+        phone,
       },
-      address: {
-        town: String(b.town || "").trim(),
-        streetAddress: String(b.streetAddress || "").trim(),
-        zone: String(b.zone || ""),
-      },
-      stores: { primary: String(b.primaryStore || "").trim(), extra: extraStores },
-      preferences: {
-        dropoffPref: String(b.dropoffPref || ""),
-        subsPref: String(b.subsPref || ""),
-        contactPref: String(b.contactPref || ""),
-        contactAuth: true,
-      },
-      list: { groceryListText: String(b.groceryList || "").trim(), attachment },
+
+      address: { town, streetAddress, unit, postalCode, zone },
+
+      stores: { primary: primaryStore, extra: extraStores },
+
+      preferences: { dropoffPref, subsPref, contactPref, contactAuth: true },
+
+      list: { groceryListText: groceryList, attachment },
+
       consents: { terms: true, accuracy: true, dropoff: true },
+
       pricingSnapshot,
       payments: { fees: { status: "unpaid" }, groceries: { status: "unpaid" } },
-      trackingEnabled: false,
+
       status: { state: "submitted", note: "", updatedAt: new Date(), updatedBy: "customer" },
       statusHistory: [{ state: "submitted", note: "", at: new Date(), by: "customer" }],
     });
@@ -1020,7 +907,6 @@ app.post("/api/orders/:orderId/cancel", async (req, res) => {
     order.status.note = "Cancelled by customer";
     order.status.updatedAt = new Date();
     order.status.updatedBy = "customer";
-    order.trackingEnabled = false;
     order.statusHistory.push({ state: "cancelled", note: "Cancelled by customer", at: new Date(), by: "customer" });
 
     await order.save();
@@ -1031,489 +917,19 @@ app.post("/api/orders/:orderId/cancel", async (req, res) => {
 });
 
 // =========================
-// ADMIN: RUN TRACKING + LOCATION
-// =========================
-async function ensureRunLocation(runKey) {
-  const rl = await RunLocation.findOne({ runKey });
-  if (rl) return rl;
-  return await RunLocation.create({ runKey, enabled: false });
-}
-
-app.get("/api/admin/runs/active", requireLogin, requireAdmin, async (_req, res) => {
-  try {
-    const runs = await ensureUpcomingRuns();
-    const out = {};
-    for (const type of ["local", "owen"]) {
-      const run = runs[type];
-      const rl = await RunLocation.findOne({ runKey: run.runKey }).lean();
-      out[type] = {
-        runKey: run.runKey,
-        type: run.type,
-        enabled: !!rl?.enabled,
-        updatedAtLocal: rl?.updatedAt ? fmtLocal(rl.updatedAt) : "",
-      };
-    }
-    res.json({ ok: true, runs: out });
-  } catch (e) {
-    res.status(500).json({ ok: false, error: String(e) });
-  }
-});
-
-app.post("/api/admin/runs/:runKey/tracking", requireLogin, requireAdmin, async (req, res) => {
-  try {
-    const runKey = String(req.params.runKey || "").trim();
-    const enabled = yn(req.body?.enabled);
-    const by = String(req.user?.email || "admin").toLowerCase();
-
-    const rl = await ensureRunLocation(runKey);
-    rl.enabled = enabled;
-    rl.enabledAt = enabled ? new Date() : rl.enabledAt;
-    rl.enabledBy = enabled ? by : rl.enabledBy;
-    await rl.save();
-    res.json({ ok: true, enabled: rl.enabled });
-  } catch (e) {
-    res.status(500).json({ ok: false, error: String(e) });
-  }
-});
-
-app.post("/api/admin/runs/:runKey/location", requireLogin, requireAdmin, async (req, res) => {
-  try {
-    const runKey = String(req.params.runKey || "").trim();
-    const { lat, lng, accuracy, heading, speed } = req.body || {};
-    const rl = await ensureRunLocation(runKey);
-    if (!rl.enabled) return res.status(403).json({ ok: false, error: "Run tracking is OFF" });
-
-    const la = Number(lat), ln = Number(lng);
-    if (!Number.isFinite(la) || !Number.isFinite(ln)) return res.status(400).json({ ok: false, error: "Invalid lat/lng" });
-
-    rl.lat = la;
-    rl.lng = ln;
-    rl.accuracy = Number.isFinite(Number(accuracy)) ? Number(accuracy) : rl.accuracy;
-    rl.heading = Number.isFinite(Number(heading)) ? Number(heading) : rl.heading;
-    rl.speed = Number.isFinite(Number(speed)) ? Number(speed) : rl.speed;
-    rl.updatedAt = new Date();
-    await rl.save();
-    res.json({ ok: true });
-  } catch (e) {
-    res.status(500).json({ ok: false, error: String(e) });
-  }
-});
-
-// =========================
-// ADMIN: CSV EXPORT (deliveries only)
-// =========================
-// One-click CSV for Routific import. Filters by runKey and ACTIVE states.
-// Columns:
-// order_id,name,address,phone,email,notes,duration_seconds
-app.get("/api/admin/routific/export-csv", requireLogin, requireAdmin, async (req, res) => {
-  try {
-    const runKey = String(req.query.runKey || "").trim();
-    if (!runKey) return res.status(400).send("Missing runKey");
-
-    const orders = await Order.find({
-      runKey,
-      "status.state": { $in: Array.from(ACTIVE_STATES) },
-    }).sort({ createdAt: 1 }).lean();
-
-    const header = ["order_id","name","address","phone","email","notes","duration_seconds"];
-
-    const rows = orders.map(o => {
-      const name = o.customer?.fullName || "";
-      const phone = o.customer?.phone || "";
-      const email = o.customer?.email || "";
-      const address = `${o.address?.streetAddress || ""}, ${o.address?.town || ""}, ON, Canada`.replace(/\s+/g," ").trim();
-
-      const notes = [
-        `TGR ${o.orderId}`,
-        `Zone ${o.address?.zone || ""}`,
-        o.preferences?.dropoffPref ? `Drop-off: ${o.preferences.dropoffPref}` : "",
-        o.preferences?.subsPref ? `Subs: ${o.preferences.subsPref}` : "",
-        o.stores?.primary ? `Store: ${o.stores.primary}` : "",
-        (o.stores?.extra || []).length ? `Extra: ${(o.stores.extra || []).join(", ")}` : "",
-      ].filter(Boolean).join(" | ");
-
-      const duration = 360; // 6 minutes per stop (tweak later)
-
-      return [
-        o.orderId,
-        name,
-        address,
-        phone,
-        email,
-        notes,
-        String(duration),
-      ].map(csvEscape).join(",");
-    });
-
-    const csv = header.join(",") + "\n" + rows.join("\n") + "\n";
-    const filename = `routific_${runKey}_deliveries.csv`;
-
-    res.setHeader("Content-Type", "text/csv; charset=utf-8");
-    res.setHeader("Content-Disposition", `attachment; filename="${filename}"`);
-    res.send(csv);
-  } catch (e) {
-    res.status(500).send(String(e));
-  }
-});
-
-// =========================
-// ADMIN: ORDERS LIST + QUICK ACTIONS (minimal API)
-// (If your current admin UI already uses these endpoints, keep them.)
-// =========================
-app.get("/api/admin/orders", requireLogin, requireAdmin, async (req, res) => {
-  try {
-    const limit = Math.min(200, Math.max(1, Number(req.query.limit || 50)));
-    const q = String(req.query.q || "").trim();
-    const state = String(req.query.state || "").trim();
-
-    const filter = {};
-    if (q) {
-      const re = new RegExp(q.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i");
-      filter.$or = [
-        { orderId: re },
-        { "customer.fullName": re },
-        { "customer.email": re },
-        { "customer.phone": re },
-        { "address.town": re },
-        { "address.streetAddress": re },
-      ];
-    }
-    if (state) filter["status.state"] = state;
-
-    const items = await Order.find(filter).sort({ createdAt: -1 }).limit(limit).lean();
-    res.json({ ok: true, items });
-  } catch (e) {
-    res.status(500).json({ ok: false, error: String(e) });
-  }
-});
-
-app.post("/api/admin/orders/:orderId/status", requireLogin, requireAdmin, async (req, res) => {
-  try {
-    const orderId = String(req.params.orderId || "").trim().toUpperCase();
-    const state = String(req.body?.state || "").trim();
-    const note = String(req.body?.note || "").trim();
-    const by = String(req.user?.email || "admin").toLowerCase();
-
-    if (!AllowedStates.includes(state)) return res.status(400).json({ ok: false, error: "Invalid state" });
-
-    const order = await Order.findOne({ orderId });
-    if (!order) return res.status(404).json({ ok: false, error: "Order not found" });
-
-    order.status.state = state;
-    order.status.note = note || "";
-    order.status.updatedAt = new Date();
-    order.status.updatedBy = by;
-    order.statusHistory.push({ state, note: note || "", at: new Date(), by });
-
-    if (state === "packed") {
-      order.trackingEnabled = true;
-      order.trackingEnabledAt = new Date();
-      order.trackingEnabledBy = by;
-    }
-    if (state === "cancelled" || state === "delivered") {
-      order.trackingEnabled = false;
-    }
-
-    await order.save();
-    res.json({ ok: true });
-  } catch (e) {
-    res.status(500).json({ ok: false, error: String(e) });
-  }
-});
-
-app.post("/api/admin/orders/:orderId/cancel", requireLogin, requireAdmin, async (req, res) => {
-  try {
-    const orderId = String(req.params.orderId || "").trim().toUpperCase();
-    const reason = String(req.body?.reason || "").trim();
-    const by = String(req.user?.email || "admin").toLowerCase();
-
-    const order = await Order.findOne({ orderId });
-    if (!order) return res.status(404).json({ ok: false, error: "Order not found" });
-
-    const wasActive = ACTIVE_STATES.has(order.status?.state || "submitted");
-    const fees = Number(order.pricingSnapshot?.totalFees || 0);
-
-    if (wasActive) {
-      await Run.updateOne(
-        { runKey: order.runKey },
-        { $inc: { bookedOrdersCount: -1, bookedFeesTotal: -fees }, $set: { lastRecalcAt: new Date() } }
-      );
-    }
-
-    order.status.state = "cancelled";
-    order.status.note = reason || "Cancelled by admin";
-    order.status.updatedAt = new Date();
-    order.status.updatedBy = by;
-    order.trackingEnabled = false;
-    order.statusHistory.push({ state: "cancelled", note: reason || "Cancelled by admin", at: new Date(), by });
-
-    await order.save();
-    res.json({ ok: true });
-  } catch (e) {
-    res.status(500).json({ ok: false, error: String(e) });
-  }
-});
-
-app.delete("/api/admin/orders/:orderId", requireLogin, requireAdmin, async (req, res) => {
-  try {
-    const orderId = String(req.params.orderId || "").trim().toUpperCase();
-    const order = await Order.findOne({ orderId }).lean();
-    if (!order) return res.status(404).json({ ok: false, error: "Order not found" });
-
-    const wasActive = ACTIVE_STATES.has(order.status?.state || "submitted");
-    const fees = Number(order.pricingSnapshot?.totalFees || 0);
-
-    if (wasActive) {
-      await Run.updateOne(
-        { runKey: order.runKey },
-        { $inc: { bookedOrdersCount: -1, bookedFeesTotal: -fees }, $set: { lastRecalcAt: new Date() } }
-      );
-    }
-
-    await Order.deleteOne({ orderId });
-    res.json({ ok: true });
-  } catch (e) {
-    res.status(500).json({ ok: false, error: String(e) });
-  }
-});
-
-// =========================
-// ADMIN PAGE (includes CSV download buttons)
+// ADMIN PAGE (kept simple placeholder)
 // =========================
 app.get("/admin", requireLogin, requireAdmin, async (req, res) => {
-  const email = String(req.user?.email || "").toLowerCase();
   res.setHeader("Content-Type", "text/html; charset=utf-8");
   res.send(`<!doctype html>
-<html lang="en-CA">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>TGR Admin</title>
-<style>
-  :root{
-    --bg:#0b0b0b; --panel:rgba(255,255,255,.06); --line:rgba(255,255,255,.14);
-    --text:#fff; --muted:rgba(255,255,255,.75);
-    --red:#e3342f; --red2:#ff4a44;
-    --radius:14px;
-  }
-  body{margin:0;background:var(--bg);color:var(--text);font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;}
-  .wrap{max-width:1100px;margin:0 auto;padding:16px;}
-  .card{border:1px solid var(--line);background:var(--panel);border-radius:var(--radius);padding:14px;}
-  .row{display:flex;gap:10px;flex-wrap:wrap;}
-  .btn{
-    border:1px solid rgba(255,255,255,.18);
-    background:rgba(255,255,255,.06);
-    color:#fff;font-weight:900;
-    border-radius:999px;
-    padding:10px 14px;
-    cursor:pointer;
-    text-decoration:none;
-    white-space:nowrap;
-  }
-  .btn.primary{background:linear-gradient(180deg,var(--red2),var(--red));border-color:rgba(0,0,0,.25);}
-  .btn.ghost{background:transparent;}
-  input,select{
-    width:100%;
-    padding:12px 12px;
-    border-radius:12px;
-    border:1px solid rgba(255,255,255,.18);
-    background:rgba(0,0,0,.25);
-    color:#fff;
-    font-size:16px;
-  }
-  .muted{color:var(--muted);}
-  table{width:100%;border-collapse:collapse;}
-  th,td{padding:10px 8px;border-bottom:1px solid rgba(255,255,255,.12);vertical-align:top;}
-  th{font-size:12px;color:rgba(255,255,255,.72);text-transform:uppercase;letter-spacing:.08em;text-align:left;}
-  .pill{display:inline-block;padding:4px 10px;border-radius:999px;border:1px solid rgba(255,255,255,.18);background:rgba(255,255,255,.06);font-weight:900;font-size:12px;}
-  .toast{margin-top:10px;padding:10px 12px;border-radius:12px;border:1px solid rgba(255,255,255,.18);background:rgba(0,0,0,.24);display:none;font-weight:900;}
-  .toast.show{display:block;}
-  .hr{height:1px;background:rgba(255,255,255,.12);margin:12px 0;}
-</style>
-</head>
-<body>
-<div class="wrap">
-  <div class="card">
-    <div class="row" style="align-items:center;justify-content:space-between;">
-      <div>
-        <div style="font-weight:1000;font-size:22px;">Admin</div>
-        <div class="muted">Signed in as <strong>${escapeHtml(email)}</strong></div>
-      </div>
-      <div class="row">
-        <a class="btn ghost" href="${escapeHtml(PUBLIC_SITE_URL)}/">Back to site</a>
-        <a class="btn ghost" href="/logout?returnTo=${encodeURIComponent(PUBLIC_SITE_URL + "/")}">Log out</a>
-      </div>
-    </div>
-
-    <div class="toast" id="toast"></div>
-
-    <div class="hr"></div>
-
-    <div class="row">
-      <div style="flex:1 1 320px;">
-        <div style="font-weight:900;">CSV export for Routific (deliveries only)</div>
-        <div class="muted">Downloads only active orders for each run (cancelled not included).</div>
-        <div class="row" style="margin-top:10px;">
-          <button class="btn primary" id="dlLocal">Download Local CSV</button>
-          <button class="btn primary" id="dlOwen">Download Owen CSV</button>
-        </div>
-        <div class="muted" id="runInfo" style="margin-top:10px;">Loading run keys…</div>
-      </div>
-
-      <div style="flex:1 1 320px;">
-        <div style="font-weight:900;">Search</div>
-        <div class="muted">Search by orderId / name / town / phone.</div>
-        <div class="row" style="margin-top:10px;">
-          <div style="flex:1 1 260px;"><input id="q" placeholder="e.g., TGR-00123 or Bullock or Tobermory"></div>
-          <div style="flex:0 0 210px;">
-            <select id="state">
-              <option value="">Any status</option>
-              <option value="submitted">submitted</option>
-              <option value="confirmed">confirmed</option>
-              <option value="shopping">shopping</option>
-              <option value="packed">packed</option>
-              <option value="out_for_delivery">out_for_delivery</option>
-              <option value="delivered">delivered</option>
-              <option value="issue">issue</option>
-              <option value="cancelled">cancelled</option>
-            </select>
-          </div>
-          <button class="btn" id="searchBtn">Search</button>
-        </div>
-      </div>
-    </div>
-
-    <div class="hr"></div>
-
-    <div class="muted" id="countLine">Loading…</div>
-    <div style="overflow:auto;margin-top:10px;">
-      <table>
-        <thead>
-          <tr>
-            <th>Order</th>
-            <th>Customer</th>
-            <th>Run</th>
-            <th>Address</th>
-            <th>Status</th>
-            <th>Fees</th>
-            <th>Actions</th>
-          </tr>
-        </thead>
-        <tbody id="rows"></tbody>
-      </table>
-    </div>
-  </div>
-</div>
-
-<script>
-  const toast = (msg)=>{
-    const el = document.getElementById("toast");
-    el.textContent = msg;
-    el.classList.add("show");
-    setTimeout(()=>el.classList.remove("show"), 3500);
-  };
-
-  const api = {
-    runs: "/api/admin/runs/active",
-    list: "/api/admin/orders",
-    cancel: (id)=> "/api/admin/orders/" + encodeURIComponent(id) + "/cancel",
-    del: (id)=> "/api/admin/orders/" + encodeURIComponent(id),
-  };
-
-  let runKeys = { local:"", owen:"" };
-
-  async function fetchRuns(){
-    const r = await fetch(api.runs, { credentials:"include" });
-    const d = await r.json().catch(()=>({}));
-    if(!r.ok || d.ok===false) throw new Error(d.error || "Runs failed");
-    runKeys.local = d.runs?.local?.runKey || "";
-    runKeys.owen = d.runs?.owen?.runKey || "";
-    document.getElementById("runInfo").textContent = "Local: " + runKeys.local + " • Owen: " + runKeys.owen;
-  }
-
-  function dl(runKey){
-    if(!runKey) return toast("Run key missing");
-    const url = "/api/admin/routific/export-csv?runKey=" + encodeURIComponent(runKey);
-    window.location.href = url;
-  }
-
-  async function fetchOrders(){
-    const q = document.getElementById("q").value.trim();
-    const state = document.getElementById("state").value;
-
-    const url = new URL(location.origin + api.list);
-    if(q) url.searchParams.set("q", q);
-    if(state) url.searchParams.set("state", state);
-    url.searchParams.set("limit", "80");
-
-    const r = await fetch(url.toString(), { credentials:"include" });
-    const d = await r.json().catch(()=>({}));
-    if(!r.ok || d.ok===false) throw new Error(d.error || "Orders failed");
-
-    const items = d.items || [];
-    document.getElementById("countLine").textContent = items.length + " orders shown";
-
-    const tbody = document.getElementById("rows");
-    tbody.innerHTML = "";
-
-    items.forEach(o=>{
-      const tr = document.createElement("tr");
-      const fees = (o.pricingSnapshot && typeof o.pricingSnapshot.totalFees==="number") ? o.pricingSnapshot.totalFees : 0;
-      tr.innerHTML = \`
-        <td><div style="font-weight:1000;">\${o.orderId}</div><div class="muted" style="font-size:12px;">\${new Date(o.createdAt).toLocaleString()}</div></td>
-        <td><div style="font-weight:900;">\${o.customer?.fullName || "—"}</div><div class="muted" style="font-size:12px;">\${o.customer?.phone || "—"}</div></td>
-        <td><span class="pill">\${o.runType}</span><div class="muted" style="font-size:12px;margin-top:4px;">\${o.runKey}</div></td>
-        <td><div style="font-weight:900;">\${o.address?.town || "—"} (\${o.address?.zone || "—"})</div><div class="muted" style="font-size:12px;">\${o.address?.streetAddress || "—"}</div></td>
-        <td><span class="pill">\${o.status?.state || "submitted"}</span><div class="muted" style="font-size:12px;margin-top:4px;">\${o.status?.note || ""}</div></td>
-        <td>$\${fees.toFixed(2)}</td>
-        <td>
-          <button class="btn" data-cancel="\${o.orderId}">Cancel</button>
-          <button class="btn" data-del="\${o.orderId}">Delete</button>
-        </td>
-      \`;
-      tbody.appendChild(tr);
-    });
-
-    tbody.querySelectorAll("[data-cancel]").forEach(btn=>{
-      btn.addEventListener("click", async ()=>{
-        const id = btn.getAttribute("data-cancel");
-        const reason = prompt("Cancel reason:", "Cancelled by admin") || "";
-        const r = await fetch(api.cancel(id), {
-          method:"POST",
-          headers:{ "Content-Type":"application/json" },
-          credentials:"include",
-          body: JSON.stringify({ reason }),
-        });
-        const d = await r.json().catch(()=>({}));
-        if(!r.ok || d.ok===false) return toast(d.error || "Cancel failed");
-        toast("Cancelled " + id);
-        fetchOrders().catch(e=>toast(String(e.message||e)));
-      });
-    });
-
-    tbody.querySelectorAll("[data-del]").forEach(btn=>{
-      btn.addEventListener("click", async ()=>{
-        const id = btn.getAttribute("data-del");
-        const ok = confirm("Delete " + id + "? This cannot be undone.");
-        if(!ok) return;
-        const r = await fetch(api.del(id), { method:"DELETE", credentials:"include" });
-        const d = await r.json().catch(()=>({}));
-        if(!r.ok || d.ok===false) return toast(d.error || "Delete failed");
-        toast("Deleted " + id);
-        fetchOrders().catch(e=>toast(String(e.message||e)));
-      });
-    });
-  }
-
-  document.getElementById("searchBtn").addEventListener("click", ()=>fetchOrders().catch(e=>toast(String(e.message||e))));
-  document.getElementById("dlLocal").addEventListener("click", ()=>dl(runKeys.local));
-  document.getElementById("dlOwen").addEventListener("click", ()=>dl(runKeys.owen));
-
-  fetchRuns().then(fetchOrders).catch(e=>toast(String(e.message||e)));
-</script>
-
-</body>
-</html>`);
+<html lang="en-CA"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>TGR Admin</title></head>
+<body style="font-family:system-ui;background:#0b0b0b;color:#fff;padding:16px;">
+<h1>Admin</h1>
+<p>Signed in as <strong>${String(req.user?.email || "")}</strong></p>
+<p><a style="color:#fff" href="${PUBLIC_SITE_URL}/">Back to site</a> • <a style="color:#fff" href="/logout?returnTo=${encodeURIComponent(PUBLIC_SITE_URL + "/")}">Log out</a></p>
+<p>Admin tooling is handled in your main admin UI build; this endpoint stays available.</p>
+</body></html>`);
 });
 
 // =========================
@@ -1526,7 +942,6 @@ async function main() {
   console.log("Connected to MongoDB");
   app.listen(PORT, () => console.log("Server running on port", PORT));
 }
-
 main().catch((err) => {
   console.error(err);
   process.exit(1);
