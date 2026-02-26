@@ -1,6 +1,7 @@
 // ======= server.js (FULL FILE) — TGR backend =======
 // Implements: Google OAuth, required profile onboarding, runs, estimator, orders, cancel tokens
-// + RESTORED full admin UI and admin endpoints (search/cancel/delete/export)
+// + FULL admin UI and admin endpoints (search/cancel/delete/export)
+// + MEMBER PORTAL (/member) restored + order list + cancel button (before cutoff)
 
 const express = require("express");
 const mongoose = require("mongoose");
@@ -53,7 +54,7 @@ const PUBLIC_SITE_URL =
 
 const MAPBOX_PUBLIC_TOKEN = process.env.MAPBOX_PUBLIC_TOKEN || "";
 
-// Square links (use your current ones; can override via Render env)
+// Square links (override via Render env)
 const SQUARE_PAY_GROCERIES_LINK =
   process.env.SQUARE_PAY_GROCERIES_LINK || "https://square.link/u/R0hfr7x8";
 const SQUARE_PAY_FEES_LINK =
@@ -799,7 +800,6 @@ app.post("/api/orders", requireLogin, requireProfileComplete, upload.single("gro
       ["subsPref", subsPref],
       ["contactPref", contactPref],
     ];
-
     for (const [k, v] of required) {
       if (!String(v || "").trim()) return res.status(400).json({ ok: false, error: "Missing required field: " + k });
     }
@@ -841,26 +841,14 @@ app.post("/api/orders", requireLogin, requireProfileComplete, upload.single("gro
       orderId,
       runKey: run.runKey,
       runType,
-
-      customer: {
-        fullName,
-        email: String(user.email || "").trim().toLowerCase(),
-        phone,
-      },
-
+      customer: { fullName, email: String(user.email || "").trim().toLowerCase(), phone },
       address: { town, streetAddress, unit, postalCode, zone },
-
       stores: { primary: primaryStore, extra: extraStores },
-
       preferences: { dropoffPref, subsPref, contactPref, contactAuth: true },
-
       list: { groceryListText: groceryList, attachment },
-
       consents: { terms: true, accuracy: true, dropoff: true },
-
       pricingSnapshot,
       payments: { fees: { status: "unpaid" }, groceries: { status: "unpaid" } },
-
       status: { state: "submitted", note: "", updatedAt: new Date(), updatedBy: "customer" },
       statusHistory: [{ state: "submitted", note: "", at: new Date(), by: "customer" }],
     });
@@ -919,7 +907,174 @@ app.post("/api/orders/:orderId/cancel", async (req, res) => {
 });
 
 // =========================
-// ADMIN API ENDPOINTS (RESTORED)
+// MEMBER PORTAL (RESTORED)
+// =========================
+app.get("/member", requireLogin, async (req, res) => {
+  try {
+    const email = String(req.user?.email || "").toLowerCase().trim();
+    const name = String(req.user?.name || "").trim();
+
+    const orders = await Order.find({ "customer.email": email })
+      .sort({ createdAt: -1 })
+      .limit(40)
+      .lean();
+
+    const runKeys = Array.from(new Set(orders.map(o => o.runKey).filter(Boolean)));
+    const runs = await Run.find({ runKey: { $in: runKeys } }).lean();
+    const runByKey = new Map(runs.map(r => [r.runKey, r]));
+
+    const now = nowTz();
+
+    const rows = orders.map(o => {
+      const fees = typeof o.pricingSnapshot?.totalFees === "number" ? o.pricingSnapshot.totalFees.toFixed(2) : "0.00";
+      const status = o.status?.state || "submitted";
+      const run = runByKey.get(o.runKey);
+      const cutoffAt = run?.cutoffAt ? dayjs(run.cutoffAt).tz(TZ) : null;
+      const cancelOpen = cutoffAt ? now.isBefore(cutoffAt) : false;
+
+      let cancelHtml = `<span class="muted">Not available</span>`;
+      if (ACTIVE_STATES.has(status) && cancelOpen) {
+        const token = signCancelToken(o.orderId, cutoffAt.toDate().getTime());
+        cancelHtml = `<button class="btn" data-cancel="${escapeHtml(o.orderId)}" data-token="${escapeHtml(token)}">Cancel</button>`;
+      } else if (status === "cancelled") {
+        cancelHtml = `<span class="pill">Cancelled</span>`;
+      } else if (!cancelOpen && ACTIVE_STATES.has(status)) {
+        cancelHtml = `<span class="muted">Past cutoff</span>`;
+      }
+
+      return `
+        <tr>
+          <td><div style="font-weight:1000;">${escapeHtml(o.orderId)}</div><div class="muted" style="font-size:12px;">${escapeHtml(fmtLocal(o.createdAt))}</div></td>
+          <td><div style="font-weight:900;">${escapeHtml(o.address?.town || "")} (Zone ${escapeHtml(o.address?.zone || "")})</div>
+              <div class="muted" style="font-size:12px;">${escapeHtml(o.address?.streetAddress || "")} • ${escapeHtml(o.address?.postalCode || "")}</div></td>
+          <td><span class="pill">${escapeHtml(o.runType || "")}</span><div class="muted" style="font-size:12px;margin-top:4px;">${escapeHtml(o.runKey || "")}</div></td>
+          <td><span class="pill">${escapeHtml(status)}</span><div class="muted" style="font-size:12px;margin-top:4px;">${escapeHtml(o.status?.note || "")}</div></td>
+          <td>$${escapeHtml(fees)}</td>
+          <td>${cancelHtml}</td>
+        </tr>
+      `;
+    }).join("");
+
+    res.setHeader("Content-Type", "text/html; charset=utf-8");
+    res.send(`<!doctype html>
+<html lang="en-CA">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>TGR Member Portal</title>
+<style>
+  :root{
+    --bg:#0b0b0b; --panel:rgba(255,255,255,.06); --line:rgba(255,255,255,.14);
+    --text:#fff; --muted:rgba(255,255,255,.75);
+    --red:#e3342f; --red2:#ff4a44;
+    --radius:14px;
+  }
+  body{margin:0;background:var(--bg);color:var(--text);font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;}
+  .wrap{max-width:1100px;margin:0 auto;padding:16px;}
+  .card{border:1px solid var(--line);background:var(--panel);border-radius:var(--radius);padding:14px;}
+  .row{display:flex;gap:10px;flex-wrap:wrap;align-items:center;}
+  .btn{
+    border:1px solid rgba(255,255,255,.18);
+    background:rgba(255,255,255,.06);
+    color:#fff;font-weight:900;
+    border-radius:999px;
+    padding:10px 14px;
+    cursor:pointer;
+    text-decoration:none;
+    white-space:nowrap;
+  }
+  .btn.primary{background:linear-gradient(180deg,var(--red2),var(--red));border-color:rgba(0,0,0,.25);}
+  .btn.ghost{background:transparent;}
+  .muted{color:var(--muted);}
+  .pill{display:inline-block;padding:4px 10px;border-radius:999px;border:1px solid rgba(255,255,255,.18);background:rgba(255,255,255,.06);font-weight:900;font-size:12px;}
+  table{width:100%;border-collapse:collapse;}
+  th,td{padding:10px 8px;border-bottom:1px solid rgba(255,255,255,.12);vertical-align:top;}
+  th{font-size:12px;color:rgba(255,255,255,.72);text-transform:uppercase;letter-spacing:.08em;text-align:left;}
+  .toast{margin-top:10px;padding:10px 12px;border-radius:12px;border:1px solid rgba(255,255,255,.18);background:rgba(0,0,0,.24);display:none;font-weight:900;}
+  .toast.show{display:block;}
+  .hr{height:1px;background:rgba(255,255,255,.12);margin:12px 0;}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="card">
+    <div class="row" style="justify-content:space-between;">
+      <div>
+        <div style="font-weight:1000;font-size:22px;">Member Portal</div>
+        <div class="muted">Signed in as <strong>${escapeHtml(email)}</strong>${name ? ` • ${escapeHtml(name)}` : ""}</div>
+      </div>
+      <div class="row">
+        <a class="btn ghost" href="${escapeHtml(PUBLIC_SITE_URL)}/">Back to site</a>
+        <a class="btn" href="${escapeHtml(SQUARE_PAY_GROCERIES_LINK)}" target="_blank" rel="noopener">Pay Grocery Total</a>
+        <a class="btn" href="${escapeHtml(SQUARE_PAY_FEES_LINK)}" target="_blank" rel="noopener">Pay Service & Delivery Fees</a>
+        <a class="btn ghost" href="/logout?returnTo=${encodeURIComponent(PUBLIC_SITE_URL + "/")}">Log out</a>
+      </div>
+    </div>
+
+    <div class="toast" id="toast"></div>
+
+    <div class="hr"></div>
+
+    <div style="overflow:auto;">
+      <table>
+        <thead>
+          <tr>
+            <th>Order</th>
+            <th>Address</th>
+            <th>Run</th>
+            <th>Status</th>
+            <th>Fees</th>
+            <th>Cancel</th>
+          </tr>
+        </thead>
+        <tbody>
+          ${rows || `<tr><td colspan="6" class="muted">No orders yet.</td></tr>`}
+        </tbody>
+      </table>
+    </div>
+  </div>
+</div>
+
+<script>
+  const toast = (msg)=>{
+    const el = document.getElementById("toast");
+    el.textContent = msg;
+    el.classList.add("show");
+    setTimeout(()=>el.classList.remove("show"), 3500);
+  };
+
+  async function cancelOrder(orderId, token){
+    const ok = confirm("Cancel " + orderId + " before cutoff?");
+    if(!ok) return;
+
+    const r = await fetch("/api/orders/" + encodeURIComponent(orderId) + "/cancel", {
+      method:"POST",
+      headers:{ "Content-Type":"application/json" },
+      credentials:"include",
+      body: JSON.stringify({ token }),
+    });
+    const d = await r.json().catch(()=>({}));
+    if(!r.ok || d.ok===false) return toast(d.error || "Cancel failed");
+    toast("Cancelled " + orderId);
+    setTimeout(()=>location.reload(), 700);
+  }
+
+  document.querySelectorAll("[data-cancel]").forEach(btn=>{
+    btn.addEventListener("click", ()=>{
+      cancelOrder(btn.getAttribute("data-cancel"), btn.getAttribute("data-token"));
+    });
+  });
+</script>
+
+</body>
+</html>`);
+  } catch (e) {
+    res.status(500).send("Member portal error: " + String(e));
+  }
+});
+
+// =========================
+// ADMIN API ENDPOINTS
 // =========================
 app.get("/api/admin/orders", requireLogin, requireAdmin, async (req, res) => {
   try {
@@ -1036,7 +1191,7 @@ app.get("/api/admin/routific/export-csv", requireLogin, requireAdmin, async (req
         (o.stores?.extra || []).length ? `Extra: ${(o.stores.extra || []).join(", ")}` : "",
       ].filter(Boolean).join(" | ");
 
-      const duration = 360; // 6 min default; tweak later
+      const duration = 360;
       return [o.orderId, name, address, phone, email, notes, String(duration)].map(csvEscape).join(",");
     });
 
@@ -1052,7 +1207,7 @@ app.get("/api/admin/routific/export-csv", requireLogin, requireAdmin, async (req
 });
 
 // =========================
-// FULL ADMIN PAGE (RESTORED)
+// FULL ADMIN PAGE
 // =========================
 app.get("/admin", requireLogin, requireAdmin, async (req, res) => {
   const email = String(req.user?.email || "").toLowerCase();
