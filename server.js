@@ -1,12 +1,6 @@
 // ======= server.js (FULL FILE) — TGR backend =======
 // Implements: Google OAuth, required profile onboarding, runs, estimator, orders, cancel tokens
-// NEW in this version:
-// - Profile addresses include postalCode
-// - Order snapshot includes postalCode
-// - isProfileComplete requires postalCode
-// - /api/profile saves postalCode
-// - /api/orders requires postalCode (unless provided via profile fallback)
-// - Admin + Member routes kept (simple)
+// + RESTORED full admin UI and admin endpoints (search/cancel/delete/export)
 
 const express = require("express");
 const mongoose = require("mongoose");
@@ -274,7 +268,6 @@ const OrderSchema = new mongoose.Schema(
 
     customer: { fullName: String, email: String, phone: String },
 
-    // NEW: postalCode stored on every order snapshot
     address: {
       town: String,
       streetAddress: String,
@@ -336,6 +329,23 @@ const Order = mongoose.model("Order", OrderSchema);
 // =========================
 // HELPERS
 // =========================
+function escapeHtml(s) {
+  return String(s || "")
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#039;");
+}
+
+function csvEscape(val) {
+  const s = String(val ?? "");
+  if (s.includes('"') || s.includes(",") || s.includes("\n") || s.includes("\r")) {
+    return `"${s.replaceAll('"', '""')}"`;
+  }
+  return s;
+}
+
 function nowTz() { return dayjs().tz(TZ); }
 function fmtLocal(d) { if (!d) return ""; return dayjs(d).tz(TZ).format("ddd MMM D, h:mma"); }
 
@@ -466,7 +476,6 @@ function yn(v) {
   return v === true || String(v || "").toLowerCase() === "yes";
 }
 
-// NEW: profileComplete requires postalCode
 function isProfileComplete(profile) {
   const p = profile || {};
   if (p.complete === true) return true;
@@ -494,18 +503,21 @@ function requireLogin(req, res, next) {
   if (!req.user) return res.status(401).json({ ok: false, error: "Sign-in required." });
   next();
 }
+
 function requireProfileComplete(req, res, next) {
   if (!isProfileComplete(req.user?.profile || {})) {
     return res.status(403).json({ ok: false, error: "Account setup required. Please complete your profile." });
   }
   next();
 }
+
 function isAdminEmail(email) {
   const e = String(email || "").toLowerCase().trim();
   if (!e) return false;
   if (!ADMIN_EMAILS.length) return true;
   return ADMIN_EMAILS.includes(e);
 }
+
 function requireAdmin(req, res, next) {
   const email = String(req.user?.email || "").toLowerCase().trim();
   if (!email || !isAdminEmail(email)) return res.status(403).send("Admin access required.");
@@ -627,8 +639,6 @@ app.post("/api/profile", requireLogin, async (req, res) => {
 
     const newProfile = {
       version: 1,
-
-      // identity/contact
       fullName: String(b.fullName || "").trim(),
       preferredName: String(b.preferredName || "").trim(),
       phone: String(b.phone || "").trim(),
@@ -636,17 +646,14 @@ app.post("/api/profile", requireLogin, async (req, res) => {
       contactPref: String(b.contactPref || "").trim(),
       contactAuth: yn(b.contactAuth),
 
-      // defaults
       subsDefault: String(b.subsDefault || "").trim(),
       dropoffDefault: String(b.dropoffDefault || "").trim(),
 
-      // optional operational notes
       customerType: String(b.customerType || "").trim(),
       accessibility: String(b.accessibility || "").trim(),
       dietary: String(b.dietary || "").trim(),
       notes: String(b.notes || "").trim(),
 
-      // address book (NEW includes postalCode + unit)
       addresses: addresses.map((a) => ({
         id: String(a.id || "").trim() || String(Math.random()).slice(2),
         label: String(a.label || "").trim(),
@@ -661,7 +668,6 @@ app.post("/api/profile", requireLogin, async (req, res) => {
 
       defaultId: String(b.defaultId || "").trim(),
 
-      // consents
       consentTerms: yn(b.consentTerms),
       consentPrivacy: yn(b.consentPrivacy),
       consentMarketing: yn(b.consentMarketing),
@@ -745,7 +751,6 @@ app.post("/api/orders", requireLogin, requireProfileComplete, upload.single("gro
     const user = await User.findById(req.user._id).lean();
     const profile = user?.profile || {};
 
-    // required consents (order)
     if (!yn(b.consent_terms) || !yn(b.consent_accuracy) || !yn(b.consent_dropoff)) {
       return res.status(400).json({ ok: false, error: "All required consents must be accepted." });
     }
@@ -762,7 +767,6 @@ app.post("/api/orders", requireLogin, requireProfileComplete, upload.single("gro
       return res.status(403).json({ ok: false, error: "Ordering is closed for this run." });
     }
 
-    // profile fallbacks (so autofill isn’t brittle)
     const defAddr = pickDefaultAddress(profile);
 
     const fullName = String(b.fullName || profile.fullName || user.name || "").trim();
@@ -781,7 +785,6 @@ app.post("/api/orders", requireLogin, requireProfileComplete, upload.single("gro
     const subsPref = String(b.subsPref || profile.subsDefault || "").trim();
     const contactPref = String(b.contactPref || profile.contactPref || "").trim();
 
-    // strict required for order submission (operational)
     const required = [
       ["fullName", fullName],
       ["phone", phone],
@@ -825,7 +828,6 @@ app.post("/api/orders", requireLogin, requireProfileComplete, upload.single("gro
       applyPerk: b.applyPerk || "yes",
     }).totals;
 
-    // slot gate per runKey
     const maxSlots = run.maxSlots || 12;
     const runUpdate = await Run.findOneAndUpdate(
       { runKey: run.runKey, bookedOrdersCount: { $lt: maxSlots } },
@@ -917,19 +919,375 @@ app.post("/api/orders/:orderId/cancel", async (req, res) => {
 });
 
 // =========================
-// ADMIN PAGE (kept simple placeholder)
+// ADMIN API ENDPOINTS (RESTORED)
+// =========================
+app.get("/api/admin/orders", requireLogin, requireAdmin, async (req, res) => {
+  try {
+    const limit = Math.min(250, Math.max(1, Number(req.query.limit || 80)));
+    const q = String(req.query.q || "").trim();
+    const state = String(req.query.state || "").trim();
+    const runKey = String(req.query.runKey || "").trim();
+
+    const filter = {};
+    if (runKey) filter.runKey = runKey;
+    if (state) filter["status.state"] = state;
+
+    if (q) {
+      const safe = q.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      const re = new RegExp(safe, "i");
+      filter.$or = [
+        { orderId: re },
+        { "customer.fullName": re },
+        { "customer.email": re },
+        { "customer.phone": re },
+        { "address.town": re },
+        { "address.streetAddress": re },
+        { "address.postalCode": re },
+      ];
+    }
+
+    const items = await Order.find(filter).sort({ createdAt: -1 }).limit(limit).lean();
+    res.json({ ok: true, items });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: String(e) });
+  }
+});
+
+app.post("/api/admin/orders/:orderId/cancel", requireLogin, requireAdmin, async (req, res) => {
+  try {
+    const orderId = String(req.params.orderId || "").trim().toUpperCase();
+    const reason = String(req.body?.reason || "").trim() || "Cancelled by admin";
+    const by = String(req.user?.email || "admin").toLowerCase();
+
+    const order = await Order.findOne({ orderId });
+    if (!order) return res.status(404).json({ ok: false, error: "Order not found" });
+
+    const wasActive = ACTIVE_STATES.has(order.status?.state || "submitted");
+    if (wasActive) {
+      const fees = Number(order.pricingSnapshot?.totalFees || 0);
+      await Run.updateOne(
+        { runKey: order.runKey },
+        { $inc: { bookedOrdersCount: -1, bookedFeesTotal: -fees }, $set: { lastRecalcAt: new Date() } }
+      );
+    }
+
+    order.status.state = "cancelled";
+    order.status.note = reason;
+    order.status.updatedAt = new Date();
+    order.status.updatedBy = by;
+    order.statusHistory.push({ state: "cancelled", note: reason, at: new Date(), by });
+
+    await order.save();
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: String(e) });
+  }
+});
+
+app.delete("/api/admin/orders/:orderId", requireLogin, requireAdmin, async (req, res) => {
+  try {
+    const orderId = String(req.params.orderId || "").trim().toUpperCase();
+    const order = await Order.findOne({ orderId }).lean();
+    if (!order) return res.status(404).json({ ok: false, error: "Order not found" });
+
+    const wasActive = ACTIVE_STATES.has(order.status?.state || "submitted");
+    if (wasActive) {
+      const fees = Number(order.pricingSnapshot?.totalFees || 0);
+      await Run.updateOne(
+        { runKey: order.runKey },
+        { $inc: { bookedOrdersCount: -1, bookedFeesTotal: -fees }, $set: { lastRecalcAt: new Date() } }
+      );
+    }
+
+    await Order.deleteOne({ orderId });
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: String(e) });
+  }
+});
+
+app.get("/api/admin/routific/export-csv", requireLogin, requireAdmin, async (req, res) => {
+  try {
+    const runKey = String(req.query.runKey || "").trim();
+    if (!runKey) return res.status(400).send("Missing runKey");
+
+    const orders = await Order.find({
+      runKey,
+      "status.state": { $in: Array.from(ACTIVE_STATES) },
+    }).sort({ createdAt: 1 }).lean();
+
+    const header = ["order_id","name","address","phone","email","notes","duration_seconds"];
+    const rows = orders.map(o => {
+      const name = o.customer?.fullName || "";
+      const phone = o.customer?.phone || "";
+      const email = o.customer?.email || "";
+      const address =
+        `${o.address?.streetAddress || ""}${o.address?.unit ? (" " + o.address.unit) : ""}, ` +
+        `${o.address?.town || ""}, ON, ${o.address?.postalCode || ""}, Canada`
+          .replace(/\s+/g, " ")
+          .trim();
+
+      const notes = [
+        `TGR ${o.orderId}`,
+        `Zone ${o.address?.zone || ""}`,
+        o.preferences?.dropoffPref ? `Drop-off: ${o.preferences.dropoffPref}` : "",
+        o.preferences?.subsPref ? `Subs: ${o.preferences.subsPref}` : "",
+        o.stores?.primary ? `Store: ${o.stores.primary}` : "",
+        (o.stores?.extra || []).length ? `Extra: ${(o.stores.extra || []).join(", ")}` : "",
+      ].filter(Boolean).join(" | ");
+
+      const duration = 360; // 6 min default; tweak later
+      return [o.orderId, name, address, phone, email, notes, String(duration)].map(csvEscape).join(",");
+    });
+
+    const csv = header.join(",") + "\n" + rows.join("\n") + "\n";
+    const filename = `routific_${runKey}_deliveries.csv`;
+
+    res.setHeader("Content-Type", "text/csv; charset=utf-8");
+    res.setHeader("Content-Disposition", `attachment; filename="${filename}"`);
+    res.send(csv);
+  } catch (e) {
+    res.status(500).send(String(e));
+  }
+});
+
+// =========================
+// FULL ADMIN PAGE (RESTORED)
 // =========================
 app.get("/admin", requireLogin, requireAdmin, async (req, res) => {
+  const email = String(req.user?.email || "").toLowerCase();
   res.setHeader("Content-Type", "text/html; charset=utf-8");
   res.send(`<!doctype html>
-<html lang="en-CA"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>TGR Admin</title></head>
-<body style="font-family:system-ui;background:#0b0b0b;color:#fff;padding:16px;">
-<h1>Admin</h1>
-<p>Signed in as <strong>${String(req.user?.email || "")}</strong></p>
-<p><a style="color:#fff" href="${PUBLIC_SITE_URL}/">Back to site</a> • <a style="color:#fff" href="/logout?returnTo=${encodeURIComponent(PUBLIC_SITE_URL + "/")}">Log out</a></p>
-<p>Admin tooling is handled in your main admin UI build; this endpoint stays available.</p>
-</body></html>`);
+<html lang="en-CA">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>TGR Admin</title>
+<style>
+  :root{
+    --bg:#0b0b0b; --panel:rgba(255,255,255,.06); --line:rgba(255,255,255,.14);
+    --text:#fff; --muted:rgba(255,255,255,.75);
+    --red:#e3342f; --red2:#ff4a44;
+    --radius:14px;
+  }
+  body{margin:0;background:var(--bg);color:var(--text);font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;}
+  .wrap{max-width:1100px;margin:0 auto;padding:16px;}
+  .card{border:1px solid var(--line);background:var(--panel);border-radius:var(--radius);padding:14px;}
+  .row{display:flex;gap:10px;flex-wrap:wrap;}
+  .btn{
+    border:1px solid rgba(255,255,255,.18);
+    background:rgba(255,255,255,.06);
+    color:#fff;font-weight:900;
+    border-radius:999px;
+    padding:10px 14px;
+    cursor:pointer;
+    text-decoration:none;
+    white-space:nowrap;
+  }
+  .btn.primary{background:linear-gradient(180deg,var(--red2),var(--red));border-color:rgba(0,0,0,.25);}
+  .btn.ghost{background:transparent;}
+  input,select{
+    width:100%;
+    padding:12px 12px;
+    border-radius:12px;
+    border:1px solid rgba(255,255,255,.18);
+    background:rgba(0,0,0,.25);
+    color:#fff;
+    font-size:16px;
+  }
+  .muted{color:var(--muted);}
+  table{width:100%;border-collapse:collapse;}
+  th,td{padding:10px 8px;border-bottom:1px solid rgba(255,255,255,.12);vertical-align:top;}
+  th{font-size:12px;color:rgba(255,255,255,.72);text-transform:uppercase;letter-spacing:.08em;text-align:left;}
+  .pill{display:inline-block;padding:4px 10px;border-radius:999px;border:1px solid rgba(255,255,255,.18);background:rgba(255,255,255,.06);font-weight:900;font-size:12px;}
+  .toast{margin-top:10px;padding:10px 12px;border-radius:12px;border:1px solid rgba(255,255,255,.18);background:rgba(0,0,0,.24);display:none;font-weight:900;}
+  .toast.show{display:block;}
+  .hr{height:1px;background:rgba(255,255,255,.12);margin:12px 0;}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="card">
+    <div class="row" style="align-items:center;justify-content:space-between;">
+      <div>
+        <div style="font-weight:1000;font-size:22px;">Admin</div>
+        <div class="muted">Signed in as <strong>${escapeHtml(email)}</strong></div>
+      </div>
+      <div class="row">
+        <a class="btn ghost" href="${escapeHtml(PUBLIC_SITE_URL)}/">Back to site</a>
+        <a class="btn ghost" href="/logout?returnTo=${encodeURIComponent(PUBLIC_SITE_URL + "/")}">Log out</a>
+      </div>
+    </div>
+
+    <div class="toast" id="toast"></div>
+
+    <div class="hr"></div>
+
+    <div class="row">
+      <div style="flex:1 1 360px;">
+        <div style="font-weight:900;">Routific CSV export (active orders only)</div>
+        <div class="muted">Downloads only active orders for each runKey.</div>
+        <div class="row" style="margin-top:10px;">
+          <button class="btn primary" id="dlLocal">Download Local CSV</button>
+          <button class="btn primary" id="dlOwen">Download Owen CSV</button>
+        </div>
+        <div class="muted" id="runInfo" style="margin-top:10px;">Loading run keys…</div>
+      </div>
+
+      <div style="flex:1 1 360px;">
+        <div style="font-weight:900;">Search</div>
+        <div class="muted">OrderId / name / town / phone / email / postal.</div>
+        <div class="row" style="margin-top:10px;">
+          <div style="flex:1 1 260px;"><input id="q" placeholder="e.g., TGR-00123 or Bullock or Tobermory"></div>
+          <div style="flex:0 0 210px;">
+            <select id="state">
+              <option value="">Any status</option>
+              <option value="submitted">submitted</option>
+              <option value="confirmed">confirmed</option>
+              <option value="shopping">shopping</option>
+              <option value="packed">packed</option>
+              <option value="out_for_delivery">out_for_delivery</option>
+              <option value="delivered">delivered</option>
+              <option value="issue">issue</option>
+              <option value="cancelled">cancelled</option>
+            </select>
+          </div>
+          <button class="btn" id="searchBtn">Search</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="hr"></div>
+
+    <div class="muted" id="countLine">Loading…</div>
+    <div style="overflow:auto;margin-top:10px;">
+      <table>
+        <thead>
+          <tr>
+            <th>Order</th>
+            <th>Customer</th>
+            <th>Run</th>
+            <th>Address</th>
+            <th>Status</th>
+            <th>Fees</th>
+            <th>Actions</th>
+          </tr>
+        </thead>
+        <tbody id="rows"></tbody>
+      </table>
+    </div>
+  </div>
+</div>
+
+<script>
+  const toast = (msg)=>{
+    const el = document.getElementById("toast");
+    el.textContent = msg;
+    el.classList.add("show");
+    setTimeout(()=>el.classList.remove("show"), 3500);
+  };
+
+  const api = {
+    runs: "/api/runs/active",
+    list: "/api/admin/orders",
+    cancel: (id)=> "/api/admin/orders/" + encodeURIComponent(id) + "/cancel",
+    del: (id)=> "/api/admin/orders/" + encodeURIComponent(id),
+  };
+
+  let runKeys = { local:"", owen:"" };
+
+  async function fetchRuns(){
+    const r = await fetch(api.runs, { credentials:"include" });
+    const d = await r.json().catch(()=>({}));
+    if(!r.ok || d.ok===false) throw new Error(d.error || "Runs failed");
+    runKeys.local = d.runs?.local?.runKey || "";
+    runKeys.owen = d.runs?.owen?.runKey || "";
+    document.getElementById("runInfo").textContent = "Local: " + runKeys.local + " • Owen: " + runKeys.owen;
+  }
+
+  function dl(runKey){
+    if(!runKey) return toast("Run key missing");
+    const url = "/api/admin/routific/export-csv?runKey=" + encodeURIComponent(runKey);
+    window.location.href = url;
+  }
+
+  async function fetchOrders(){
+    const q = document.getElementById("q").value.trim();
+    const state = document.getElementById("state").value;
+
+    const url = new URL(location.origin + api.list);
+    if(q) url.searchParams.set("q", q);
+    if(state) url.searchParams.set("state", state);
+    url.searchParams.set("limit", "80");
+
+    const r = await fetch(url.toString(), { credentials:"include" });
+    const d = await r.json().catch(()=>({}));
+    if(!r.ok || d.ok===false) throw new Error(d.error || "Orders failed");
+
+    const items = d.items || [];
+    document.getElementById("countLine").textContent = items.length + " orders shown";
+
+    const tbody = document.getElementById("rows");
+    tbody.innerHTML = "";
+
+    items.forEach(o=>{
+      const tr = document.createElement("tr");
+      const fees = (o.pricingSnapshot && typeof o.pricingSnapshot.totalFees==="number") ? o.pricingSnapshot.totalFees : 0;
+      tr.innerHTML = \`
+        <td><div style="font-weight:1000;">\${o.orderId}</div><div class="muted" style="font-size:12px;">\${new Date(o.createdAt).toLocaleString()}</div></td>
+        <td><div style="font-weight:900;">\${o.customer?.fullName || "—"}</div><div class="muted" style="font-size:12px;">\${o.customer?.phone || "—"}</div></td>
+        <td><span class="pill">\${o.runType}</span><div class="muted" style="font-size:12px;margin-top:4px;">\${o.runKey}</div></td>
+        <td><div style="font-weight:900;">\${o.address?.town || "—"} (Zone \${o.address?.zone || "—"})</div><div class="muted" style="font-size:12px;">\${o.address?.streetAddress || "—"} • \${o.address?.postalCode || ""}</div></td>
+        <td><span class="pill">\${o.status?.state || "submitted"}</span><div class="muted" style="font-size:12px;margin-top:4px;">\${o.status?.note || ""}</div></td>
+        <td>$\${fees.toFixed(2)}</td>
+        <td>
+          <button class="btn" data-cancel="\${o.orderId}">Cancel</button>
+          <button class="btn" data-del="\${o.orderId}">Delete</button>
+        </td>
+      \`;
+      tbody.appendChild(tr);
+    });
+
+    tbody.querySelectorAll("[data-cancel]").forEach(btn=>{
+      btn.addEventListener("click", async ()=>{
+        const id = btn.getAttribute("data-cancel");
+        const reason = prompt("Cancel reason:", "Cancelled by admin") || "";
+        const r = await fetch(api.cancel(id), {
+          method:"POST",
+          headers:{ "Content-Type":"application/json" },
+          credentials:"include",
+          body: JSON.stringify({ reason }),
+        });
+        const d = await r.json().catch(()=>({}));
+        if(!r.ok || d.ok===false) return toast(d.error || "Cancel failed");
+        toast("Cancelled " + id + " (slot freed if active)");
+        fetchOrders().catch(e=>toast(String(e.message||e)));
+      });
+    });
+
+    tbody.querySelectorAll("[data-del]").forEach(btn=>{
+      btn.addEventListener("click", async ()=>{
+        const id = btn.getAttribute("data-del");
+        const ok = confirm("Delete " + id + "? This cannot be undone.");
+        if(!ok) return;
+        const r = await fetch(api.del(id), { method:"DELETE", credentials:"include" });
+        const d = await r.json().catch(()=>({}));
+        if(!r.ok || d.ok===false) return toast(d.error || "Delete failed");
+        toast("Deleted " + id + " (slot freed if active)");
+        fetchOrders().catch(e=>toast(String(e.message||e)));
+      });
+    });
+  }
+
+  document.getElementById("searchBtn").addEventListener("click", ()=>fetchOrders().catch(e=>toast(String(e.message||e))));
+  document.getElementById("dlLocal").addEventListener("click", ()=>dl(runKeys.local));
+  document.getElementById("dlOwen").addEventListener("click", ()=>dl(runKeys.owen));
+
+  fetchRuns().then(fetchOrders).catch(e=>toast(String(e.message||e)));
+</script>
+
+</body>
+</html>`);
 });
 
 // =========================
