@@ -9,6 +9,12 @@
 //     GET /vendor/addresscomplete.js
 //     GET /vendor/addresscomplete.css
 //     GET /api/public/addresscomplete  (returns URLs for frontend)
+//
+// FIX (Bi-weekly runs / ordering windows):
+// - Local + Owen runs are bi-weekly alternating, not weekly.
+// - ensureUpcomingRuns() now uses DB-driven "next run" logic instead of always "next Saturday/Sunday".
+//   If a future run already exists in Mongo for that type, it uses it.
+//   Otherwise it creates the next run as (latest run of that type + 14 days).
 
 const express = require("express");
 const mongoose = require("mongoose");
@@ -188,7 +194,12 @@ if (GOOGLE_CLIENT_ID && GOOGLE_CLIENT_SECRET && GOOGLE_CALLBACK_URL) {
                 renewalDate: null,
                 discounts: [],
                 perks: [],
-                profile: { version: 1, complete: false, defaultId: "", addresses: [] },
+                profile: {
+                  version: 1,
+                  complete: false,
+                  defaultId: "",
+                  addresses: [],
+                },
               },
             },
             { upsert: true, new: true }
@@ -213,7 +224,12 @@ const PRICING = {
   serviceFee: 25,
   zone: { A: 20, B: 15, C: 10, D: 25 },
   owenRunFeePerOrder: 20,
-  addOns: { extraStore: 8, printingBase: 5, printingFirst10: 1.25, printingAfter10: 0.75 },
+  addOns: {
+    extraStore: 8,
+    printingBase: 5,
+    printingFirst10: 1.25,
+    printingAfter10: 0.75,
+  },
   groceryUnderMin: { threshold: 35, surcharge: 19 },
 };
 
@@ -222,15 +238,29 @@ function calcPrinting(pages) {
   if (p <= 0) return 0;
   const first = Math.min(p, 10);
   const rest = Math.max(0, p - 10);
-  return PRICING.addOns.printingBase + first * PRICING.addOns.printingFirst10 + rest * PRICING.addOns.printingAfter10;
+  return (
+    PRICING.addOns.printingBase +
+    first * PRICING.addOns.printingFirst10 +
+    rest * PRICING.addOns.printingAfter10
+  );
 }
 
 function membershipDiscounts(tier, applyPerkYes) {
-  if (!tier || !applyPerkYes) return { serviceOff: 0, zoneOff: 0, freeAddonUpTo: 0, waitWaived: false };
-  if (tier === "standard") return { serviceOff: 0, zoneOff: 10, freeAddonUpTo: 10, waitWaived: false };
-  if (tier === "route") return { serviceOff: 5, zoneOff: 10, freeAddonUpTo: 10, waitWaived: false };
-  if (tier === "access") return { serviceOff: 8, zoneOff: 10, freeAddonUpTo: 10, waitWaived: true };
-  if (tier === "accesspro") return { serviceOff: 10, zoneOff: 0, freeAddonUpTo: 0, waitWaived: true };
+  if (!tier || !applyPerkYes)
+    return {
+      serviceOff: 0,
+      zoneOff: 0,
+      freeAddonUpTo: 0,
+      waitWaived: false,
+    };
+  if (tier === "standard")
+    return { serviceOff: 0, zoneOff: 10, freeAddonUpTo: 10, waitWaived: false };
+  if (tier === "route")
+    return { serviceOff: 5, zoneOff: 10, freeAddonUpTo: 10, waitWaived: false };
+  if (tier === "access")
+    return { serviceOff: 8, zoneOff: 10, freeAddonUpTo: 10, waitWaived: true };
+  if (tier === "accesspro")
+    return { serviceOff: 10, zoneOff: 0, freeAddonUpTo: 0, waitWaived: true };
   return { serviceOff: 0, zoneOff: 0, freeAddonUpTo: 0, waitWaived: false };
 }
 
@@ -270,7 +300,13 @@ const AllowedStates = [
   "cancelled",
 ];
 
-const ACTIVE_STATES = new Set(["submitted", "confirmed", "shopping", "packed", "out_for_delivery"]);
+const ACTIVE_STATES = new Set([
+  "submitted",
+  "confirmed",
+  "shopping",
+  "packed",
+  "out_for_delivery",
+]);
 
 const OrderSchema = new mongoose.Schema(
   {
@@ -299,7 +335,12 @@ const OrderSchema = new mongoose.Schema(
 
     list: {
       groceryListText: String,
-      attachment: { originalName: String, mimeType: String, size: Number, path: String },
+      attachment: {
+        originalName: String,
+        mimeType: String,
+        size: Number,
+        path: String,
+      },
     },
 
     consents: { terms: Boolean, accuracy: Boolean, dropoff: Boolean },
@@ -315,8 +356,16 @@ const OrderSchema = new mongoose.Schema(
     },
 
     payments: {
-      fees: { status: { type: String, default: "unpaid" }, note: { type: String, default: "" }, paidAt: { type: Date, default: null } },
-      groceries: { status: { type: String, default: "unpaid" }, note: { type: String, default: "" }, paidAt: { type: Date, default: null } },
+      fees: {
+        status: { type: String, default: "unpaid" },
+        note: { type: String, default: "" },
+        paidAt: { type: Date, default: null },
+      },
+      groceries: {
+        status: { type: String, default: "unpaid" },
+        note: { type: String, default: "" },
+        paidAt: { type: Date, default: null },
+      },
     },
 
     status: {
@@ -327,7 +376,9 @@ const OrderSchema = new mongoose.Schema(
     },
 
     statusHistory: {
-      type: [{ state: { type: String, enum: AllowedStates }, note: String, at: Date, by: String }],
+      type: [
+        { state: { type: String, enum: AllowedStates }, note: String, at: Date, by: String },
+      ],
       default: [],
     },
   },
@@ -358,8 +409,13 @@ function csvEscape(val) {
   return s;
 }
 
-function nowTz() { return dayjs().tz(TZ); }
-function fmtLocal(d) { if (!d) return ""; return dayjs(d).tz(TZ).format("ddd MMM D, h:mma"); }
+function nowTz() {
+  return dayjs().tz(TZ);
+}
+function fmtLocal(d) {
+  if (!d) return "";
+  return dayjs(d).tz(TZ).format("ddd MMM D, h:mma");
+}
 
 function nextDow(targetDow, from) {
   let d = dayjs(from).tz(TZ);
@@ -369,62 +425,137 @@ function nextDow(targetDow, from) {
   return d.add(diff, "day");
 }
 
-function buildRunTimes(type) {
-  const base = nowTz();
+// ---- Bi-weekly run helpers ----
+function runKeyToDayjs(runKey) {
+  try {
+    const dateStr = String(runKey || "").slice(0, 10); // YYYY-MM-DD
+    const d = dayjs(dateStr).tz(TZ);
+    return d.isValid() ? d : null;
+  } catch {
+    return null;
+  }
+}
+
+function computeTimesForDelivery(deliveryDayjs, type) {
+  const delivery = dayjs(deliveryDayjs).tz(TZ);
   if (type === "local") {
-    const delivery = nextDow(6, base); // Saturday
-    const cutoff = delivery.subtract(2, "day").hour(18).minute(0).second(0).millisecond(0); // Thu 6pm
-    const opens = delivery.subtract(5, "day").hour(0).minute(0).second(0).millisecond(0); // Mon 12am
+    const cutoff = delivery
+      .subtract(2, "day")
+      .hour(18)
+      .minute(0)
+      .second(0)
+      .millisecond(0); // Thu 6pm
+    const opens = delivery
+      .subtract(5, "day")
+      .hour(0)
+      .minute(0)
+      .second(0)
+      .millisecond(0); // Mon 12am
     return { delivery, cutoff, opens };
   }
-  const delivery = nextDow(0, base); // Sunday
-  const cutoff = delivery.subtract(2, "day").hour(18).minute(0).second(0).millisecond(0); // Fri 6pm
-  const opens = delivery.subtract(6, "day").hour(0).minute(0).second(0).millisecond(0); // Mon 12am
+  // owen
+  const cutoff = delivery
+    .subtract(2, "day")
+    .hour(18)
+    .minute(0)
+    .second(0)
+    .millisecond(0); // Fri 6pm (because delivery is Sunday)
+  const opens = delivery
+    .subtract(6, "day")
+    .hour(0)
+    .minute(0)
+    .second(0)
+    .millisecond(0); // Mon 12am
   return { delivery, cutoff, opens };
 }
 
 function runMinimumConfig(type) {
-  if (type === "local") return { minOrders: 6, minFees: 200, minLogic: "OR", minimumText: "Minimum: 6 orders OR $200 booked fees" };
-  return { minOrders: 6, minFees: 300, minLogic: "AND", minimumText: "Minimum: 6 orders AND $300 booked fees" };
+  if (type === "local")
+    return {
+      minOrders: 6,
+      minFees: 200,
+      minLogic: "OR",
+      minimumText: "Minimum: 6 orders OR $200 booked fees",
+    };
+  return {
+    minOrders: 6,
+    minFees: 300,
+    minLogic: "AND",
+    minimumText: "Minimum: 6 orders AND $300 booked fees",
+  };
 }
 
 function meetsMinimums(run) {
-  if (run.minLogic === "AND") return run.bookedOrdersCount >= run.minOrders && run.bookedFeesTotal >= run.minFees;
+  if (run.minLogic === "AND")
+    return run.bookedOrdersCount >= run.minOrders && run.bookedFeesTotal >= run.minFees;
   return run.bookedOrdersCount >= run.minOrders || run.bookedFeesTotal >= run.minFees;
+}
+
+async function getOrCreateNextRun(type) {
+  const now = nowTz();
+
+  // 1) If there is already a future run for this type, use it
+  const existing = await Run.findOne({
+    type,
+    cutoffAt: { $gt: now.toDate() },
+  })
+    .sort({ opensAt: 1 })
+    .lean();
+
+  if (existing) return existing;
+
+  // 2) Otherwise, create the next run as (latest run of this type + 14 days)
+  const latest = await Run.findOne({ type }).sort({ opensAt: -1 }).lean();
+
+  let delivery;
+  if (latest?.runKey) {
+    const lastDelivery = runKeyToDayjs(latest.runKey);
+    delivery = (lastDelivery || now).add(14, "day");
+  } else {
+    // Seed only (first time): next Saturday for local, next Sunday for owen
+    delivery = type === "local" ? nextDow(6, now) : nextDow(0, now);
+  }
+
+  const { cutoff, opens } = computeTimesForDelivery(delivery, type);
+  const runKey = delivery.format("YYYY-MM-DD") + "-" + type;
+  const cfg = runMinimumConfig(type);
+
+  const created = await Run.create({
+    runKey,
+    type,
+    opensAt: opens.toDate(),
+    cutoffAt: cutoff.toDate(),
+    maxSlots: 12,
+    minOrders: cfg.minOrders,
+    minFees: cfg.minFees,
+    minLogic: cfg.minLogic,
+  });
+
+  return created.toObject();
 }
 
 async function ensureUpcomingRuns() {
   const out = {};
   for (const type of ["local", "owen"]) {
-    const { delivery, cutoff, opens } = buildRunTimes(type);
-    const runKey = delivery.format("YYYY-MM-DD") + "-" + type;
+    let run = await getOrCreateNextRun(type);
 
-    let run = await Run.findOne({ runKey }).lean();
-    if (!run) {
-      const cfg = runMinimumConfig(type);
-      const created = await Run.create({
-        runKey,
-        type,
-        opensAt: opens.toDate(),
-        cutoffAt: cutoff.toDate(),
-        maxSlots: 12,
-        minOrders: cfg.minOrders,
-        minFees: cfg.minFees,
-        minLogic: cfg.minLogic,
-      });
-      run = created.toObject();
-    }
+    const needsRecalc =
+      !run.lastRecalcAt ||
+      dayjs(run.lastRecalcAt).isBefore(nowTz().subtract(60, "second").toDate());
 
-    const needsRecalc = !run.lastRecalcAt || dayjs(run.lastRecalcAt).isBefore(nowTz().subtract(60, "second").toDate());
     if (needsRecalc) {
       const agg = await Order.aggregate([
-        { $match: { runKey, "status.state": { $in: Array.from(ACTIVE_STATES) } } },
+        { $match: { runKey: run.runKey, "status.state": { $in: Array.from(ACTIVE_STATES) } } },
         { $group: { _id: "$runKey", c: { $sum: 1 }, fees: { $sum: "$pricingSnapshot.totalFees" } } },
       ]);
       const c = agg?.[0]?.c || 0;
       const fees = agg?.[0]?.fees || 0;
 
-      await Run.updateOne({ runKey }, { $set: { bookedOrdersCount: c, bookedFeesTotal: fees, lastRecalcAt: new Date() } });
+      await Run.updateOne(
+        { runKey: run.runKey },
+        { $set: { bookedOrdersCount: c, bookedFeesTotal: fees, lastRecalcAt: new Date() } }
+      );
+
       run.bookedOrdersCount = c;
       run.bookedFeesTotal = fees;
       run.lastRecalcAt = new Date();
@@ -436,7 +567,11 @@ async function ensureUpcomingRuns() {
 }
 
 async function nextOrderId() {
-  const c = await Counter.findOneAndUpdate({ key: "orders" }, { $inc: { seq: 1 } }, { upsert: true, new: true }).lean();
+  const c = await Counter.findOneAndUpdate(
+    { key: "orders" },
+    { $inc: { seq: 1 } },
+    { upsert: true, new: true }
+  ).lean();
   return "TGR-" + String(c.seq).padStart(5, "0");
 }
 
@@ -445,7 +580,9 @@ function safeJsonArray(str) {
     const v = JSON.parse(str || "[]");
     if (Array.isArray(v)) return v.map((x) => String(x || "").trim()).filter(Boolean);
     return [];
-  } catch { return []; }
+  } catch {
+    return [];
+  }
 }
 
 function computeFeeBreakdown(input) {
@@ -472,7 +609,9 @@ function computeFeeBreakdown(input) {
   if (String(input.addon_printing || "") === "yes" && pages > 0) addOnsFees += calcPrinting(pages);
 
   let surcharges = 0;
-  if (grocerySubtotal > 0 && grocerySubtotal < PRICING.groceryUnderMin.threshold) surcharges += PRICING.groceryUnderMin.surcharge;
+  if (grocerySubtotal > 0 && grocerySubtotal < PRICING.groceryUnderMin.threshold) {
+    surcharges += PRICING.groceryUnderMin.surcharge;
+  }
 
   const serviceOff = Math.min(serviceFee, disc.serviceOff || 0);
   const optionA = Math.min(zoneFee, disc.zoneOff || 0);
@@ -480,7 +619,10 @@ function computeFeeBreakdown(input) {
   const bestOr = Math.max(optionA, optionB);
   const discount = serviceOff + bestOr;
 
-  const totalFees = Math.max(0, serviceFee + zoneFee + runFee + addOnsFees + surcharges - discount);
+  const totalFees = Math.max(
+    0,
+    serviceFee + zoneFee + runFee + addOnsFees + surcharges - discount
+  );
   return { totals: { serviceFee, zoneFee, runFee, addOnsFees, surcharges, discount, totalFees } };
 }
 
@@ -518,7 +660,10 @@ function requireLogin(req, res, next) {
 
 function requireProfileComplete(req, res, next) {
   if (!isProfileComplete(req.user?.profile || {})) {
-    return res.status(403).json({ ok: false, error: "Account setup required. Please complete your profile." });
+    return res.status(403).json({
+      ok: false,
+      error: "Account setup required. Please complete your profile.",
+    });
   }
   next();
 }
@@ -568,7 +713,9 @@ function verifyCancelToken(orderId, token) {
     if (a.length !== b.length) return { ok: false };
     if (!crypto.timingSafeEqual(a, b)) return { ok: false };
     return { ok: true, expMs };
-  } catch { return { ok: false }; }
+  } catch {
+    return { ok: false };
+  }
 }
 
 // =========================
@@ -603,12 +750,16 @@ function proxyRemote(url, res, contentType) {
 }
 
 app.get("/vendor/addresscomplete.css", (_req, res) => {
-  const url = `https://ws1.postescanada-canadapost.ca/css/addresscomplete-2.50.min.css?key=${encodeURIComponent(CANADAPOST_KEY)}`;
+  const url = `https://ws1.postescanada-canadapost.ca/css/addresscomplete-2.50.min.css?key=${encodeURIComponent(
+    CANADAPOST_KEY
+  )}`;
   proxyRemote(url, res, "text/css; charset=utf-8");
 });
 
 app.get("/vendor/addresscomplete.js", (_req, res) => {
-  const url = `https://ws1.postescanada-canadapost.ca/js/addresscomplete-2.50.min.js?key=${encodeURIComponent(CANADAPOST_KEY)}`;
+  const url = `https://ws1.postescanada-canadapost.ca/js/addresscomplete-2.50.min.js?key=${encodeURIComponent(
+    CANADAPOST_KEY
+  )}`;
   proxyRemote(url, res, "application/javascript; charset=utf-8");
 });
 
@@ -736,7 +887,9 @@ app.post("/api/profile", requireLogin, async (req, res) => {
       consentMarketing: yn(b.consentMarketing),
     };
 
-    if (!newProfile.defaultId && newProfile.addresses.length) newProfile.defaultId = newProfile.addresses[0].id;
+    if (!newProfile.defaultId && newProfile.addresses.length) {
+      newProfile.defaultId = newProfile.addresses[0].id;
+    }
 
     newProfile.complete = isProfileComplete(newProfile);
     newProfile.completedAt = newProfile.complete ? new Date().toISOString() : null;
@@ -808,122 +961,133 @@ function pickDefaultAddress(profile) {
   return found || arr[0] || null;
 }
 
-app.post("/api/orders", requireLogin, requireProfileComplete, upload.single("groceryFile"), async (req, res) => {
-  try {
-    const b = req.body || {};
-    const user = await User.findById(req.user._id).lean();
-    const profile = user?.profile || {};
+app.post(
+  "/api/orders",
+  requireLogin,
+  requireProfileComplete,
+  upload.single("groceryFile"),
+  async (req, res) => {
+    try {
+      const b = req.body || {};
+      const user = await User.findById(req.user._id).lean();
+      const profile = user?.profile || {};
 
-    if (!yn(b.consent_terms) || !yn(b.consent_accuracy) || !yn(b.consent_dropoff)) {
-      return res.status(400).json({ ok: false, error: "All required consents must be accepted." });
+      if (!yn(b.consent_terms) || !yn(b.consent_accuracy) || !yn(b.consent_dropoff)) {
+        return res.status(400).json({ ok: false, error: "All required consents must be accepted." });
+      }
+
+      const runs = await ensureUpcomingRuns();
+      const runType = String(b.runType || "");
+      const run = runs[runType];
+      if (!run) return res.status(400).json({ ok: false, error: "Invalid runType." });
+
+      const now = nowTz();
+      const opensAt = dayjs(run.opensAt).tz(TZ);
+      const cutoffAt = dayjs(run.cutoffAt).tz(TZ);
+      if (!(now.isAfter(opensAt) && now.isBefore(cutoffAt))) {
+        return res.status(403).json({ ok: false, error: "Ordering is closed for this run." });
+      }
+
+      const defAddr = pickDefaultAddress(profile);
+
+      const fullName = String(b.fullName || profile.fullName || user.name || "").trim();
+      const phone = String(b.phone || profile.phone || "").trim();
+
+      const town = String(b.town || defAddr?.town || "").trim();
+      const streetAddress = String(b.streetAddress || defAddr?.streetAddress || "").trim();
+      const unit = String(b.unit || defAddr?.unit || "").trim();
+      const postalCode = String(b.postalCode || defAddr?.postalCode || "").trim();
+      const zone = String(b.zone || defAddr?.zone || "").trim();
+
+      const primaryStore = String(b.primaryStore || "").trim();
+      const groceryList = String(b.groceryList || "").trim();
+
+      const dropoffPref = String(b.dropoffPref || profile.dropoffDefault || "").trim();
+      const subsPref = String(b.subsPref || profile.subsDefault || "").trim();
+      const contactPref = String(b.contactPref || profile.contactPref || "").trim();
+
+      const required = [
+        ["fullName", fullName],
+        ["phone", phone],
+        ["town", town],
+        ["streetAddress", streetAddress],
+        ["postalCode", postalCode],
+        ["zone", zone],
+        ["runType", runType],
+        ["primaryStore", primaryStore],
+        ["groceryList", groceryList],
+        ["dropoffPref", dropoffPref],
+        ["subsPref", subsPref],
+        ["contactPref", contactPref],
+      ];
+      for (const [k, v] of required) {
+        if (!String(v || "").trim()) {
+          return res.status(400).json({ ok: false, error: "Missing required field: " + k });
+        }
+      }
+
+      const orderId = await nextOrderId();
+      const extraStores = safeJsonArray(b.extraStores);
+
+      let attachment = null;
+      if (req.file) {
+        attachment = {
+          originalName: req.file.originalname,
+          mimeType: req.file.mimetype,
+          size: req.file.size,
+          path: req.file.path,
+        };
+      }
+
+      const pricingSnapshot = computeFeeBreakdown({
+        zone,
+        runType,
+        extraStores,
+        grocerySubtotal: Number(b.grocerySubtotal || 0),
+        addon_printing: b.addon_printing || "no",
+        printPages: Number(b.printPages || 0),
+        memberTier: b.memberTier || "",
+        applyPerk: b.applyPerk || "yes",
+      }).totals;
+
+      const maxSlots = run.maxSlots || 12;
+      const runUpdate = await Run.findOneAndUpdate(
+        { runKey: run.runKey, bookedOrdersCount: { $lt: maxSlots } },
+        {
+          $inc: { bookedOrdersCount: 1, bookedFeesTotal: pricingSnapshot.totalFees },
+          $set: { lastRecalcAt: new Date() },
+        },
+        { new: true }
+      ).lean();
+
+      if (!runUpdate) return res.status(409).json({ ok: false, error: "This run is full." });
+
+      await Order.create({
+        orderId,
+        runKey: run.runKey,
+        runType,
+        customer: { fullName, email: String(user.email || "").trim().toLowerCase(), phone },
+        address: { town, streetAddress, unit, postalCode, zone },
+        stores: { primary: primaryStore, extra: extraStores },
+        preferences: { dropoffPref, subsPref, contactPref, contactAuth: true },
+        list: { groceryListText: groceryList, attachment },
+        consents: { terms: true, accuracy: true, dropoff: true },
+        pricingSnapshot,
+        payments: { fees: { status: "unpaid" }, groceries: { status: "unpaid" } },
+        status: { state: "submitted", note: "", updatedAt: new Date(), updatedBy: "customer" },
+        statusHistory: [{ state: "submitted", note: "", at: new Date(), by: "customer" }],
+      });
+
+      const cancelUntilMs = cutoffAt.toDate().getTime();
+      const cancelToken = signCancelToken(orderId, cancelUntilMs);
+      const cancelUntilLocal = fmtLocal(cutoffAt.toDate());
+
+      res.json({ ok: true, orderId, runKey: run.runKey, cancelToken, cancelUntilLocal });
+    } catch (e) {
+      res.status(500).json({ ok: false, error: String(e) });
     }
-
-    const runs = await ensureUpcomingRuns();
-    const runType = String(b.runType || "");
-    const run = runs[runType];
-    if (!run) return res.status(400).json({ ok: false, error: "Invalid runType." });
-
-    const now = nowTz();
-    const opensAt = dayjs(run.opensAt).tz(TZ);
-    const cutoffAt = dayjs(run.cutoffAt).tz(TZ);
-    if (!(now.isAfter(opensAt) && now.isBefore(cutoffAt))) {
-      return res.status(403).json({ ok: false, error: "Ordering is closed for this run." });
-    }
-
-    const defAddr = pickDefaultAddress(profile);
-
-    const fullName = String(b.fullName || profile.fullName || user.name || "").trim();
-    const phone = String(b.phone || profile.phone || "").trim();
-
-    const town = String(b.town || defAddr?.town || "").trim();
-    const streetAddress = String(b.streetAddress || defAddr?.streetAddress || "").trim();
-    const unit = String(b.unit || defAddr?.unit || "").trim();
-    const postalCode = String(b.postalCode || defAddr?.postalCode || "").trim();
-    const zone = String(b.zone || defAddr?.zone || "").trim();
-
-    const primaryStore = String(b.primaryStore || "").trim();
-    const groceryList = String(b.groceryList || "").trim();
-
-    const dropoffPref = String(b.dropoffPref || profile.dropoffDefault || "").trim();
-    const subsPref = String(b.subsPref || profile.subsDefault || "").trim();
-    const contactPref = String(b.contactPref || profile.contactPref || "").trim();
-
-    const required = [
-      ["fullName", fullName],
-      ["phone", phone],
-      ["town", town],
-      ["streetAddress", streetAddress],
-      ["postalCode", postalCode],
-      ["zone", zone],
-      ["runType", runType],
-      ["primaryStore", primaryStore],
-      ["groceryList", groceryList],
-      ["dropoffPref", dropoffPref],
-      ["subsPref", subsPref],
-      ["contactPref", contactPref],
-    ];
-    for (const [k, v] of required) {
-      if (!String(v || "").trim()) return res.status(400).json({ ok: false, error: "Missing required field: " + k });
-    }
-
-    const orderId = await nextOrderId();
-    const extraStores = safeJsonArray(b.extraStores);
-
-    let attachment = null;
-    if (req.file) {
-      attachment = {
-        originalName: req.file.originalname,
-        mimeType: req.file.mimetype,
-        size: req.file.size,
-        path: req.file.path,
-      };
-    }
-
-    const pricingSnapshot = computeFeeBreakdown({
-      zone,
-      runType,
-      extraStores,
-      grocerySubtotal: Number(b.grocerySubtotal || 0),
-      addon_printing: b.addon_printing || "no",
-      printPages: Number(b.printPages || 0),
-      memberTier: b.memberTier || "",
-      applyPerk: b.applyPerk || "yes",
-    }).totals;
-
-    const maxSlots = run.maxSlots || 12;
-    const runUpdate = await Run.findOneAndUpdate(
-      { runKey: run.runKey, bookedOrdersCount: { $lt: maxSlots } },
-      { $inc: { bookedOrdersCount: 1, bookedFeesTotal: pricingSnapshot.totalFees }, $set: { lastRecalcAt: new Date() } },
-      { new: true }
-    ).lean();
-
-    if (!runUpdate) return res.status(409).json({ ok: false, error: "This run is full." });
-
-    await Order.create({
-      orderId,
-      runKey: run.runKey,
-      runType,
-      customer: { fullName, email: String(user.email || "").trim().toLowerCase(), phone },
-      address: { town, streetAddress, unit, postalCode, zone },
-      stores: { primary: primaryStore, extra: extraStores },
-      preferences: { dropoffPref, subsPref, contactPref, contactAuth: true },
-      list: { groceryListText: groceryList, attachment },
-      consents: { terms: true, accuracy: true, dropoff: true },
-      pricingSnapshot,
-      payments: { fees: { status: "unpaid" }, groceries: { status: "unpaid" } },
-      status: { state: "submitted", note: "", updatedAt: new Date(), updatedBy: "customer" },
-      statusHistory: [{ state: "submitted", note: "", at: new Date(), by: "customer" }],
-    });
-
-    const cancelUntilMs = cutoffAt.toDate().getTime();
-    const cancelToken = signCancelToken(orderId, cancelUntilMs);
-    const cancelUntilLocal = fmtLocal(cutoffAt.toDate());
-
-    res.json({ ok: true, orderId, runKey: run.runKey, cancelToken, cancelUntilLocal });
-  } catch (e) {
-    res.status(500).json({ ok: false, error: String(e) });
   }
-});
+);
 
 app.post("/api/orders/:orderId/cancel", async (req, res) => {
   try {
@@ -940,13 +1104,18 @@ app.post("/api/orders/:orderId/cancel", async (req, res) => {
     const now = nowTz();
 
     const isActive = ACTIVE_STATES.has(order.status?.state || "submitted");
-    if (!isActive) return res.status(400).json({ ok: false, error: "Order cannot be cancelled in its current status." });
+    if (!isActive) {
+      return res.status(400).json({ ok: false, error: "Order cannot be cancelled in its current status." });
+    }
 
     const v = verifyCancelToken(orderId, token);
     if (!v.ok) return res.status(403).json({ ok: false, error: "Invalid cancel token." });
 
     if (!now.isBefore(cutoffAt)) {
-      return res.status(403).json({ ok: false, error: "Cancellation window closed (past cutoff). After-cutoff policy applies." });
+      return res.status(403).json({
+        ok: false,
+        error: "Cancellation window closed (past cutoff). After-cutoff policy applies.",
+      });
     }
 
     const fees = Number(order.pricingSnapshot?.totalFees || 0);
@@ -976,46 +1145,58 @@ app.get("/member", requireLogin, async (req, res) => {
     const email = String(req.user?.email || "").toLowerCase().trim();
     const name = String(req.user?.name || "").trim();
 
-    const orders = await Order.find({ "customer.email": email })
-      .sort({ createdAt: -1 })
-      .limit(40)
-      .lean();
+    const orders = await Order.find({ "customer.email": email }).sort({ createdAt: -1 }).limit(40).lean();
 
-    const runKeys = Array.from(new Set(orders.map(o => o.runKey).filter(Boolean)));
+    const runKeys = Array.from(new Set(orders.map((o) => o.runKey).filter(Boolean)));
     const runs = await Run.find({ runKey: { $in: runKeys } }).lean();
-    const runByKey = new Map(runs.map(r => [r.runKey, r]));
+    const runByKey = new Map(runs.map((r) => [r.runKey, r]));
 
     const now = nowTz();
 
-    const rows = orders.map(o => {
-      const fees = typeof o.pricingSnapshot?.totalFees === "number" ? o.pricingSnapshot.totalFees.toFixed(2) : "0.00";
-      const status = o.status?.state || "submitted";
-      const run = runByKey.get(o.runKey);
-      const cutoffAt = run?.cutoffAt ? dayjs(run.cutoffAt).tz(TZ) : null;
-      const cancelOpen = cutoffAt ? now.isBefore(cutoffAt) : false;
+    const rows = orders
+      .map((o) => {
+        const fees =
+          typeof o.pricingSnapshot?.totalFees === "number" ? o.pricingSnapshot.totalFees.toFixed(2) : "0.00";
+        const status = o.status?.state || "submitted";
+        const run = runByKey.get(o.runKey);
+        const cutoffAt = run?.cutoffAt ? dayjs(run.cutoffAt).tz(TZ) : null;
+        const cancelOpen = cutoffAt ? now.isBefore(cutoffAt) : false;
 
-      let cancelHtml = `<span class="muted">Not available</span>`;
-      if (ACTIVE_STATES.has(status) && cancelOpen) {
-        const token = signCancelToken(o.orderId, cutoffAt.toDate().getTime());
-        cancelHtml = `<button class="btn" data-cancel="${escapeHtml(o.orderId)}" data-token="${escapeHtml(token)}">Cancel</button>`;
-      } else if (status === "cancelled") {
-        cancelHtml = `<span class="pill">Cancelled</span>`;
-      } else if (!cancelOpen && ACTIVE_STATES.has(status)) {
-        cancelHtml = `<span class="muted">Past cutoff</span>`;
-      }
+        let cancelHtml = `<span class="muted">Not available</span>`;
+        if (ACTIVE_STATES.has(status) && cancelOpen) {
+          const token = signCancelToken(o.orderId, cutoffAt.toDate().getTime());
+          cancelHtml = `<button class="btn" data-cancel="${escapeHtml(o.orderId)}" data-token="${escapeHtml(
+            token
+          )}">Cancel</button>`;
+        } else if (status === "cancelled") {
+          cancelHtml = `<span class="pill">Cancelled</span>`;
+        } else if (!cancelOpen && ACTIVE_STATES.has(status)) {
+          cancelHtml = `<span class="muted">Past cutoff</span>`;
+        }
 
-      return `
+        return `
         <tr>
-          <td><div style="font-weight:1000;">${escapeHtml(o.orderId)}</div><div class="muted" style="font-size:12px;">${escapeHtml(fmtLocal(o.createdAt))}</div></td>
-          <td><div style="font-weight:900;">${escapeHtml(o.address?.town || "")} (Zone ${escapeHtml(o.address?.zone || "")})</div>
-              <div class="muted" style="font-size:12px;">${escapeHtml(o.address?.streetAddress || "")} • ${escapeHtml(o.address?.postalCode || "")}</div></td>
-          <td><span class="pill">${escapeHtml(o.runType || "")}</span><div class="muted" style="font-size:12px;margin-top:4px;">${escapeHtml(o.runKey || "")}</div></td>
-          <td><span class="pill">${escapeHtml(status)}</span><div class="muted" style="font-size:12px;margin-top:4px;">${escapeHtml(o.status?.note || "")}</div></td>
+          <td><div style="font-weight:1000;">${escapeHtml(o.orderId)}</div><div class="muted" style="font-size:12px;">${escapeHtml(
+          fmtLocal(o.createdAt)
+        )}</div></td>
+          <td><div style="font-weight:900;">${escapeHtml(o.address?.town || "")} (Zone ${escapeHtml(
+          o.address?.zone || ""
+        )})</div>
+              <div class="muted" style="font-size:12px;">${escapeHtml(o.address?.streetAddress || "")} • ${escapeHtml(
+          o.address?.postalCode || ""
+        )}</div></td>
+          <td><span class="pill">${escapeHtml(o.runType || "")}</span><div class="muted" style="font-size:12px;margin-top:4px;">${escapeHtml(
+          o.runKey || ""
+        )}</div></td>
+          <td><span class="pill">${escapeHtml(status)}</span><div class="muted" style="font-size:12px;margin-top:4px;">${escapeHtml(
+          o.status?.note || ""
+        )}</div></td>
           <td>$${escapeHtml(fees)}</td>
           <td>${cancelHtml}</td>
         </tr>
       `;
-    }).join("");
+      })
+      .join("");
 
     res.setHeader("Content-Type", "text/html; charset=utf-8");
     res.send(`<!doctype html>
@@ -1231,18 +1412,20 @@ app.get("/api/admin/routific/export-csv", requireLogin, requireAdmin, async (req
     const orders = await Order.find({
       runKey,
       "status.state": { $in: Array.from(ACTIVE_STATES) },
-    }).sort({ createdAt: 1 }).lean();
+    })
+      .sort({ createdAt: 1 })
+      .lean();
 
-    const header = ["order_id","name","address","phone","email","notes","duration_seconds"];
-    const rows = orders.map(o => {
+    const header = ["order_id", "name", "address", "phone", "email", "notes", "duration_seconds"];
+    const rows = orders.map((o) => {
       const name = o.customer?.fullName || "";
       const phone = o.customer?.phone || "";
       const email = o.customer?.email || "";
-      const address =
-        `${o.address?.streetAddress || ""}${o.address?.unit ? (" " + o.address.unit) : ""}, ` +
-        `${o.address?.town || ""}, ON, ${o.address?.postalCode || ""}, Canada`
-          .replace(/\s+/g, " ")
-          .trim();
+      const address = `${o.address?.streetAddress || ""}${o.address?.unit ? " " + o.address.unit : ""}, ${
+        o.address?.town || ""
+      }, ON, ${o.address?.postalCode || ""}, Canada`
+        .replace(/\s+/g, " ")
+        .trim();
 
       const notes = [
         `TGR ${o.orderId}`,
@@ -1251,7 +1434,9 @@ app.get("/api/admin/routific/export-csv", requireLogin, requireAdmin, async (req
         o.preferences?.subsPref ? `Subs: ${o.preferences.subsPref}` : "",
         o.stores?.primary ? `Store: ${o.stores.primary}` : "",
         (o.stores?.extra || []).length ? `Extra: ${(o.stores.extra || []).join(", ")}` : "",
-      ].filter(Boolean).join(" | ");
+      ]
+        .filter(Boolean)
+        .join(" | ");
 
       const duration = 360;
       return [o.orderId, name, address, phone, email, notes, String(duration)].map(csvEscape).join(",");
