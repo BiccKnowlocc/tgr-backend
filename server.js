@@ -705,9 +705,25 @@ function meetsMinimums(run) {
 async function getOrCreateNextRun(type) {
   const now = nowTz();
 
-  const existing = await Run.findOne({ type, cutoffAt: { $gt: now.toDate() } }).sort({ opensAt: 1 }).lean();
-  if (existing) return existing;
+  // Prefer an existing run that has NOT passed cutoff yet
+  let existing = await Run.findOne({ type, cutoffAt: { $gt: now.toDate() } })
+    .sort({ opensAt: 1 })
+    .lean();
 
+  // If found but opensAt is still in the future, force it open now (avoid dead windows)
+  if (existing) {
+    const opensAt = dayjs(existing.opensAt).tz(TZ);
+    const cutoffAt = dayjs(existing.cutoffAt).tz(TZ);
+
+    if (now.isBefore(cutoffAt) && now.isBefore(opensAt)) {
+      const forced = now.subtract(1, "minute").toDate();
+      await Run.updateOne({ runKey: existing.runKey }, { $set: { opensAt: forced } });
+      existing.opensAt = forced;
+    }
+    return existing;
+  }
+
+  // No upcoming run in DB: create one.
   const latest = await Run.findOne({ type }).sort({ opensAt: -1 }).lean();
 
   let delivery;
@@ -718,7 +734,13 @@ async function getOrCreateNextRun(type) {
     delivery = type === "local" ? nextDow(6, now) : nextDow(0, now);
   }
 
-  const { cutoff, opens } = computeTimesForDelivery(delivery, type);
+  let { cutoff, opens } = computeTimesForDelivery(delivery, type);
+
+  // KEY FIX: if computed opens is still in the future, open immediately.
+  if (opens.isAfter(now)) {
+    opens = now.subtract(1, "minute");
+  }
+
   const runKey = delivery.format("YYYY-MM-DD") + "-" + type;
   const cfg = runMinimumConfig(type);
 
