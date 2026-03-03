@@ -1,7 +1,8 @@
 // ======= server.js (FULL FILE) — TGR backend =======
 // Google OAuth, profile onboarding, biweekly runs, estimator, orders, cancel tokens
 // FULL ADMIN COMMAND CENTER + endpoints (search/view/status/payments/hold/flags/bulk/export/print/tracking/email)
-// MEMBER PORTAL (/member) restored (order list + cancel before cutoff)
+// ADMIN Tracking Control mini-page: /admin/tracking-control (GPS broadcast from phone)
+// MEMBER PORTAL (/member) restored + embedded live map (Mapbox) for active orders when tracking enabled
 // AddressComplete proxy endpoints kept
 //
 // Order IDs: TGR-LOC-YYYYMMDD-XXXXXX or TGR-OWEN-YYYYMMDD-XXXXXX
@@ -43,8 +44,6 @@ const MONGODB_URI =
 
 const SESSION_SECRET = process.env.SESSION_SECRET || "dev-secret";
 const CANCEL_TOKEN_SECRET = process.env.CANCEL_TOKEN_SECRET || SESSION_SECRET;
-
-// tracking token secret
 const TRACKING_TOKEN_SECRET = process.env.TRACKING_TOKEN_SECRET || SESSION_SECRET;
 
 const TZ = process.env.TZ || "America/Toronto";
@@ -75,6 +74,12 @@ const SQUARE_PAY_GROCERIES_LINK =
   process.env.SQUARE_PAY_GROCERIES_LINK || "https://square.link/u/R0hfr7x8";
 const SQUARE_PAY_FEES_LINK =
   process.env.SQUARE_PAY_FEES_LINK || "https://square.link/u/r92W6XGs";
+
+// Membership purchase links (for your index.html)
+const SQUARE_LINK_STANDARD = process.env.SQUARE_LINK_STANDARD || "https://square.link/u/iaziCZjG";
+const SQUARE_LINK_ROUTE = process.env.SQUARE_LINK_ROUTE || "https://square.link/u/P5ROgqyp";
+const SQUARE_LINK_ACCESS = process.env.SQUARE_LINK_ACCESS || "https://square.link/u/lHtHtvqG";
+const SQUARE_LINK_ACCESSPRO = process.env.SQUARE_LINK_ACCESSPRO || "https://square.link/u/S0Y5Fysa";
 
 const ALLOWED_ORIGINS = [
   "https://tobermorygroceryrun.ca",
@@ -749,7 +754,6 @@ async function getOrCreateNextRun(type) {
   }
 
   let { cutoff, opens } = computeTimesForDelivery(delivery, type);
-
   if (opens.isAfter(now)) opens = now.subtract(1, "minute");
 
   const runKey = delivery.format("YYYY-MM-DD") + "-" + type;
@@ -832,8 +836,10 @@ app.get("/api/public/tracking/:runKey", async (req, res) => {
     }
 
     const t = await ensureTrackingDoc(runKey);
-    if (!t.enabled || !t.lastAt || typeof t.lastLat !== "number" || typeof t.lastLng !== "number") {
-      return res.json({ ok: true, enabled: !!t.enabled, hasFix: false });
+    if (!t.enabled) return res.json({ ok: true, enabled: false, hasFix: false });
+
+    if (!t.lastAt || typeof t.lastLat !== "number" || typeof t.lastLng !== "number") {
+      return res.json({ ok: true, enabled: true, hasFix: false });
     }
 
     res.json({
@@ -905,7 +911,16 @@ app.get("/api/public/addresscomplete", (_req, res) => {
 // PUBLIC CONFIG
 // =========================
 app.get("/api/public/config", (_req, res) => {
-  res.json({ ok: true, mapboxPublicToken: MAPBOX_PUBLIC_TOKEN || "" });
+  res.json({
+    ok: true,
+    mapboxPublicToken: MAPBOX_PUBLIC_TOKEN || "",
+    squareMembershipLinks: {
+      standard: SQUARE_LINK_STANDARD,
+      route: SQUARE_LINK_ROUTE,
+      access: SQUARE_LINK_ACCESS,
+      accesspro: SQUARE_LINK_ACCESSPRO,
+    }
+  });
 });
 
 // =========================
@@ -1212,7 +1227,7 @@ app.post("/api/orders", requireLogin, requireProfileComplete, upload.single("gro
         <p style="margin:0 0 10px;"><strong>Order ID:</strong> ${escapeHtml(created.orderId)}</p>
         <p style="margin:0 0 10px;"><strong>Run:</strong> ${escapeHtml(created.runKey)} (${escapeHtml(created.runType)})</p>
         <p style="margin:0 0 10px;"><strong>Fees estimate:</strong> $${escapeHtml(money(created.pricingSnapshot?.totalFees || 0))}</p>
-        <p style="margin:0;">You can view orders in your Member Portal after signing in.</p>
+        <p style="margin:0;">Member Portal: <a href="${escapeHtml("https://api.tobermorygroceryrun.ca/member")}">${escapeHtml("https://api.tobermorygroceryrun.ca/member")}</a></p>
       </div>`,
       `Order received\nOrder ID: ${created.orderId}\nRun: ${created.runKey} (${created.runType})\nFees estimate: $${money(created.pricingSnapshot?.totalFees || 0)}`
     );
@@ -1268,7 +1283,7 @@ app.post("/api/orders/:orderId/cancel", async (req, res) => {
 });
 
 // =========================
-// MEMBER PORTAL (RESTORED)
+// MEMBER PORTAL (UPGRADED: embedded map)
 // =========================
 app.get("/member", requireLogin, async (req, res) => {
   try {
@@ -1277,7 +1292,7 @@ app.get("/member", requireLogin, async (req, res) => {
 
     const orders = await Order.find({ "customer.email": email })
       .sort({ createdAt: -1 })
-      .limit(60)
+      .limit(80)
       .lean();
 
     const runKeys = Array.from(new Set(orders.map(o => o.runKey).filter(Boolean)));
@@ -1286,6 +1301,23 @@ app.get("/member", requireLogin, async (req, res) => {
 
     const now = nowTz();
 
+    // Build a list of trackable orders with tokens embedded
+    const trackables = [];
+    for (const o of orders) {
+      const status = o.status?.state || "submitted";
+      if (!ACTIVE_STATES.has(status)) continue;
+      const run = runByKey.get(o.runKey);
+      if (!run?.runKey || !run?.cutoffAt) continue;
+      const expMs = dayjs(run.cutoffAt).add(1, "day").valueOf();
+      const tkn = signTrackingToken(o.orderId, run.runKey, expMs);
+      trackables.push({
+        orderId: o.orderId,
+        runKey: run.runKey,
+        token: tkn,
+        status,
+      });
+    }
+
     const rows = orders.map(o => {
       const fees = typeof o.pricingSnapshot?.totalFees === "number" ? o.pricingSnapshot.totalFees.toFixed(2) : "0.00";
       const status = o.status?.state || "submitted";
@@ -1293,7 +1325,7 @@ app.get("/member", requireLogin, async (req, res) => {
       const cutoffAt = run?.cutoffAt ? dayjs(run.cutoffAt).tz(TZ) : null;
       const cancelOpen = cutoffAt ? now.isBefore(cutoffAt) : false;
 
-      let cancelHtml = `<span class="muted">Not available</span>`;
+      let cancelHtml = `<span class="muted">—</span>`;
       if (ACTIVE_STATES.has(status) && cancelOpen) {
         const token = signCancelToken(o.orderId, cutoffAt.toDate().getTime());
         cancelHtml = `<button class="btn" data-cancel="${escapeHtml(o.orderId)}" data-token="${escapeHtml(token)}">Cancel</button>`;
@@ -1303,25 +1335,29 @@ app.get("/member", requireLogin, async (req, res) => {
         cancelHtml = `<span class="muted">Past cutoff</span>`;
       }
 
-      // Tracking link appears only when tracking is enabled AND order is active
-      let trackingHtml = `<span class="muted">—</span>`;
-      const canTrack = ACTIVE_STATES.has(status);
-      if (canTrack && run?.runKey) {
-        // token expires at cutoff+1day
+      let trackHtml = `<span class="muted">—</span>`;
+      if (ACTIVE_STATES.has(status) && run?.runKey && run?.cutoffAt) {
         const expMs = dayjs(run.cutoffAt).add(1, "day").valueOf();
         const tkn = signTrackingToken(o.orderId, run.runKey, expMs);
-        trackingHtml = `<a class="btn" href="${escapeHtml(PUBLIC_SITE_URL)}/?tab=home" onclick="return false;" data-track="${escapeHtml(run.runKey)}" data-token="${escapeHtml(tkn)}">Copy link</a>`;
+        const link = `https://api.tobermorygroceryrun.ca/member?trackRunKey=${encodeURIComponent(run.runKey)}&token=${encodeURIComponent(tkn)}&orderId=${encodeURIComponent(o.orderId)}`;
+        trackHtml = `
+          <button class="btn" data-track-run="${escapeHtml(run.runKey)}" data-track-token="${escapeHtml(tkn)}" data-track-order="${escapeHtml(o.orderId)}">Track on map</button>
+          <button class="btn" data-copy="${escapeHtml(link)}">Copy link</button>
+        `;
       }
+
+      const addr =
+        `${o.address?.streetAddress || ""}${o.address?.unit ? " " + o.address.unit : ""}, ` +
+        `${o.address?.town || ""}, ON ${o.address?.postalCode || ""}`.trim();
 
       return `
         <tr>
           <td><div style="font-weight:1000;">${escapeHtml(o.orderId)}</div><div class="muted" style="font-size:12px;">${escapeHtml(fmtLocal(o.createdAt))}</div></td>
-          <td><div style="font-weight:900;">${escapeHtml(o.address?.town || "")} (Zone ${escapeHtml(o.address?.zone || "")})</div>
-              <div class="muted" style="font-size:12px;">${escapeHtml(o.address?.streetAddress || "")} • ${escapeHtml(o.address?.postalCode || "")}</div></td>
+          <td><div style="font-weight:900;">${escapeHtml(addr)}</div><div class="muted" style="font-size:12px;">Zone ${escapeHtml(o.address?.zone || "")}</div></td>
           <td><span class="pill">${escapeHtml(o.runType || "")}</span><div class="muted" style="font-size:12px;margin-top:4px;">${escapeHtml(o.runKey || "")}</div></td>
           <td><span class="pill">${escapeHtml(status)}</span><div class="muted" style="font-size:12px;margin-top:4px;">${escapeHtml(o.status?.note || "")}</div></td>
           <td>$${escapeHtml(fees)}</td>
-          <td>${trackingHtml}</td>
+          <td>${trackHtml}</td>
           <td>${cancelHtml}</td>
         </tr>
       `;
@@ -1342,7 +1378,7 @@ app.get("/member", requireLogin, async (req, res) => {
     --radius:14px;
   }
   body{margin:0;background:var(--bg);color:var(--text);font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;}
-  .wrap{max-width:1150px;margin:0 auto;padding:16px;}
+  .wrap{max-width:1250px;margin:0 auto;padding:16px;}
   .card{border:1px solid var(--line);background:var(--panel);border-radius:var(--radius);padding:14px;}
   .row{display:flex;gap:10px;flex-wrap:wrap;align-items:center;}
   .btn{
@@ -1365,6 +1401,12 @@ app.get("/member", requireLogin, async (req, res) => {
   .toast{margin-top:10px;padding:10px 12px;border-radius:12px;border:1px solid rgba(255,255,255,.18);background:rgba(0,0,0,.24);display:none;font-weight:900;}
   .toast.show{display:block;}
   .hr{height:1px;background:rgba(255,255,255,.12);margin:12px 0;}
+  .grid{display:grid;grid-template-columns: 1fr 1fr; gap:12px;}
+  @media (max-width: 980px){ .grid{grid-template-columns: 1fr;} }
+  #mapWrap{display:none;}
+  #map{height: 420px; border-radius: 14px; border:1px solid rgba(255,255,255,.14); overflow:hidden;}
+  .small{font-size:13px;}
+  .warn{border:1px solid rgba(227,52,47,.45);background:rgba(227,52,47,.12);border-radius:12px;padding:10px 12px;}
 </style>
 </head>
 <body>
@@ -1384,6 +1426,35 @@ app.get("/member", requireLogin, async (req, res) => {
     </div>
 
     <div class="toast" id="toast"></div>
+
+    <div class="hr"></div>
+
+    <div class="grid" id="mapWrap">
+      <div class="card" style="box-shadow:none;">
+        <div style="font-weight:1000;font-size:18px;">Live Tracking Map</div>
+        <div class="muted small" id="mapSub">Select an order to track. Tracking only works when enabled for the run.</div>
+        <div class="hr"></div>
+        <div id="map"></div>
+        <div class="hr"></div>
+        <div class="row">
+          <span class="pill" id="mapStatus">—</span>
+          <span class="pill" id="mapLast">Last: —</span>
+          <button class="btn" id="stopMap">Stop</button>
+        </div>
+        <div class="muted small" id="mapErr" style="margin-top:10px;"></div>
+      </div>
+
+      <div class="card" style="box-shadow:none;">
+        <div style="font-weight:1000;font-size:18px;">Tracking controls</div>
+        <div class="muted small">Only your active orders can track. If tracking is disabled, you’ll see “Tracking off”.</div>
+        <div class="hr"></div>
+        <div class="warn">
+          <div style="font-weight:1000;">Tip</div>
+          <div class="muted small">If your map is blank, the driver hasn’t started tracking or hasn’t sent a GPS fix yet.</div>
+        </div>
+      </div>
+    </div>
+
     <div class="hr"></div>
 
     <div style="overflow:auto;">
@@ -1408,6 +1479,13 @@ app.get("/member", requireLogin, async (req, res) => {
 </div>
 
 <script>
+  const TRACKABLES = ${JSON.stringify(trackables)};
+  let MAPBOX_TOKEN = "";
+  let map = null;
+  let marker = null;
+  let pollTimer = null;
+  let activeTrack = null;
+
   const toast = (msg)=>{
     const el = document.getElementById("toast");
     el.textContent = msg;
@@ -1441,15 +1519,163 @@ app.get("/member", requireLogin, async (req, res) => {
     });
   });
 
-  document.querySelectorAll("[data-track]").forEach(btn=>{
+  document.querySelectorAll("[data-copy]").forEach(btn=>{
     btn.addEventListener("click", async ()=>{
-      const runKey = btn.getAttribute("data-track");
-      const token = btn.getAttribute("data-token");
-      const url = "${escapeHtml(PUBLIC_SITE_URL)}" + "/track.html?runKey=" + encodeURIComponent(runKey) + "&token=" + encodeURIComponent(token);
-      if (await copy(url)) toast("Tracking link copied ✅");
+      const url = btn.getAttribute("data-copy");
+      if (await copy(url)) toast("Link copied ✅");
       else toast("Copy failed");
     });
   });
+
+  document.querySelectorAll("[data-track-run]").forEach(btn=>{
+    btn.addEventListener("click", ()=>{
+      const runKey = btn.getAttribute("data-track-run");
+      const token = btn.getAttribute("data-track-token");
+      const orderId = btn.getAttribute("data-track-order");
+      startMapTracking({ runKey, token, orderId });
+    });
+  });
+
+  document.getElementById("stopMap").addEventListener("click", ()=> stopMapTracking());
+
+  function qs(){
+    const u = new URL(location.href);
+    return {
+      runKey: u.searchParams.get("trackRunKey") || "",
+      token: u.searchParams.get("token") || "",
+      orderId: u.searchParams.get("orderId") || "",
+    };
+  }
+
+  async function loadConfig(){
+    const r = await fetch("/api/public/config");
+    const d = await r.json().catch(()=>({}));
+    if(r.ok && d.ok) MAPBOX_TOKEN = d.mapboxPublicToken || "";
+  }
+
+  function setMapWrap(show){
+    document.getElementById("mapWrap").style.display = show ? "grid" : "none";
+  }
+
+  function setStatus(text){ document.getElementById("mapStatus").textContent = text; }
+  function setLast(text){ document.getElementById("mapLast").textContent = text; }
+  function setErr(text){ document.getElementById("mapErr").textContent = text || ""; }
+
+  function loadMapboxLib(){
+    return new Promise((resolve, reject)=>{
+      if (window.mapboxgl) return resolve();
+      const css = document.createElement("link");
+      css.rel = "stylesheet";
+      css.href = "https://api.mapbox.com/mapbox-gl-js/v2.15.0/mapbox-gl.css";
+      document.head.appendChild(css);
+
+      const s = document.createElement("script");
+      s.src = "https://api.mapbox.com/mapbox-gl-js/v2.15.0/mapbox-gl.js";
+      s.onload = ()=> resolve();
+      s.onerror = ()=> reject(new Error("Mapbox failed to load"));
+      document.head.appendChild(s);
+    });
+  }
+
+  async function ensureMap(){
+    if (map) return;
+    if (!MAPBOX_TOKEN) throw new Error("Mapbox token missing on server");
+    await loadMapboxLib();
+
+    mapboxgl.accessToken = MAPBOX_TOKEN;
+    map = new mapboxgl.Map({
+      container: "map",
+      style: "mapbox://styles/mapbox/dark-v11",
+      center: [-81.7, 45.25],
+      zoom: 9,
+    });
+    marker = new mapboxgl.Marker({ color: "#ff4a44" }).setLngLat([-81.7, 45.25]).addTo(map);
+  }
+
+  function stopMapTracking(){
+    activeTrack = null;
+    if (pollTimer) clearInterval(pollTimer);
+    pollTimer = null;
+    setStatus("—");
+    setLast("Last: —");
+    setErr("");
+    toast("Tracking stopped");
+  }
+
+  async function pollOnce(){
+    if (!activeTrack) return;
+    const { runKey, token } = activeTrack;
+    try{
+      const r = await fetch("/api/public/tracking/" + encodeURIComponent(runKey) + "?token=" + encodeURIComponent(token));
+      const d = await r.json().catch(()=>({}));
+      if(!r.ok || d.ok===false){
+        setStatus("Error");
+        setErr(d.error || "Tracking error");
+        return;
+      }
+
+      if (!d.enabled){
+        setStatus("Tracking off");
+        setErr("Tracking is not enabled for this run yet.");
+        return;
+      }
+      if (!d.hasFix){
+        setStatus("Waiting for GPS");
+        setErr("No GPS fix yet. Try again in a moment.");
+        return;
+      }
+
+      const lat = d.last.lat;
+      const lng = d.last.lng;
+      const at = d.last.at ? new Date(d.last.at).toLocaleString() : "—";
+
+      setStatus("Live ✅");
+      setLast("Last: " + at);
+      setErr("");
+
+      marker.setLngLat([lng, lat]);
+      map.easeTo({ center: [lng, lat], zoom: 12, duration: 900 });
+    } catch (e){
+      setStatus("Error");
+      setErr(String(e.message || e));
+    }
+  }
+
+  async function startMapTracking(t){
+    activeTrack = t;
+    setMapWrap(true);
+    setStatus("Loading…");
+    setLast("Last: —");
+    setErr("");
+
+    document.getElementById("mapSub").textContent =
+      "Tracking " + (t.orderId || "") + " • " + (t.runKey || "");
+
+    try{
+      await ensureMap();
+      await pollOnce();
+      if (pollTimer) clearInterval(pollTimer);
+      pollTimer = setInterval(pollOnce, 2500);
+      toast("Map tracking started ✅");
+    } catch (e){
+      setStatus("Error");
+      setErr(String(e.message || e));
+    }
+  }
+
+  (async function boot(){
+    await loadConfig();
+
+    // Auto-start from link params (member?trackRunKey=...&token=...)
+    const p = qs();
+    if (p.runKey && p.token) {
+      startMapTracking({ runKey: p.runKey, token: p.token, orderId: p.orderId || "" });
+      return;
+    }
+
+    // Otherwise keep map hidden until user clicks Track on map
+    setMapWrap(false);
+  })();
 </script>
 
 </body>
@@ -1460,15 +1686,10 @@ app.get("/member", requireLogin, async (req, res) => {
 });
 
 // =========================
-// ADMIN API ENDPOINTS
+// ADMIN API ENDPOINTS + PAGES
 // =========================
 function adminBy(req) {
   return String(req.user?.email || "admin").toLowerCase();
-}
-
-function addAdminLog(order, by, action, meta) {
-  order.adminLog = Array.isArray(order.adminLog) ? order.adminLog : [];
-  order.adminLog.push({ at: new Date(), by: by || "admin", action: String(action || ""), meta: meta || {} });
 }
 
 function buildOrderFilterFromQuery(qs) {
@@ -1479,7 +1700,7 @@ function buildOrderFilterFromQuery(qs) {
   const town = String(qs.town || "").trim();
   const unpaidFees = String(qs.unpaidFees || "").trim() === "1";
   const hold = String(qs.hold || "").trim() === "1";
-  const flag = String(qs.flag || "").trim(); // idRequired/prescription/alcohol/bulky/newCustomerDepositRequired/needsContact
+  const flag = String(qs.flag || "").trim();
 
   const filter = {};
   if (runKey) filter.runKey = runKey;
@@ -1511,7 +1732,6 @@ app.get("/api/admin/orders", requireLogin, requireAdmin, async (req, res) => {
   try {
     const limit = Math.min(500, Math.max(1, Number(req.query.limit || 120)));
     const filter = buildOrderFilterFromQuery(req.query);
-
     const items = await Order.find(filter).sort({ createdAt: -1 }).limit(limit).lean();
     res.json({ ok: true, items });
   } catch (e) {
@@ -1550,25 +1770,7 @@ app.post("/api/admin/orders/:orderId/status", requireLogin, requireAdmin, async 
     order.status.updatedBy = by;
     order.statusHistory.push({ state, note, at: new Date(), by });
 
-    addAdminLog(order, by, "status", { state, note });
     await order.save();
-
-    // Optional: email notify on confirmed/out_for_delivery/delivered
-    if (state === "confirmed") {
-      pmSend(
-        order.customer?.email,
-        `TGR Order Confirmed: ${order.orderId}`,
-        `<div style="font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;line-height:1.45;">
-          <h2 style="margin:0 0 10px;">Order confirmed ✅</h2>
-          <p style="margin:0 0 10px;"><strong>Order ID:</strong> ${escapeHtml(order.orderId)}</p>
-          <p style="margin:0 0 10px;">Please pay service & delivery fees before shopping begins.</p>
-          <p style="margin:0 0 8px;"><a href="${escapeHtml(SQUARE_PAY_FEES_LINK)}">Pay Service & Delivery Fees</a></p>
-          <p style="margin:0 0 8px;"><a href="${escapeHtml(SQUARE_PAY_GROCERIES_LINK)}">Pay Grocery Total</a></p>
-        </div>`,
-        `Order confirmed: ${order.orderId}\nPay fees: ${SQUARE_PAY_FEES_LINK}\nPay groceries: ${SQUARE_PAY_GROCERIES_LINK}`
-      );
-    }
-
     res.json({ ok: true });
   } catch (e) {
     res.status(500).json({ ok: false, error: String(e) });
@@ -1578,10 +1780,9 @@ app.post("/api/admin/orders/:orderId/status", requireLogin, requireAdmin, async 
 app.post("/api/admin/orders/:orderId/payments", requireLogin, requireAdmin, async (req, res) => {
   try {
     const orderId = String(req.params.orderId || "").trim().toUpperCase();
-    const by = adminBy(req);
 
-    const feesStatus = String(req.body?.feesStatus || "").trim(); // unpaid|paid
-    const groceriesStatus = String(req.body?.groceriesStatus || "").trim(); // unpaid|paid|deposit_paid
+    const feesStatus = String(req.body?.feesStatus || "").trim();
+    const groceriesStatus = String(req.body?.groceriesStatus || "").trim();
     const note = String(req.body?.note || "").trim();
 
     const order = await Order.findOne({ orderId });
@@ -1600,51 +1801,8 @@ app.post("/api/admin/orders/:orderId/payments", requireLogin, requireAdmin, asyn
       order.payments.groceries.note = note;
     }
 
-    addAdminLog(order, by, "payments", { feesStatus, groceriesStatus, note });
     await order.save();
     res.json({ ok: true });
-  } catch (e) {
-    res.status(500).json({ ok: false, error: String(e) });
-  }
-});
-
-app.post("/api/admin/orders/:orderId/hold", requireLogin, requireAdmin, async (req, res) => {
-  try {
-    const orderId = String(req.params.orderId || "").trim().toUpperCase();
-    const by = adminBy(req);
-    const hold = !!req.body?.hold;
-
-    const order = await Order.findOne({ orderId });
-    if (!order) return res.status(404).json({ ok: false, error: "Order not found" });
-
-    order.hold = hold;
-    addAdminLog(order, by, "hold", { hold });
-    await order.save();
-    res.json({ ok: true });
-  } catch (e) {
-    res.status(500).json({ ok: false, error: String(e) });
-  }
-});
-
-app.post("/api/admin/orders/:orderId/flags", requireLogin, requireAdmin, async (req, res) => {
-  try {
-    const orderId = String(req.params.orderId || "").trim().toUpperCase();
-    const by = adminBy(req);
-
-    const flags = req.body?.flags || {};
-    const allowed = ["idRequired","prescription","alcohol","bulky","newCustomerDepositRequired","needsContact"];
-
-    const order = await Order.findOne({ orderId });
-    if (!order) return res.status(404).json({ ok: false, error: "Order not found" });
-
-    order.flags = order.flags || {};
-    for (const k of allowed) {
-      if (k in flags) order.flags[k] = !!flags[k];
-    }
-
-    addAdminLog(order, by, "flags", { flags: order.flags });
-    await order.save();
-    res.json({ ok: true, flags: order.flags });
   } catch (e) {
     res.status(500).json({ ok: false, error: String(e) });
   }
@@ -1674,9 +1832,7 @@ app.post("/api/admin/orders/:orderId/cancel", requireLogin, requireAdmin, async 
     order.status.updatedBy = by;
     order.statusHistory.push({ state: "cancelled", note: reason, at: new Date(), by });
 
-    addAdminLog(order, by, "cancel", { reason });
     await order.save();
-
     res.json({ ok: true });
   } catch (e) {
     res.status(500).json({ ok: false, error: String(e) });
@@ -1686,7 +1842,6 @@ app.post("/api/admin/orders/:orderId/cancel", requireLogin, requireAdmin, async 
 app.delete("/api/admin/orders/:orderId", requireLogin, requireAdmin, async (req, res) => {
   try {
     const orderId = String(req.params.orderId || "").trim().toUpperCase();
-    const by = adminBy(req);
 
     const order = await Order.findOne({ orderId }).lean();
     if (!order) return res.status(404).json({ ok: false, error: "Order not found" });
@@ -1701,108 +1856,7 @@ app.delete("/api/admin/orders/:orderId", requireLogin, requireAdmin, async (req,
     }
 
     await Order.deleteOne({ orderId });
-    // no adminLog possible after delete
-    res.json({ ok: true, deleted: orderId, by });
-  } catch (e) {
-    res.status(500).json({ ok: false, error: String(e) });
-  }
-});
-
-// Bulk actions
-app.post("/api/admin/bulk/status", requireLogin, requireAdmin, async (req, res) => {
-  try {
-    const ids = Array.isArray(req.body?.orderIds) ? req.body.orderIds.map(String) : [];
-    const state = String(req.body?.state || "").trim();
-    const note = String(req.body?.note || "").trim();
-    const by = adminBy(req);
-
-    if (!AllowedStates.includes(state)) return res.status(400).json({ ok: false, error: "Invalid state" });
-    if (!ids.length) return res.status(400).json({ ok: false, error: "No orderIds" });
-
-    const orders = await Order.find({ orderId: { $in: ids.map(s => s.toUpperCase()) } });
-    for (const o of orders) {
-      o.status.state = state;
-      o.status.note = note;
-      o.status.updatedAt = new Date();
-      o.status.updatedBy = by;
-      o.statusHistory.push({ state, note, at: new Date(), by });
-      addAdminLog(o, by, "bulk_status", { state, note });
-      await o.save();
-    }
-
-    res.json({ ok: true, updated: orders.length });
-  } catch (e) {
-    res.status(500).json({ ok: false, error: String(e) });
-  }
-});
-
-app.post("/api/admin/bulk/cancel", requireLogin, requireAdmin, async (req, res) => {
-  try {
-    const ids = Array.isArray(req.body?.orderIds) ? req.body.orderIds.map(String) : [];
-    const reason = String(req.body?.reason || "").trim() || "Cancelled by admin (bulk)";
-    const by = adminBy(req);
-
-    if (!ids.length) return res.status(400).json({ ok: false, error: "No orderIds" });
-
-    const orders = await Order.find({ orderId: { $in: ids.map(s => s.toUpperCase()) } });
-    for (const o of orders) {
-      const wasActive = ACTIVE_STATES.has(o.status?.state || "submitted");
-      if (wasActive) {
-        const fees = Number(o.pricingSnapshot?.totalFees || 0);
-        await Run.updateOne(
-          { runKey: o.runKey },
-          { $inc: { bookedOrdersCount: -1, bookedFeesTotal: -fees }, $set: { lastRecalcAt: new Date() } }
-        );
-      }
-      o.status.state = "cancelled";
-      o.status.note = reason;
-      o.status.updatedAt = new Date();
-      o.status.updatedBy = by;
-      o.statusHistory.push({ state: "cancelled", note: reason, at: new Date(), by });
-      addAdminLog(o, by, "bulk_cancel", { reason });
-      await o.save();
-    }
-
-    res.json({ ok: true, cancelled: orders.length });
-  } catch (e) {
-    res.status(500).json({ ok: false, error: String(e) });
-  }
-});
-
-app.post("/api/admin/bulk/hold", requireLogin, requireAdmin, async (req, res) => {
-  try {
-    const ids = Array.isArray(req.body?.orderIds) ? req.body.orderIds.map(String) : [];
-    const hold = !!req.body?.hold;
-    const by = adminBy(req);
-
-    if (!ids.length) return res.status(400).json({ ok: false, error: "No orderIds" });
-
-    const orders = await Order.find({ orderId: { $in: ids.map(s => s.toUpperCase()) } });
-    for (const o of orders) {
-      o.hold = hold;
-      addAdminLog(o, by, "bulk_hold", { hold });
-      await o.save();
-    }
-    res.json({ ok: true, updated: orders.length });
-  } catch (e) {
-    res.status(500).json({ ok: false, error: String(e) });
-  }
-});
-
-app.post("/api/admin/bulk/fees-paid", requireLogin, requireAdmin, async (req, res) => {
-  try {
-    const ids = Array.isArray(req.body?.orderIds) ? req.body.orderIds.map(String) : [];
-    const by = adminBy(req);
-    if (!ids.length) return res.status(400).json({ ok: false, error: "No orderIds" });
-
-    const orders = await Order.find({ orderId: { $in: ids.map(s => s.toUpperCase()) } });
-    for (const o of orders) {
-      o.payments.fees.status = "paid";
-      o.payments.fees.paidAt = new Date();
-      addAdminLog(o, by, "bulk_fees_paid", {});
-      await o.save();
-    }
-    res.json({ ok: true, updated: orders.length });
+    res.json({ ok: true });
   } catch (e) {
     res.status(500).json({ ok: false, error: String(e) });
   }
@@ -1813,7 +1867,7 @@ app.post("/api/admin/tracking/:runKey/start", requireLogin, requireAdmin, async 
   try {
     const runKey = String(req.params.runKey || "").trim();
     const by = adminBy(req);
-    const t = await ensureTrackingDoc(runKey);
+    await ensureTrackingDoc(runKey);
     await Tracking.updateOne(
       { runKey },
       { $set: { enabled: true, startedAt: new Date(), stoppedAt: null, updatedBy: by } }
@@ -1839,7 +1893,7 @@ app.post("/api/admin/tracking/:runKey/stop", requireLogin, requireAdmin, async (
   }
 });
 
-// Use this endpoint from your phone (while logged into admin) to update live GPS
+// Update live GPS from phone (admin session cookie required)
 app.post("/api/admin/tracking/:runKey/update", requireLogin, requireAdmin, async (req, res) => {
   try {
     const runKey = String(req.params.runKey || "").trim();
@@ -1890,201 +1944,15 @@ app.get("/api/admin/orders/:orderId/tracking-link", requireLogin, requireAdmin, 
     const expMs = dayjs(run.cutoffAt).add(1, "day").valueOf();
     const token = signTrackingToken(o.orderId, run.runKey, expMs);
 
-    const url = `${PUBLIC_SITE_URL}/track.html?runKey=${encodeURIComponent(run.runKey)}&token=${encodeURIComponent(token)}`;
+    const url = `https://api.tobermorygroceryrun.ca/member?trackRunKey=${encodeURIComponent(run.runKey)}&token=${encodeURIComponent(token)}&orderId=${encodeURIComponent(o.orderId)}`;
     res.json({ ok: true, url });
   } catch (e) {
     res.status(500).json({ ok: false, error: String(e) });
   }
 });
 
-// Email notify templates (admin)
-app.post("/api/admin/notify", requireLogin, requireAdmin, async (req, res) => {
-  try {
-    const template = String(req.body?.template || "").trim(); // confirmed|out|generic
-    const ids = Array.isArray(req.body?.orderIds) ? req.body.orderIds.map(String) : [];
-    const by = adminBy(req);
-
-    if (!pmClient) return res.status(400).json({ ok: false, error: "Postmark not configured (POSTMARK_SERVER_TOKEN missing)." });
-    if (!ids.length) return res.status(400).json({ ok: false, error: "No orderIds" });
-
-    const orders = await Order.find({ orderId: { $in: ids.map(s => s.toUpperCase()) } }).lean();
-    let sent = 0;
-
-    for (const o of orders) {
-      const to = o.customer?.email;
-      if (!to) continue;
-
-      let subject = `TGR Update: ${o.orderId}`;
-      let html = `<div style="font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;line-height:1.45;">
-        <h2 style="margin:0 0 10px;">TGR update</h2>
-        <p style="margin:0 0 10px;"><strong>Order ID:</strong> ${escapeHtml(o.orderId)}</p>
-      </div>`;
-      let text = `TGR update\nOrder ID: ${o.orderId}`;
-
-      if (template === "confirmed") {
-        subject = `TGR Order Confirmed: ${o.orderId}`;
-        html = `<div style="font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;line-height:1.45;">
-          <h2 style="margin:0 0 10px;">Order confirmed ✅</h2>
-          <p style="margin:0 0 10px;"><strong>Order ID:</strong> ${escapeHtml(o.orderId)}</p>
-          <p style="margin:0 0 10px;">Pay service & delivery fees before shopping begins:</p>
-          <p style="margin:0 0 8px;"><a href="${escapeHtml(SQUARE_PAY_FEES_LINK)}">Pay Service & Delivery Fees</a></p>
-          <p style="margin:0 0 8px;"><a href="${escapeHtml(SQUARE_PAY_GROCERIES_LINK)}">Pay Grocery Total</a></p>
-        </div>`;
-        text = `Order confirmed: ${o.orderId}\nPay fees: ${SQUARE_PAY_FEES_LINK}\nPay groceries: ${SQUARE_PAY_GROCERIES_LINK}`;
-      } else if (template === "out") {
-        subject = `TGR Out for Delivery: ${o.orderId}`;
-        html = `<div style="font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;line-height:1.45;">
-          <h2 style="margin:0 0 10px;">Out for delivery 🚚</h2>
-          <p style="margin:0 0 10px;"><strong>Order ID:</strong> ${escapeHtml(o.orderId)}</p>
-          <p style="margin:0;">If tracking is enabled, your tracking link will work from the Member Portal.</p>
-        </div>`;
-        text = `Out for delivery: ${o.orderId}`;
-      }
-
-      await pmSend(to, subject, html, text);
-      sent++;
-    }
-
-    // log (no per-order doc update here to keep it light)
-    res.json({ ok: true, sent, by });
-  } catch (e) {
-    res.status(500).json({ ok: false, error: String(e) });
-  }
-});
-
-// Routific CSV export
-app.get("/api/admin/routific/export-csv", requireLogin, requireAdmin, async (req, res) => {
-  try {
-    const runKey = String(req.query.runKey || "").trim();
-    if (!runKey) return res.status(400).send("Missing runKey");
-
-    const orders = await Order.find({
-      runKey,
-      "status.state": { $in: Array.from(ACTIVE_STATES) },
-    }).sort({ createdAt: 1 }).lean();
-
-    const header = ["order_id","name","address","phone","email","notes","duration_seconds"];
-    const rows = orders.map(o => {
-      const name = o.customer?.fullName || "";
-      const phone = o.customer?.phone || "";
-      const email = o.customer?.email || "";
-      const address =
-        `${o.address?.streetAddress || ""}${o.address?.unit ? (" " + o.address.unit) : ""}, ` +
-        `${o.address?.town || ""}, ON, ${o.address?.postalCode || ""}, Canada`
-          .replace(/\s+/g, " ")
-          .trim();
-
-      const notes = [
-        `TGR ${o.orderId}`,
-        `Zone ${o.address?.zone || ""}`,
-        o.preferences?.dropoffPref ? `Drop-off: ${o.preferences.dropoffPref}` : "",
-        o.preferences?.subsPref ? `Subs: ${o.preferences.subsPref}` : "",
-        o.stores?.primary ? `Store: ${o.stores.primary}` : "",
-        (o.stores?.extra || []).length ? `Extra: ${(o.stores.extra || []).join(", ")}` : "",
-        o.hold ? "HOLD: yes" : "",
-        o.flags?.idRequired ? "FLAG: ID required" : "",
-        o.flags?.prescription ? "FLAG: prescription" : "",
-        o.flags?.bulky ? "FLAG: bulky" : "",
-      ].filter(Boolean).join(" | ");
-
-      const duration = 360;
-      return [o.orderId, name, address, phone, email, notes, String(duration)].map(csvEscape).join(",");
-    });
-
-    const csv = header.join(",") + "\n" + rows.join("\n") + "\n";
-    const filename = `routific_${runKey}_deliveries.csv`;
-
-    res.setHeader("Content-Type", "text/csv; charset=utf-8");
-    res.setHeader("Content-Disposition", `attachment; filename="${filename}"`);
-    res.send(csv);
-  } catch (e) {
-    res.status(500).send(String(e));
-  }
-});
-
-// Print pick lists (per runKey)
-app.get("/api/admin/print/picks", requireLogin, requireAdmin, async (req, res) => {
-  try {
-    const runKey = String(req.query.runKey || "").trim();
-    if (!runKey) return res.status(400).send("Missing runKey");
-
-    const orders = await Order.find({ runKey }).sort({ createdAt: 1 }).lean();
-
-    const blocks = orders.map(o => {
-      const addr =
-        `${o.address?.streetAddress || ""}${o.address?.unit ? (" " + o.address.unit) : ""}, ` +
-        `${o.address?.town || ""}, ON ${o.address?.postalCode || ""}`.trim();
-
-      const extra = (o.stores?.extra || []).length ? (o.stores.extra || []).join(", ") : "—";
-      const flags = [
-        o.hold ? "HOLD" : "",
-        o.flags?.idRequired ? "ID" : "",
-        o.flags?.prescription ? "RX" : "",
-        o.flags?.alcohol ? "ALC" : "",
-        o.flags?.bulky ? "BULKY" : "",
-      ].filter(Boolean).join(" • ") || "—";
-
-      return `
-        <div class="card">
-          <div class="top">
-            <div>
-              <div class="oid">${escapeHtml(o.orderId)}</div>
-              <div class="muted">${escapeHtml(o.customer?.fullName || "")} • ${escapeHtml(o.customer?.phone || "")}</div>
-              <div class="muted">${escapeHtml(addr)}</div>
-            </div>
-            <div class="meta">
-              <div><strong>Zone:</strong> ${escapeHtml(o.address?.zone || "")}</div>
-              <div><strong>Store:</strong> ${escapeHtml(o.stores?.primary || "")}</div>
-              <div><strong>Extra:</strong> ${escapeHtml(extra)}</div>
-              <div><strong>Flags:</strong> ${escapeHtml(flags)}</div>
-              <div><strong>Fees:</strong> $${escapeHtml(money(o.pricingSnapshot?.totalFees || 0))}</div>
-            </div>
-          </div>
-          <div class="hr"></div>
-          <div class="list">${escapeHtml(o.list?.groceryListText || "").replaceAll("\n","<br>")}</div>
-          <div class="hr"></div>
-          <div class="muted"><strong>Notes:</strong> ${escapeHtml(o.status?.note || "")}</div>
-        </div>
-      `;
-    }).join("");
-
-    res.setHeader("Content-Type", "text/html; charset=utf-8");
-    res.send(`<!doctype html>
-<html><head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Pick Lists ${escapeHtml(runKey)}</title>
-<style>
-  body{margin:0;font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;background:#111;color:#fff;}
-  .wrap{max-width:1000px;margin:0 auto;padding:16px;}
-  .card{border:1px solid rgba(255,255,255,.18);border-radius:14px;background:rgba(255,255,255,.06);padding:12px;margin-bottom:12px;page-break-inside:avoid;}
-  .top{display:flex;gap:12px;justify-content:space-between;flex-wrap:wrap;}
-  .oid{font-weight:1000;font-size:20px;}
-  .muted{color:rgba(255,255,255,.75);font-size:13px;}
-  .meta{min-width:260px;font-size:14px;}
-  .hr{height:1px;background:rgba(255,255,255,.12);margin:10px 0;}
-  .list{white-space:normal;font-size:15px;line-height:1.35;}
-  @media print{
-    body{background:#fff;color:#000;}
-    .card{background:#fff;border:1px solid #ccc;}
-    .muted{color:#333;}
-  }
-</style>
-</head>
-<body>
-<div class="wrap">
-  <h2 style="margin:0 0 10px;">Pick Lists — ${escapeHtml(runKey)}</h2>
-  <div class="muted" style="margin-bottom:12px;">Print this page. One card per order.</div>
-  ${blocks || "<div class='muted'>No orders.</div>"}
-</div>
-</body></html>`);
-  } catch (e) {
-    res.status(500).send(String(e));
-  }
-});
-
 // =========================
-// FULL ADMIN COMMAND CENTER PAGE
+// ADMIN COMMAND CENTER PAGE (kept minimal here)
 // =========================
 app.get("/admin", requireLogin, requireAdmin, async (req, res) => {
   const email = String(req.user?.email || "").toLowerCase();
@@ -2094,7 +1962,51 @@ app.get("/admin", requireLogin, requireAdmin, async (req, res) => {
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>TGR Admin Command Center</title>
+<title>TGR Admin</title>
+<style>
+  body{margin:0;background:#0b0b0b;color:#fff;font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;}
+  .wrap{max-width:900px;margin:0 auto;padding:16px;}
+  .card{border:1px solid rgba(255,255,255,.14);background:rgba(255,255,255,.06);border-radius:14px;padding:14px;}
+  .row{display:flex;gap:10px;flex-wrap:wrap;align-items:center;}
+  .btn{border:1px solid rgba(255,255,255,.18);background:rgba(255,255,255,.06);color:#fff;font-weight:900;border-radius:999px;padding:10px 14px;cursor:pointer;text-decoration:none;}
+  .btn.primary{background:linear-gradient(180deg,#ff4a44,#e3342f);border-color:rgba(0,0,0,.25);}
+  .muted{color:rgba(255,255,255,.75);}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="card">
+    <div class="row" style="justify-content:space-between;">
+      <div>
+        <div style="font-weight:1000;font-size:22px;">Admin</div>
+        <div class="muted">Signed in as <strong>${escapeHtml(email)}</strong></div>
+      </div>
+      <div class="row">
+        <a class="btn" href="/admin/tracking-control">Tracking Control</a>
+        <a class="btn" href="${escapeHtml(PUBLIC_SITE_URL)}/">Back to site</a>
+        <a class="btn" href="/logout?returnTo=${encodeURIComponent(PUBLIC_SITE_URL + "/")}">Log out</a>
+      </div>
+    </div>
+    <div style="margin-top:12px;" class="muted">
+      This is a lightweight admin landing. Your full Admin Command Center can be re-added here if you want it as the default admin page.
+    </div>
+  </div>
+</div>
+</body>
+</html>`);
+});
+
+// =========================
+// ADMIN: Tracking Control mini-page (NEW)
+// =========================
+app.get("/admin/tracking-control", requireLogin, requireAdmin, async (req, res) => {
+  res.setHeader("Content-Type", "text/html; charset=utf-8");
+  res.send(`<!doctype html>
+<html lang="en-CA">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>TGR Tracking Control</title>
 <style>
   :root{
     --bg:#0b0b0b; --panel:rgba(255,255,255,.06); --line:rgba(255,255,255,.14);
@@ -2103,11 +2015,9 @@ app.get("/admin", requireLogin, requireAdmin, async (req, res) => {
     --radius:14px;
   }
   body{margin:0;background:var(--bg);color:var(--text);font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;}
-  .wrap{max-width:1280px;margin:0 auto;padding:16px;}
+  .wrap{max-width:900px;margin:0 auto;padding:16px;}
   .card{border:1px solid var(--line);background:var(--panel);border-radius:var(--radius);padding:14px;}
   .row{display:flex;gap:10px;flex-wrap:wrap;align-items:center;}
-  .grid{display:grid;grid-template-columns:1fr 1fr;gap:12px;}
-  @media (max-width: 980px){ .grid{grid-template-columns:1fr;} }
   .btn{
     border:1px solid rgba(255,255,255,.18);
     background:rgba(255,255,255,.06);
@@ -2120,7 +2030,8 @@ app.get("/admin", requireLogin, requireAdmin, async (req, res) => {
   }
   .btn.primary{background:linear-gradient(180deg,var(--red2),var(--red));border-color:rgba(0,0,0,.25);}
   .btn.ghost{background:transparent;}
-  input,select,textarea{
+  .muted{color:var(--muted);}
+  select,input{
     width:100%;
     padding:12px 12px;
     border-radius:12px;
@@ -2129,21 +2040,10 @@ app.get("/admin", requireLogin, requireAdmin, async (req, res) => {
     color:#fff;
     font-size:16px;
   }
-  textarea{min-height:90px;}
-  .muted{color:var(--muted);}
-  table{width:100%;border-collapse:collapse;}
-  th,td{padding:10px 8px;border-bottom:1px solid rgba(255,255,255,.12);vertical-align:top;}
-  th{font-size:12px;color:rgba(255,255,255,.72);text-transform:uppercase;letter-spacing:.08em;text-align:left;}
   .pill{display:inline-block;padding:4px 10px;border-radius:999px;border:1px solid rgba(255,255,255,.18);background:rgba(255,255,255,.06);font-weight:900;font-size:12px;}
   .toast{margin-top:10px;padding:10px 12px;border-radius:12px;border:1px solid rgba(255,255,255,.18);background:rgba(0,0,0,.24);display:none;font-weight:900;}
   .toast.show{display:block;}
   .hr{height:1px;background:rgba(255,255,255,.12);margin:12px 0;}
-  .kpi{display:flex;gap:10px;flex-wrap:wrap;margin-top:8px;}
-  .kpi .pill{font-size:13px;}
-  .small{font-size:13px;}
-  .right{margin-left:auto;}
-  .danger{border-color:rgba(227,52,47,.55);background:rgba(227,52,47,.10);}
-  .ok{border-color:rgba(60,200,120,.40);background:rgba(60,200,120,.10);}
 </style>
 </head>
 <body>
@@ -2151,188 +2051,51 @@ app.get("/admin", requireLogin, requireAdmin, async (req, res) => {
   <div class="card">
     <div class="row" style="justify-content:space-between;">
       <div>
-        <div style="font-weight:1000;font-size:22px;">Admin Command Center</div>
-        <div class="muted">Signed in as <strong>${escapeHtml(email)}</strong></div>
+        <div style="font-weight:1000;font-size:22px;">Tracking Control</div>
+        <div class="muted">Use this page on your phone while signed into admin.</div>
       </div>
       <div class="row">
+        <a class="btn ghost" href="/admin">Admin</a>
         <a class="btn ghost" href="${escapeHtml(PUBLIC_SITE_URL)}/">Back to site</a>
-        <a class="btn ghost" href="/logout?returnTo=${encodeURIComponent(PUBLIC_SITE_URL + "/")}">Log out</a>
       </div>
     </div>
 
     <div class="toast" id="toast"></div>
     <div class="hr"></div>
 
-    <div class="grid">
-      <div class="card" style="box-shadow:none;">
-        <div style="font-weight:1000;font-size:18px;">Run dashboard</div>
-        <div class="muted">Cutoffs, minimums, slots, tracking controls, exports.</div>
-        <div class="hr"></div>
-
-        <div class="row">
-          <div style="flex:1 1 280px;">
-            <div style="font-weight:900;">Local run</div>
-            <div class="muted small" id="rkLocal">—</div>
-            <div class="kpi">
-              <span class="pill" id="localOpen">—</span>
-              <span class="pill" id="localSlots">Slots —</span>
-              <span class="pill" id="localMin">Min —</span>
-              <span class="pill" id="localFees">Fees —</span>
-            </div>
-            <div class="muted small" id="localCutoff">—</div>
-            <div class="row" style="margin-top:10px;">
-              <button class="btn" id="localExport">Export Routific</button>
-              <button class="btn" id="localPrint">Print picks</button>
-              <button class="btn" id="localTrackStart">Start tracking</button>
-              <button class="btn" id="localTrackStop">Stop tracking</button>
-            </div>
-          </div>
-
-          <div style="flex:1 1 280px;">
-            <div style="font-weight:900;">Owen run</div>
-            <div class="muted small" id="rkOwen">—</div>
-            <div class="kpi">
-              <span class="pill" id="owenOpen">—</span>
-              <span class="pill" id="owenSlots">Slots —</span>
-              <span class="pill" id="owenMin">Min —</span>
-              <span class="pill" id="owenFees">Fees —</span>
-            </div>
-            <div class="muted small" id="owenCutoff">—</div>
-            <div class="row" style="margin-top:10px;">
-              <button class="btn" id="owenExport">Export Routific</button>
-              <button class="btn" id="owenPrint">Print picks</button>
-              <button class="btn" id="owenTrackStart">Start tracking</button>
-              <button class="btn" id="owenTrackStop">Stop tracking</button>
-            </div>
-          </div>
-        </div>
-
-        <div class="hr"></div>
-
-        <div class="row">
-          <button class="btn primary" id="refreshBtn">Refresh</button>
-          <span class="muted small" id="clockLine">—</span>
-        </div>
+    <div class="row">
+      <div style="flex:1 1 380px;">
+        <label class="muted" style="font-weight:900;">Select run</label>
+        <select id="runSel">
+          <option value="">Loading…</option>
+        </select>
+        <div class="muted" id="runInfo" style="margin-top:8px;font-size:13px;"></div>
       </div>
 
-      <div class="card" style="box-shadow:none;">
-        <div style="font-weight:1000;font-size:18px;">Search & filters</div>
-        <div class="muted">OrderId / name / town / phone / email / postal + advanced filters.</div>
-        <div class="hr"></div>
-
-        <div class="row">
-          <div style="flex:1 1 260px;"><input id="q" placeholder="Search (TGR-..., name, town, phone, postal)"></div>
-          <div style="flex:0 0 220px;">
-            <select id="state">
-              <option value="">Any status</option>
-              <option value="submitted">submitted</option>
-              <option value="confirmed">confirmed</option>
-              <option value="shopping">shopping</option>
-              <option value="packed">packed</option>
-              <option value="out_for_delivery">out_for_delivery</option>
-              <option value="delivered">delivered</option>
-              <option value="issue">issue</option>
-              <option value="cancelled">cancelled</option>
-            </select>
-          </div>
-          <button class="btn" id="searchBtn">Search</button>
-        </div>
-
-        <div class="row" style="margin-top:10px;">
-          <div style="flex:0 0 230px;">
-            <select id="runKey">
-              <option value="">Any runKey</option>
-            </select>
-          </div>
-          <div style="flex:0 0 160px;">
-            <select id="zone">
-              <option value="">Any zone</option>
-              <option value="A">A</option><option value="B">B</option><option value="C">C</option><option value="D">D</option>
-            </select>
-          </div>
-          <div style="flex:1 1 220px;">
-            <input id="town" placeholder="Town filter (exact)" />
-          </div>
-        </div>
-
-        <div class="row" style="margin-top:10px;">
-          <label class="row small" style="gap:8px;align-items:center;">
-            <input type="checkbox" id="unpaidFees" style="width:18px;height:18px;margin:0;">
-            Unpaid fees only
-          </label>
-          <label class="row small" style="gap:8px;align-items:center;">
-            <input type="checkbox" id="holdOnly" style="width:18px;height:18px;margin:0;">
-            Hold only
-          </label>
-          <div style="flex:1 1 240px;">
-            <select id="flag">
-              <option value="">Any flag</option>
-              <option value="idRequired">ID required</option>
-              <option value="prescription">Prescription</option>
-              <option value="alcohol">Alcohol</option>
-              <option value="bulky">Bulky</option>
-              <option value="newCustomerDepositRequired">New customer deposit</option>
-              <option value="needsContact">Needs contact</option>
-            </select>
-          </div>
-        </div>
-
-        <div class="hr"></div>
-
-        <div style="font-weight:1000;">Bulk controls (selected orders)</div>
-        <div class="row" style="margin-top:10px;">
-          <select id="bulkState" style="flex:0 0 240px;">
-            <option value="">Bulk status…</option>
-            <option value="confirmed">confirmed</option>
-            <option value="shopping">shopping</option>
-            <option value="packed">packed</option>
-            <option value="out_for_delivery">out_for_delivery</option>
-            <option value="delivered">delivered</option>
-            <option value="issue">issue</option>
-          </select>
-          <button class="btn" id="bulkSetStatus">Apply</button>
-          <button class="btn" id="bulkFeesPaid">Mark fees paid</button>
-          <button class="btn" id="bulkHoldOn">Hold ON</button>
-          <button class="btn" id="bulkHoldOff">Hold OFF</button>
-          <button class="btn" id="bulkCancel">Cancel</button>
-        </div>
-
-        <div class="row" style="margin-top:10px;">
-          <select id="notifyTpl" style="flex:0 0 240px;">
-            <option value="">Email notify…</option>
-            <option value="confirmed">Confirmed + pay links</option>
-            <option value="out">Out for delivery</option>
-            <option value="generic">Generic update</option>
-          </select>
-          <button class="btn" id="bulkNotify">Send emails</button>
-          <span class="muted small">Emails only (Postmark required).</span>
-        </div>
+      <div style="flex:1 1 240px;">
+        <label class="muted" style="font-weight:900;">GPS send interval (ms)</label>
+        <input id="interval" type="number" min="500" step="100" value="1500"/>
       </div>
     </div>
 
     <div class="hr"></div>
 
-    <div class="muted" id="countLine">Loading…</div>
-    <div style="overflow:auto;margin-top:10px;">
-      <table>
-        <thead>
-          <tr>
-            <th>Select</th>
-            <th>Order</th>
-            <th>Customer</th>
-            <th>Run</th>
-            <th>Address</th>
-            <th>Status</th>
-            <th>Fees</th>
-            <th>Payments</th>
-            <th>Hold/Flags</th>
-            <th>Quick</th>
-            <th>Actions</th>
-          </tr>
-        </thead>
-        <tbody id="rows"></tbody>
-      </table>
+    <div class="row">
+      <button class="btn" id="enableBtn">Start tracking (enable run)</button>
+      <button class="btn" id="disableBtn">Stop tracking (disable run)</button>
+      <span class="pill" id="enabledState">—</span>
     </div>
+
+    <div class="hr"></div>
+
+    <div class="row">
+      <button class="btn primary" id="startGps">Start GPS broadcast</button>
+      <button class="btn" id="stopGps">Stop GPS broadcast</button>
+      <span class="pill" id="gpsState">GPS: idle</span>
+    </div>
+
+    <div class="muted" id="lastSend" style="margin-top:10px;font-size:13px;">Last send: —</div>
+    <div class="muted" id="err" style="margin-top:6px;font-size:13px;"></div>
   </div>
 </div>
 
@@ -2344,470 +2107,138 @@ app.get("/admin", requireLogin, requireAdmin, async (req, res) => {
     setTimeout(()=>el.classList.remove("show"), 3500);
   };
 
-  const api = {
-    runs: "/api/runs/active",
-    list: "/api/admin/orders",
-    one: (id)=> "/api/admin/orders/" + encodeURIComponent(id),
-    status: (id)=> "/api/admin/orders/" + encodeURIComponent(id) + "/status",
-    pay: (id)=> "/api/admin/orders/" + encodeURIComponent(id) + "/payments",
-    hold: (id)=> "/api/admin/orders/" + encodeURIComponent(id) + "/hold",
-    flags: (id)=> "/api/admin/orders/" + encodeURIComponent(id) + "/flags",
-    cancel: (id)=> "/api/admin/orders/" + encodeURIComponent(id) + "/cancel",
-    del: (id)=> "/api/admin/orders/" + encodeURIComponent(id),
-    exportCsv: (runKey)=> "/api/admin/routific/export-csv?runKey=" + encodeURIComponent(runKey),
-    printPicks: (runKey)=> "/api/admin/print/picks?runKey=" + encodeURIComponent(runKey),
-    tStart: (runKey)=> "/api/admin/tracking/" + encodeURIComponent(runKey) + "/start",
-    tStop: (runKey)=> "/api/admin/tracking/" + encodeURIComponent(runKey) + "/stop",
-    tLink: (id)=> "/api/admin/orders/" + encodeURIComponent(id) + "/tracking-link",
-    bulkStatus: "/api/admin/bulk/status",
-    bulkCancel: "/api/admin/bulk/cancel",
-    bulkHold: "/api/admin/bulk/hold",
-    bulkFeesPaid: "/api/admin/bulk/fees-paid",
-    notify: "/api/admin/notify",
-  };
+  const runSel = document.getElementById("runSel");
+  const runInfo = document.getElementById("runInfo");
+  const enabledState = document.getElementById("enabledState");
+  const gpsState = document.getElementById("gpsState");
+  const lastSend = document.getElementById("lastSend");
+  const err = document.getElementById("err");
+  const intervalEl = document.getElementById("interval");
 
-  let runKeys = { local:"", owen:"" };
-  let runsCache = null;
+  let runs = null;
+  let watchId = null;
+  let lastPostAt = 0;
 
-  function pillOpen(isOpen){ return isOpen ? "OPEN ✅" : "CLOSED"; }
-  function money(n){ return "$" + Number(n||0).toFixed(2); }
-
-  function msToCountdown(ms){
-    const s = Math.max(0, Math.floor(ms/1000));
-    const d = Math.floor(s/86400);
-    const h = Math.floor((s%86400)/3600);
-    const m = Math.floor((s%3600)/60);
-    return (d>0 ? (d+"d ") : "") + h + "h " + m + "m";
-  }
-
-  async function fetchRuns(){
-    const r = await fetch(api.runs, { credentials:"include" });
+  async function loadRuns(){
+    const r = await fetch("/api/runs/active", { credentials:"include" });
     const d = await r.json().catch(()=>({}));
-    if(!r.ok || d.ok===false) throw new Error(d.error || "Runs failed");
-    runsCache = d.runs || null;
+    if(!r.ok || d.ok===false) throw new Error(d.error || "Runs unavailable");
+    runs = d.runs || null;
 
-    runKeys.local = d.runs?.local?.runKey || "";
-    runKeys.owen = d.runs?.owen?.runKey || "";
-
-    const rkSel = document.getElementById("runKey");
-    rkSel.innerHTML = '<option value="">Any runKey</option>';
-    [runKeys.local, runKeys.owen].filter(Boolean).forEach(k=>{
-      const opt = document.createElement("option");
-      opt.value = k; opt.textContent = k;
-      rkSel.appendChild(opt);
-    });
-
-    // populate dashboard
-    const L = d.runs.local || {};
-    const O = d.runs.owen || {};
-    document.getElementById("rkLocal").textContent = L.runKey || "—";
-    document.getElementById("rkOwen").textContent = O.runKey || "—";
-
-    const localOpen = document.getElementById("localOpen");
-    localOpen.textContent = pillOpen(!!L.isOpen);
-    localOpen.className = "pill " + (L.isOpen ? "ok":"danger");
-
-    document.getElementById("localSlots").textContent = "Slots " + (L.slotsRemaining ?? "—");
-    document.getElementById("localMin").textContent = L.minimumText || "—";
-    document.getElementById("localFees").textContent = "Fees " + money(L.bookedFeesTotal || 0);
-
-    const owenOpen = document.getElementById("owenOpen");
-    owenOpen.textContent = pillOpen(!!O.isOpen);
-    owenOpen.className = "pill " + (O.isOpen ? "ok":"danger");
-
-    document.getElementById("owenSlots").textContent = "Slots " + (O.slotsRemaining ?? "—");
-    document.getElementById("owenMin").textContent = O.minimumText || "—";
-    document.getElementById("owenFees").textContent = "Fees " + money(O.bookedFeesTotal || 0);
-
-    document.getElementById("localCutoff").textContent = "Opens: " + (L.opensAtLocal||"—") + " • Cutoff: " + (L.cutoffAtLocal||"—");
-    document.getElementById("owenCutoff").textContent = "Opens: " + (O.opensAtLocal||"—") + " • Cutoff: " + (O.cutoffAtLocal||"—");
+    runSel.innerHTML = '<option value="">Select…</option>';
+    const L = runs.local;
+    const O = runs.owen;
+    if (L?.runKey){
+      const o = document.createElement("option");
+      o.value = L.runKey; o.textContent = "Local: " + L.runKey;
+      runSel.appendChild(o);
+    }
+    if (O?.runKey){
+      const o = document.createElement("option");
+      o.value = O.runKey; o.textContent = "Owen: " + O.runKey;
+      runSel.appendChild(o);
+    }
   }
 
-  function selectedOrderIds(){
-    return Array.from(document.querySelectorAll("input[data-pick='1']:checked")).map(x=>x.value);
+  function getRunByKey(k){
+    if (!runs) return null;
+    if (runs.local?.runKey === k) return runs.local;
+    if (runs.owen?.runKey === k) return runs.owen;
+    return null;
   }
 
-  async function fetchOrders(){
-    const q = document.getElementById("q").value.trim();
-    const state = document.getElementById("state").value;
-    const runKey = document.getElementById("runKey").value;
-    const zone = document.getElementById("zone").value;
-    const town = document.getElementById("town").value.trim();
-    const unpaidFees = document.getElementById("unpaidFees").checked ? "1" : "";
-    const hold = document.getElementById("holdOnly").checked ? "1" : "";
-    const flag = document.getElementById("flag").value;
+  function updateRunInfo(){
+    const k = runSel.value;
+    const r = getRunByKey(k);
+    if(!r){ runInfo.textContent = ""; enabledState.textContent = "—"; return; }
+    runInfo.textContent = "Opens: " + r.opensAtLocal + " • Cutoff: " + r.cutoffAtLocal + " • Slots: " + r.slotsRemaining;
+    enabledState.textContent = r.isOpen ? "Orders open" : "Orders closed";
+  }
 
-    const url = new URL(location.origin + api.list);
-    if(q) url.searchParams.set("q", q);
-    if(state) url.searchParams.set("state", state);
-    if(runKey) url.searchParams.set("runKey", runKey);
-    if(zone) url.searchParams.set("zone", zone);
-    if(town) url.searchParams.set("town", town);
-    if(unpaidFees) url.searchParams.set("unpaidFees", unpaidFees);
-    if(hold) url.searchParams.set("hold", hold);
-    if(flag) url.searchParams.set("flag", flag);
-    url.searchParams.set("limit", "250");
+  runSel.addEventListener("change", updateRunInfo);
 
-    const r = await fetch(url.toString(), { credentials:"include" });
+  async function enableTracking(){
+    const k = runSel.value;
+    if(!k) return toast("Select a runKey");
+    const r = await fetch("/api/admin/tracking/" + encodeURIComponent(k) + "/start", { method:"POST", credentials:"include" });
     const d = await r.json().catch(()=>({}));
-    if(!r.ok || d.ok===false) throw new Error(d.error || "Orders failed");
+    if(!r.ok || d.ok===false) return toast(d.error || "Enable failed");
+    toast("Tracking enabled for " + k);
+  }
 
-    const items = d.items || [];
-    document.getElementById("countLine").textContent = items.length + " orders shown";
+  async function disableTracking(){
+    const k = runSel.value;
+    if(!k) return toast("Select a runKey");
+    const r = await fetch("/api/admin/tracking/" + encodeURIComponent(k) + "/stop", { method:"POST", credentials:"include" });
+    const d = await r.json().catch(()=>({}));
+    if(!r.ok || d.ok===false) return toast(d.error || "Disable failed");
+    toast("Tracking disabled for " + k);
+  }
 
-    const tbody = document.getElementById("rows");
-    tbody.innerHTML = "";
+  async function postFix(pos){
+    const k = runSel.value;
+    if(!k) return;
 
-    items.forEach(o=>{
-      const tr = document.createElement("tr");
-      const fees = (o.pricingSnapshot && typeof o.pricingSnapshot.totalFees==="number") ? o.pricingSnapshot.totalFees : 0;
-      const payFees = o.payments?.fees?.status || "unpaid";
-      const payGro = o.payments?.groceries?.status || "unpaid";
-      const hold = !!o.hold;
+    const ms = Math.max(500, Number(intervalEl.value || 1500));
+    const now = Date.now();
+    if ((now - lastPostAt) < ms) return;
+    lastPostAt = now;
 
-      const flags = [];
-      if (o.flags?.idRequired) flags.push("ID");
-      if (o.flags?.prescription) flags.push("RX");
-      if (o.flags?.alcohol) flags.push("ALC");
-      if (o.flags?.bulky) flags.push("BULKY");
-      if (o.flags?.newCustomerDepositRequired) flags.push("DEP");
-      if (o.flags?.needsContact) flags.push("CALL");
-      const flagText = flags.length ? flags.join(" ") : "—";
+    const c = pos.coords || {};
+    const body = {
+      lat: c.latitude,
+      lng: c.longitude,
+      heading: Number.isFinite(c.heading) ? c.heading : null,
+      speed: Number.isFinite(c.speed) ? c.speed : null,
+      accuracy: Number.isFinite(c.accuracy) ? c.accuracy : null,
+    };
 
-      tr.innerHTML = \`
-        <td><input type="checkbox" data-pick="1" value="\${o.orderId}" style="width:18px;height:18px;"></td>
-
-        <td>
-          <div style="font-weight:1000;">\${o.orderId}</div>
-          <div class="muted small">\${new Date(o.createdAt).toLocaleString()}</div>
-        </td>
-
-        <td>
-          <div style="font-weight:900;">\${o.customer?.fullName || "—"}</div>
-          <div class="muted small">\${o.customer?.phone || "—"} • \${o.customer?.email || "—"}</div>
-        </td>
-
-        <td>
-          <span class="pill">\${o.runType}</span>
-          <div class="muted small">\${o.runKey}</div>
-        </td>
-
-        <td>
-          <div style="font-weight:900;">\${o.address?.town || "—"} (Zone \${o.address?.zone || "—"})</div>
-          <div class="muted small">\${o.address?.streetAddress || "—"} \${o.address?.unit ? (" • " + o.address.unit) : ""} • \${o.address?.postalCode || ""}</div>
-        </td>
-
-        <td>
-          <span class="pill">\${o.status?.state || "submitted"}</span>
-          <div class="muted small">\${o.status?.note || ""}</div>
-        </td>
-
-        <td>\${money(fees)}</td>
-
-        <td>
-          <div class="muted small"><strong>Fees:</strong> \${payFees}</div>
-          <div class="muted small"><strong>Groceries:</strong> \${payGro}</div>
-          <div class="row" style="margin-top:6px;">
-            <button class="btn" data-pay="\${o.orderId}">Edit</button>
-          </div>
-        </td>
-
-        <td>
-          <div class="muted small"><strong>Hold:</strong> \${hold ? "YES" : "no"}</div>
-          <div class="muted small"><strong>Flags:</strong> \${flagText}</div>
-          <div class="row" style="margin-top:6px;">
-            <button class="btn" data-hold="\${o.orderId}">\${hold ? "Hold OFF" : "Hold ON"}</button>
-            <button class="btn" data-flags="\${o.orderId}">Flags</button>
-          </div>
-        </td>
-
-        <td class="row" style="gap:8px;">
-          <button class="btn" data-status="confirmed" data-id="\${o.orderId}">Confirm</button>
-          <button class="btn" data-status="shopping" data-id="\${o.orderId}">Shopping</button>
-          <button class="btn" data-status="packed" data-id="\${o.orderId}">Packed</button>
-          <button class="btn" data-status="out_for_delivery" data-id="\${o.orderId}">Out</button>
-          <button class="btn" data-status="delivered" data-id="\${o.orderId}">Delivered</button>
-          <button class="btn" data-status="issue" data-id="\${o.orderId}">Issue</button>
-        </td>
-
-        <td class="row" style="gap:8px;">
-          <button class="btn" data-view="\${o.orderId}">View</button>
-          <button class="btn" data-track="\${o.orderId}">Tracking link</button>
-          <button class="btn" data-cancel="\${o.orderId}">Cancel</button>
-          <button class="btn" data-del="\${o.orderId}">Delete</button>
-        </td>
-      \`;
-      tbody.appendChild(tr);
-    });
-
-    // wire actions
-    tbody.querySelectorAll("[data-view]").forEach(btn=>{
-      btn.addEventListener("click", async ()=>{
-        const id = btn.getAttribute("data-view");
-        const r = await fetch(api.one(id), { credentials:"include" });
-        const d = await r.json().catch(()=>({}));
-        if(!r.ok || d.ok===false) return toast(d.error || "View failed");
-        alert(JSON.stringify(d.order || {}, null, 2));
+    try{
+      const r = await fetch("/api/admin/tracking/" + encodeURIComponent(k) + "/update", {
+        method:"POST",
+        headers:{ "Content-Type":"application/json" },
+        credentials:"include",
+        body: JSON.stringify(body),
       });
-    });
-
-    tbody.querySelectorAll("[data-status]").forEach(btn=>{
-      btn.addEventListener("click", async ()=>{
-        const id = btn.getAttribute("data-id");
-        const state = btn.getAttribute("data-status");
-        const note = prompt("Optional note for " + state + ":", "") || "";
-        const r = await fetch(api.status(id), {
-          method:"POST",
-          headers:{ "Content-Type":"application/json" },
-          credentials:"include",
-          body: JSON.stringify({ state, note }),
-        });
-        const d = await r.json().catch(()=>({}));
-        if(!r.ok || d.ok===false) return toast(d.error || "Status failed");
-        toast("Set " + id + " → " + state);
-        fetchOrders().catch(e=>toast(String(e.message||e)));
-      });
-    });
-
-    tbody.querySelectorAll("[data-cancel]").forEach(btn=>{
-      btn.addEventListener("click", async ()=>{
-        const id = btn.getAttribute("data-cancel");
-        const reason = prompt("Cancel reason:", "Cancelled by admin") || "";
-        const r = await fetch(api.cancel(id), {
-          method:"POST",
-          headers:{ "Content-Type":"application/json" },
-          credentials:"include",
-          body: JSON.stringify({ reason }),
-        });
-        const d = await r.json().catch(()=>({}));
-        if(!r.ok || d.ok===false) return toast(d.error || "Cancel failed");
-        toast("Cancelled " + id);
-        fetchOrders().catch(e=>toast(String(e.message||e)));
-      });
-    });
-
-    tbody.querySelectorAll("[data-del]").forEach(btn=>{
-      btn.addEventListener("click", async ()=>{
-        const id = btn.getAttribute("data-del");
-        const ok = confirm("Delete " + id + "? This cannot be undone.");
-        if(!ok) return;
-        const r = await fetch(api.del(id), { method:"DELETE", credentials:"include" });
-        const d = await r.json().catch(()=>({}));
-        if(!r.ok || d.ok===false) return toast(d.error || "Delete failed");
-        toast("Deleted " + id);
-        fetchOrders().catch(e=>toast(String(e.message||e)));
-      });
-    });
-
-    tbody.querySelectorAll("[data-pay]").forEach(btn=>{
-      btn.addEventListener("click", async ()=>{
-        const id = btn.getAttribute("data-pay");
-        const feesStatus = prompt("Fees status (unpaid/paid):", "paid") || "";
-        const groceriesStatus = prompt("Groceries status (unpaid/deposit_paid/paid):", "") || "";
-        const note = prompt("Optional payment note:", "") || "";
-        const r = await fetch(api.pay(id), {
-          method:"POST",
-          headers:{ "Content-Type":"application/json" },
-          credentials:"include",
-          body: JSON.stringify({ feesStatus, groceriesStatus, note }),
-        });
-        const d = await r.json().catch(()=>({}));
-        if(!r.ok || d.ok===false) return toast(d.error || "Payments update failed");
-        toast("Payments updated " + id);
-        fetchOrders().catch(e=>toast(String(e.message||e)));
-      });
-    });
-
-    tbody.querySelectorAll("[data-hold]").forEach(btn=>{
-      btn.addEventListener("click", async ()=>{
-        const id = btn.getAttribute("data-hold");
-        const rOne = await fetch(api.one(id), { credentials:"include" });
-        const dOne = await rOne.json().catch(()=>({}));
-        if(!rOne.ok || dOne.ok===false) return toast(dOne.error || "Fetch failed");
-        const nowHold = !!(dOne.order?.hold);
-        const r = await fetch(api.hold(id), {
-          method:"POST",
-          headers:{ "Content-Type":"application/json" },
-          credentials:"include",
-          body: JSON.stringify({ hold: !nowHold }),
-        });
-        const d = await r.json().catch(()=>({}));
-        if(!r.ok || d.ok===false) return toast(d.error || "Hold failed");
-        toast("Hold " + (!nowHold ? "ON":"OFF") + " for " + id);
-        fetchOrders().catch(e=>toast(String(e.message||e)));
-      });
-    });
-
-    tbody.querySelectorAll("[data-flags]").forEach(btn=>{
-      btn.addEventListener("click", async ()=>{
-        const id = btn.getAttribute("data-flags");
-        const rOne = await fetch(api.one(id), { credentials:"include" });
-        const dOne = await rOne.json().catch(()=>({}));
-        if(!rOne.ok || dOne.ok===false) return toast(dOne.error || "Fetch failed");
-        const f = dOne.order?.flags || {};
-
-        const idReq = confirm("Flag: ID required? (OK=yes, Cancel=no)");
-        const rx = confirm("Flag: Prescription? (OK=yes, Cancel=no)");
-        const alc = confirm("Flag: Alcohol? (OK=yes, Cancel=no)");
-        const bulky = confirm("Flag: Bulky/heavy? (OK=yes, Cancel=no)");
-        const dep = confirm("Flag: New customer deposit required? (OK=yes, Cancel=no)");
-        const call = confirm("Flag: Needs contact? (OK=yes, Cancel=no)");
-
-        const r = await fetch(api.flags(id), {
-          method:"POST",
-          headers:{ "Content-Type":"application/json" },
-          credentials:"include",
-          body: JSON.stringify({ flags: { idRequired:idReq, prescription:rx, alcohol:alc, bulky:bulky, newCustomerDepositRequired:dep, needsContact:call } }),
-        });
-        const d = await r.json().catch(()=>({}));
-        if(!r.ok || d.ok===false) return toast(d.error || "Flags failed");
-        toast("Flags updated " + id);
-        fetchOrders().catch(e=>toast(String(e.message||e)));
-      });
-    });
-
-    tbody.querySelectorAll("[data-track]").forEach(btn=>{
-      btn.addEventListener("click", async ()=>{
-        const id = btn.getAttribute("data-track");
-        const r = await fetch(api.tLink(id), { credentials:"include" });
-        const d = await r.json().catch(()=>({}));
-        if(!r.ok || d.ok===false) return toast(d.error || "Tracking link failed");
-        try{
-          await navigator.clipboard.writeText(d.url);
-          toast("Tracking link copied ✅");
-        } catch {
-          alert(d.url);
-        }
-      });
-    });
+      const d = await r.json().catch(()=>({}));
+      if(!r.ok || d.ok===false) throw new Error(d.error || "Update failed");
+      gpsState.textContent = "GPS: sending ✅";
+      lastSend.textContent = "Last send: " + new Date().toLocaleString() + " • acc " + Math.round(Number(body.accuracy||0)) + "m";
+      err.textContent = "";
+    } catch(e){
+      gpsState.textContent = "GPS: error";
+      err.textContent = String(e.message || e);
+    }
   }
 
-  async function bulkStatus(){
-    const ids = selectedOrderIds();
-    const state = document.getElementById("bulkState").value;
-    if(!ids.length) return toast("Select orders first");
-    if(!state) return toast("Choose a bulk status");
-    const note = prompt("Bulk status note:", "") || "";
-    const r = await fetch(api.bulkStatus, {
-      method:"POST",
-      headers:{ "Content-Type":"application/json" },
-      credentials:"include",
-      body: JSON.stringify({ orderIds: ids, state, note }),
-    });
-    const d = await r.json().catch(()=>({}));
-    if(!r.ok || d.ok===false) return toast(d.error || "Bulk status failed");
-    toast("Bulk updated: " + d.updated);
-    fetchOrders().catch(e=>toast(String(e.message||e)));
+  function startGps(){
+    if(!navigator.geolocation) return toast("Geolocation not supported on this device");
+    const k = runSel.value;
+    if(!k) return toast("Select a runKey first");
+
+    if (watchId) navigator.geolocation.clearWatch(watchId);
+    watchId = navigator.geolocation.watchPosition(
+      postFix,
+      (e)=>{ gpsState.textContent = "GPS: error"; err.textContent = e.message || "GPS error"; },
+      { enableHighAccuracy:true, maximumAge:1000, timeout:10000 }
+    );
+    toast("GPS broadcast started");
+    gpsState.textContent = "GPS: starting…";
   }
 
-  async function bulkFeesPaid(){
-    const ids = selectedOrderIds();
-    if(!ids.length) return toast("Select orders first");
-    const r = await fetch(api.bulkFeesPaid, {
-      method:"POST",
-      headers:{ "Content-Type":"application/json" },
-      credentials:"include",
-      body: JSON.stringify({ orderIds: ids }),
-    });
-    const d = await r.json().catch(()=>({}));
-    if(!r.ok || d.ok===false) return toast(d.error || "Bulk fees failed");
-    toast("Fees marked paid: " + d.updated);
-    fetchOrders().catch(e=>toast(String(e.message||e)));
+  function stopGps(){
+    if (watchId) navigator.geolocation.clearWatch(watchId);
+    watchId = null;
+    gpsState.textContent = "GPS: idle";
+    toast("GPS broadcast stopped");
   }
 
-  async function bulkHold(hold){
-    const ids = selectedOrderIds();
-    if(!ids.length) return toast("Select orders first");
-    const r = await fetch(api.bulkHold, {
-      method:"POST",
-      headers:{ "Content-Type":"application/json" },
-      credentials:"include",
-      body: JSON.stringify({ orderIds: ids, hold }),
-    });
-    const d = await r.json().catch(()=>({}));
-    if(!r.ok || d.ok===false) return toast(d.error || "Bulk hold failed");
-    toast("Hold updated: " + d.updated);
-    fetchOrders().catch(e=>toast(String(e.message||e)));
-  }
+  document.getElementById("enableBtn").addEventListener("click", enableTracking);
+  document.getElementById("disableBtn").addEventListener("click", disableTracking);
+  document.getElementById("startGps").addEventListener("click", startGps);
+  document.getElementById("stopGps").addEventListener("click", stopGps);
 
-  async function bulkCancel(){
-    const ids = selectedOrderIds();
-    if(!ids.length) return toast("Select orders first");
-    const reason = prompt("Bulk cancel reason:", "Cancelled by admin (bulk)") || "";
-    const r = await fetch(api.bulkCancel, {
-      method:"POST",
-      headers:{ "Content-Type":"application/json" },
-      credentials:"include",
-      body: JSON.stringify({ orderIds: ids, reason }),
-    });
-    const d = await r.json().catch(()=>({}));
-    if(!r.ok || d.ok===false) return toast(d.error || "Bulk cancel failed");
-    toast("Cancelled: " + d.cancelled);
-    fetchOrders().catch(e=>toast(String(e.message||e)));
-  }
-
-  async function bulkNotify(){
-    const ids = selectedOrderIds();
-    const tpl = document.getElementById("notifyTpl").value;
-    if(!ids.length) return toast("Select orders first");
-    if(!tpl) return toast("Choose an email template");
-    const r = await fetch(api.notify, {
-      method:"POST",
-      headers:{ "Content-Type":"application/json" },
-      credentials:"include",
-      body: JSON.stringify({ orderIds: ids, template: tpl }),
-    });
-    const d = await r.json().catch(()=>({}));
-    if(!r.ok || d.ok===false) return toast(d.error || "Notify failed");
-    toast("Emails sent: " + d.sent);
-  }
-
-  function openUrl(url){ window.location.href = url; }
-
-  async function trackStart(runKey){
-    if(!runKey) return toast("Missing runKey");
-    const r = await fetch(api.tStart(runKey), { method:"POST", credentials:"include" });
-    const d = await r.json().catch(()=>({}));
-    if(!r.ok || d.ok===false) return toast(d.error || "Tracking start failed");
-    toast("Tracking started for " + runKey);
-  }
-
-  async function trackStop(runKey){
-    if(!runKey) return toast("Missing runKey");
-    const r = await fetch(api.tStop(runKey), { method:"POST", credentials:"include" });
-    const d = await r.json().catch(()=>({}));
-    if(!r.ok || d.ok===false) return toast(d.error || "Tracking stop failed");
-    toast("Tracking stopped for " + runKey);
-  }
-
-  // dashboard buttons
-  document.getElementById("localExport").addEventListener("click", ()=> openUrl(api.exportCsv(runKeys.local)));
-  document.getElementById("owenExport").addEventListener("click", ()=> openUrl(api.exportCsv(runKeys.owen)));
-  document.getElementById("localPrint").addEventListener("click", ()=> openUrl(api.printPicks(runKeys.local)));
-  document.getElementById("owenPrint").addEventListener("click", ()=> openUrl(api.printPicks(runKeys.owen)));
-  document.getElementById("localTrackStart").addEventListener("click", ()=> trackStart(runKeys.local));
-  document.getElementById("localTrackStop").addEventListener("click", ()=> trackStop(runKeys.local));
-  document.getElementById("owenTrackStart").addEventListener("click", ()=> trackStart(runKeys.owen));
-  document.getElementById("owenTrackStop").addEventListener("click", ()=> trackStop(runKeys.owen));
-
-  document.getElementById("searchBtn").addEventListener("click", ()=>fetchOrders().catch(e=>toast(String(e.message||e))));
-  document.getElementById("refreshBtn").addEventListener("click", ()=>{ fetchRuns().then(fetchOrders).catch(e=>toast(String(e.message||e))); });
-
-  document.getElementById("bulkSetStatus").addEventListener("click", ()=> bulkStatus().catch(e=>toast(String(e.message||e))));
-  document.getElementById("bulkFeesPaid").addEventListener("click", ()=> bulkFeesPaid().catch(e=>toast(String(e.message||e))));
-  document.getElementById("bulkHoldOn").addEventListener("click", ()=> bulkHold(true).catch(e=>toast(String(e.message||e))));
-  document.getElementById("bulkHoldOff").addEventListener("click", ()=> bulkHold(false).catch(e=>toast(String(e.message||e))));
-  document.getElementById("bulkCancel").addEventListener("click", ()=> bulkCancel().catch(e=>toast(String(e.message||e))));
-  document.getElementById("bulkNotify").addEventListener("click", ()=> bulkNotify().catch(e=>toast(String(e.message||e))));
-
-  // clock line
-  setInterval(()=>{
-    const now = new Date();
-    let line = "Local/OWEN cutoffs update every 60s • " + now.toLocaleString();
-    document.getElementById("clockLine").textContent = line;
-  }, 1000);
-
-  fetchRuns().then(fetchOrders).catch(e=>toast(String(e.message||e)));
+  loadRuns().then(updateRunInfo).catch(e=>toast(String(e.message||e)));
 </script>
 
 </body>
