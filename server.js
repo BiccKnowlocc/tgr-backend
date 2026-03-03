@@ -1954,48 +1954,50 @@ app.get("/api/admin/orders/:orderId/tracking-link", requireLogin, requireAdmin, 
 // =========================
 // ADMIN COMMAND CENTER PAGE (kept minimal here)
 // =========================
-app.get("/admin", requireLogin, requireAdmin, async (req, res) => {
-  const email = String(req.user?.email || "").toLowerCase();
-  res.setHeader("Content-Type", "text/html; charset=utf-8");
-  res.send(`<!doctype html>
-<html lang="en-CA">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>TGR Admin</title>
-<style>
-  body{margin:0;background:#0b0b0b;color:#fff;font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;}
-  .wrap{max-width:900px;margin:0 auto;padding:16px;}
-  .card{border:1px solid rgba(255,255,255,.14);background:rgba(255,255,255,.06);border-radius:14px;padding:14px;}
-  .row{display:flex;gap:10px;flex-wrap:wrap;align-items:center;}
-  .btn{border:1px solid rgba(255,255,255,.18);background:rgba(255,255,255,.06);color:#fff;font-weight:900;border-radius:999px;padding:10px 14px;cursor:pointer;text-decoration:none;}
-  .btn.primary{background:linear-gradient(180deg,#ff4a44,#e3342f);border-color:rgba(0,0,0,.25);}
-  .muted{color:rgba(255,255,255,.75);}
-</style>
-</head>
-<body>
-<div class="wrap">
-  <div class="card">
-    <div class="row" style="justify-content:space-between;">
-      <div>
-        <div style="font-weight:1000;font-size:22px;">Admin</div>
-        <div class="muted">Signed in as <strong>${escapeHtml(email)}</strong></div>
-      </div>
-      <div class="row">
-        <a class="btn" href="/admin/tracking-control">Tracking Control</a>
-        <a class="btn" href="${escapeHtml(PUBLIC_SITE_URL)}/">Back to site</a>
-        <a class="btn" href="/logout?returnTo=${encodeURIComponent(PUBLIC_SITE_URL + "/")}">Log out</a>
-      </div>
-    </div>
-    <div style="margin-top:12px;" class="muted">
-      This is a lightweight admin landing. Your full Admin Command Center can be re-added here if you want it as the default admin page.
-    </div>
-  </div>
-</div>
-</body>
-</html>`);
-});
+app.get("/api/admin/routific/export-csv", requireLogin, requireAdmin, async (req, res) => {
+  try {
+    const runKey = String(req.query.runKey || "").trim();
+    if (!runKey) return res.status(400).send("Missing runKey");
 
+    const orders = await Order.find({
+      runKey,
+      "status.state": { $in: Array.from(ACTIVE_STATES) },
+    }).sort({ createdAt: 1 }).lean();
+
+    const header = ["order_id","name","address","phone","email","notes","duration_seconds"];
+    const rows = orders.map(o => {
+      const name = o.customer?.fullName || "";
+      const phone = o.customer?.phone || "";
+      const email = o.customer?.email || "";
+      const address =
+        \`\${o.address?.streetAddress || ""}\${o.address?.unit ? (" " + o.address.unit) : ""}, \` +
+        \`\${o.address?.town || ""}, ON, \${o.address?.postalCode || ""}, Canada\`
+          .replace(/\\s+/g, " ")
+          .trim();
+
+      const notes = [
+        \`TGR \${o.orderId}\`,
+        \`Zone \${o.address?.zone || ""}\`,
+        o.preferences?.dropoffPref ? \`Drop-off: \${o.preferences.dropoffPref}\` : "",
+        o.preferences?.subsPref ? \`Subs: \${o.preferences.subsPref}\` : "",
+        o.stores?.primary ? \`Store: \${o.stores.primary}\` : "",
+        (o.stores?.extra || []).length ? \`Extra: \${(o.stores.extra || []).join(", ")}\` : "",
+      ].filter(Boolean).join(" | ");
+
+      const duration = 360;
+      return [o.orderId, name, address, phone, email, notes, String(duration)].map(csvEscape).join(",");
+    });
+
+    const csv = header.join(",") + "\\n" + rows.join("\\n") + "\\n";
+    const filename = \`routific_\${runKey}_deliveries.csv\`;
+
+    res.setHeader("Content-Type", "text/csv; charset=utf-8");
+    res.setHeader("Content-Disposition", \`attachment; filename="\${filename}"\`);
+    res.send(csv);
+  } catch (e) {
+    res.status(500).send(String(e));
+  }
+});
 // =========================
 // ADMIN: Tracking Control mini-page (NEW)
 // =========================
