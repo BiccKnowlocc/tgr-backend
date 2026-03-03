@@ -1,6 +1,5 @@
 // ======= server.js (FULL FILE) — TGR backend =======
 // Implements: Google OAuth, required profile onboarding, runs (biweekly), estimator, orders, cancel tokens
-// + FULL admin UI and admin endpoints (search/status/cancel/delete/export)
 // + MEMBER PORTAL (/member) + order list + cancel button (before cutoff) + LIVE MAP (active orders only)
 //
 // AddressComplete reliability:
@@ -9,17 +8,11 @@
 //   GET /vendor/addresscomplete.css
 //   GET /api/public/addresscomplete
 //
-// ADDED (ONLY what’s necessary for auto membership activation):
-// - Square webhook endpoint: POST /webhooks/square
-// - Signature verification using raw body
-// - Membership activation by buyer_email_address + amount_money.amount (cents)
-// - Updates User: membershipLevel, membershipStatus, renewalDate
+// Square membership auto-activation:
+// - POST /webhooks/square (signature verified) updates membership fields by buyer email + amount
 //
-// RESTORED / ADDED (member tools):
-// - GET /member  (member portal HTML)
-// - GET /api/member/orders
-// - POST /api/member/cancel-membership
-// - GET /api/member/tracking-token?orderId=...
+// CHANGE (requested):
+// - Store cancel token on Order at creation, so Member Portal can cancel before cutoff.
 
 const express = require("express");
 const mongoose = require("mongoose");
@@ -379,6 +372,12 @@ const OrderSchema = new mongoose.Schema(
 
     consents: { terms: Boolean, accuracy: Boolean, dropoff: Boolean },
 
+    // NEW: persisted cancel token
+    cancel: {
+      token: { type: String, default: "" },
+      untilMs: { type: Number, default: 0 },
+    },
+
     pricingSnapshot: {
       serviceFee: Number,
       zoneFee: Number,
@@ -462,14 +461,6 @@ function escapeHtml(s) {
     .replaceAll("'", "&#039;");
 }
 
-function csvEscape(val) {
-  const s = String(val ?? "");
-  if (s.includes('"') || s.includes(",") || s.includes("\n") || s.includes("\r")) {
-    return `"${s.replaceAll('"', '""')}"`;
-  }
-  return s;
-}
-
 function nowTz() {
   return dayjs().tz(TZ);
 }
@@ -533,6 +524,81 @@ function requireBasicAuth(user, pass) {
       res.status(403).send("Forbidden");
     }
   };
+}
+
+// ===== Cancel token helpers =====
+function base64urlEncode(buf) {
+  return Buffer.from(buf).toString("base64").replaceAll("+", "-").replaceAll("/", "_").replaceAll("=", "");
+}
+function base64urlDecodeToString(b64url) {
+  const pad = b64url.length % 4 ? "=".repeat(4 - (b64url.length % 4)) : "";
+  const b64 = b64url.replaceAll("-", "+").replaceAll("_", "/") + pad;
+  return Buffer.from(b64, "base64").toString("utf8");
+}
+function signCancelToken(orderId, expMs) {
+  const payload = `${orderId}.${String(expMs)}`;
+  const sig = crypto.createHmac("sha256", CANCEL_TOKEN_SECRET).update(payload).digest();
+  return `${base64urlEncode(payload)}.${base64urlEncode(sig)}`;
+}
+function verifyCancelToken(orderId, token) {
+  try {
+    const parts = String(token || "").trim().split(".");
+    if (parts.length !== 2) return { ok: false };
+    const payloadStr = base64urlDecodeToString(parts[0]);
+    const sigB64 = parts[1];
+    const [oid, expStr] = payloadStr.split(".");
+    const expMs = Number(expStr);
+    if (oid !== orderId || !Number.isFinite(expMs)) return { ok: false };
+
+    const expectedSig = crypto.createHmac("sha256", CANCEL_TOKEN_SECRET).update(payloadStr).digest();
+    const expectedB64 = base64urlEncode(expectedSig);
+
+    const a = Buffer.from(sigB64);
+    const b = Buffer.from(expectedB64);
+    if (a.length !== b.length) return { ok: false };
+    if (!crypto.timingSafeEqual(a, b)) return { ok: false };
+    return { ok: true, expMs };
+  } catch {
+    return { ok: false };
+  }
+}
+
+// ===== Tracking token helpers (orderId + runKey) =====
+function signTrackingToken(orderId, runKey, expMs) {
+  const payload = `${orderId}.${runKey}.${String(expMs)}`;
+  const sig = crypto.createHmac("sha256", TRACKING_TOKEN_SECRET).update(payload).digest();
+  return `${base64urlEncode(payload)}.${base64urlEncode(sig)}`;
+}
+function verifyTrackingToken(token) {
+  try {
+    const parts = String(token || "").trim().split(".");
+    if (parts.length !== 2) return { ok: false };
+    const payloadStr = base64urlDecodeToString(parts[0]);
+    const sigB64 = parts[1];
+
+    const segs = payloadStr.split(".");
+    if (segs.length < 3) return { ok: false };
+    const orderId = segs[0];
+    const expStr = segs[segs.length - 1];
+    const runKey = segs.slice(1, -1).join(".");
+
+    const expMs = Number(expStr);
+    if (!orderId || !runKey || !Number.isFinite(expMs)) return { ok: false };
+
+    const expectedSig = crypto.createHmac("sha256", TRACKING_TOKEN_SECRET).update(payloadStr).digest();
+    const expectedB64 = base64urlEncode(expectedSig);
+
+    const a = Buffer.from(sigB64);
+    const b = Buffer.from(expectedB64);
+    if (a.length !== b.length) return { ok: false };
+    if (!crypto.timingSafeEqual(a, b)) return { ok: false };
+
+    if (Date.now() > expMs) return { ok: false, error: "expired" };
+
+    return { ok: true, orderId, runKey, expMs };
+  } catch {
+    return { ok: false };
+  }
 }
 
 // =========================
@@ -687,12 +753,10 @@ function meetsMinimums(run) {
 async function getOrCreateNextRun(type) {
   const now = nowTz();
 
-  // Prefer an existing run that has NOT passed cutoff yet
   let existing = await Run.findOne({ type, cutoffAt: { $gt: now.toDate() } })
     .sort({ opensAt: 1 })
     .lean();
 
-  // If found but opensAt is still in the future, force it open now (avoid dead windows)
   if (existing) {
     const opensAt = dayjs(existing.opensAt).tz(TZ);
     const cutoffAt = dayjs(existing.cutoffAt).tz(TZ);
@@ -705,7 +769,6 @@ async function getOrCreateNextRun(type) {
     return existing;
   }
 
-  // No upcoming run in DB: create one.
   const latest = await Run.findOne({ type }).sort({ opensAt: -1 }).lean();
 
   let delivery;
@@ -718,7 +781,6 @@ async function getOrCreateNextRun(type) {
 
   let { cutoff, opens } = computeTimesForDelivery(delivery, type);
 
-  // KEY FIX: if computed opens is still in the future, open immediately.
   if (opens.isAfter(now)) {
     opens = now.subtract(1, "minute");
   }
@@ -878,87 +940,6 @@ function isAdminEmail(email) {
   return ADMIN_EMAILS.includes(e);
 }
 
-function requireAdmin(req, res, next) {
-  const email = String(req.user?.email || "").toLowerCase().trim();
-  if (!email || !isAdminEmail(email)) return res.status(403).send("Admin access required.");
-  next();
-}
-
-// ===== Cancel token helpers =====
-function base64urlEncode(buf) {
-  return Buffer.from(buf).toString("base64").replaceAll("+", "-").replaceAll("/", "_").replaceAll("=", "");
-}
-function base64urlDecodeToString(b64url) {
-  const pad = b64url.length % 4 ? "=".repeat(4 - (b64url.length % 4)) : "";
-  const b64 = b64url.replaceAll("-", "+").replaceAll("_", "/") + pad;
-  return Buffer.from(b64, "base64").toString("utf8");
-}
-function signCancelToken(orderId, expMs) {
-  const payload = `${orderId}.${String(expMs)}`;
-  const sig = crypto.createHmac("sha256", CANCEL_TOKEN_SECRET).update(payload).digest();
-  return `${base64urlEncode(payload)}.${base64urlEncode(sig)}`;
-}
-function verifyCancelToken(orderId, token) {
-  try {
-    const parts = String(token || "").trim().split(".");
-    if (parts.length !== 2) return { ok: false };
-    const payloadStr = base64urlDecodeToString(parts[0]);
-    const sigB64 = parts[1];
-    const [oid, expStr] = payloadStr.split(".");
-    const expMs = Number(expStr);
-    if (oid !== orderId || !Number.isFinite(expMs)) return { ok: false };
-
-    const expectedSig = crypto.createHmac("sha256", CANCEL_TOKEN_SECRET).update(payloadStr).digest();
-    const expectedB64 = base64urlEncode(expectedSig);
-
-    const a = Buffer.from(sigB64);
-    const b = Buffer.from(expectedB64);
-    if (a.length !== b.length) return { ok: false };
-    if (!crypto.timingSafeEqual(a, b)) return { ok: false };
-    return { ok: true, expMs };
-  } catch {
-    return { ok: false };
-  }
-}
-
-// ===== Tracking token helpers (orderId + runKey) =====
-function signTrackingToken(orderId, runKey, expMs) {
-  const payload = `${orderId}.${runKey}.${String(expMs)}`;
-  const sig = crypto.createHmac("sha256", TRACKING_TOKEN_SECRET).update(payload).digest();
-  return `${base64urlEncode(payload)}.${base64urlEncode(sig)}`;
-}
-function verifyTrackingToken(token) {
-  try {
-    const parts = String(token || "").trim().split(".");
-    if (parts.length !== 2) return { ok: false };
-    const payloadStr = base64urlDecodeToString(parts[0]);
-    const sigB64 = parts[1];
-
-    const segs = payloadStr.split(".");
-    if (segs.length < 3) return { ok: false };
-    const orderId = segs[0];
-    const expStr = segs[segs.length - 1];
-    const runKey = segs.slice(1, -1).join(".");
-
-    const expMs = Number(expStr);
-    if (!orderId || !runKey || !Number.isFinite(expMs)) return { ok: false };
-
-    const expectedSig = crypto.createHmac("sha256", TRACKING_TOKEN_SECRET).update(payloadStr).digest();
-    const expectedB64 = base64urlEncode(expectedSig);
-
-    const a = Buffer.from(sigB64);
-    const b = Buffer.from(expectedB64);
-    if (a.length !== b.length) return { ok: false };
-    if (!crypto.timingSafeEqual(a, b)) return { ok: false };
-
-    if (Date.now() > expMs) return { ok: false, error: "expired" };
-
-    return { ok: true, orderId, runKey, expMs };
-  } catch {
-    return { ok: false };
-  }
-}
-
 // =========================
 // Postmark webhook endpoint (secured)
 // =========================
@@ -1101,77 +1082,6 @@ app.get("/api/me", (req, res) => {
     profileComplete: isProfileComplete(u?.profile || {}),
     isAdmin: !!u?.email && isAdminEmail(u.email),
   });
-});
-
-app.get("/api/profile", requireLogin, async (req, res) => {
-  const u = await User.findById(req.user._id).lean();
-  res.json({
-    ok: true,
-    profile: u?.profile || {},
-    profileComplete: isProfileComplete(u?.profile || {}),
-    email: u?.email || "",
-    name: u?.name || "",
-    photo: u?.photo || "",
-  });
-});
-
-app.post("/api/profile", requireLogin, async (req, res) => {
-  try {
-    const b = req.body || {};
-    const u = await User.findById(req.user._id);
-    if (!u) return res.status(404).json({ ok: false, error: "User not found" });
-
-    const addresses = Array.isArray(b.addresses) ? b.addresses : [];
-
-    const newProfile = {
-      version: 1,
-      fullName: String(b.fullName || "").trim(),
-      preferredName: String(b.preferredName || "").trim(),
-      phone: String(b.phone || "").trim(),
-      altPhone: String(b.altPhone || "").trim(),
-      contactPref: String(b.contactPref || "").trim(),
-      contactAuth: yn(b.contactAuth),
-
-      subsDefault: String(b.subsDefault || "").trim(),
-      dropoffDefault: String(b.dropoffDefault || "").trim(),
-
-      customerType: String(b.customerType || "").trim(),
-      accessibility: String(b.accessibility || "").trim(),
-      dietary: String(b.dietary || "").trim(),
-      notes: String(b.notes || "").trim(),
-
-      addresses: addresses.map((a) => ({
-        id: String(a.id || "").trim() || String(Math.random()).slice(2),
-        label: String(a.label || "").trim(),
-        town: String(a.town || "").trim(),
-        zone: String(a.zone || "").trim(),
-        streetAddress: String(a.streetAddress || "").trim(),
-        unit: String(a.unit || "").trim(),
-        postalCode: String(a.postalCode || "").trim(),
-        instructions: String(a.instructions || "").trim(),
-        gateCode: String(a.gateCode || "").trim(),
-      })),
-
-      defaultId: String(b.defaultId || "").trim(),
-
-      consentTerms: yn(b.consentTerms),
-      consentPrivacy: yn(b.consentPrivacy),
-      consentMarketing: yn(b.consentMarketing),
-    };
-
-    if (!newProfile.defaultId && newProfile.addresses.length) newProfile.defaultId = newProfile.addresses[0].id;
-
-    newProfile.complete = isProfileComplete(newProfile);
-    newProfile.completedAt = newProfile.complete ? new Date().toISOString() : null;
-
-    u.profile = newProfile;
-    u.markModified("profile");
-    await u.save();
-
-    res.json({ ok: true, profileComplete: newProfile.complete === true, profile: newProfile });
-  } catch (e) {
-    res.status(500).json({ ok: false, error: String(e) });
-  }
 });
 
 // =========================
@@ -1322,6 +1232,11 @@ app.post("/api/orders", requireLogin, requireProfileComplete, upload.single("gro
 
     if (!runUpdate) return res.status(409).json({ ok: false, error: "This run is full." });
 
+    // NEW: store cancel token
+    const cancelUntilMs = cutoffAt.toDate().getTime();
+    const cancelToken = signCancelToken(orderId, cancelUntilMs);
+    const cancelUntilLocal = fmtLocal(cutoffAt.toDate());
+
     await Order.create({
       orderId,
       runKey: run.runKey,
@@ -1332,28 +1247,14 @@ app.post("/api/orders", requireLogin, requireProfileComplete, upload.single("gro
       preferences: { dropoffPref, subsPref, contactPref, contactAuth: true },
       list: { groceryListText: groceryList, attachment },
       consents: { terms: true, accuracy: true, dropoff: true },
+
+      cancel: { token: cancelToken, untilMs: cancelUntilMs },
+
       pricingSnapshot,
       payments: { fees: { status: "unpaid" }, groceries: { status: "unpaid" } },
       status: { state: "submitted", note: "", updatedAt: new Date(), updatedBy: "customer" },
       statusHistory: [{ state: "submitted", note: "", at: new Date(), by: "customer" }],
     });
-
-    const cancelUntilMs = cutoffAt.toDate().getTime();
-    const cancelToken = signCancelToken(orderId, cancelUntilMs);
-    const cancelUntilLocal = fmtLocal(cutoffAt.toDate());
-
-    // optional: basic order confirmation email
-    pmSend(
-      String(user.email || "").trim().toLowerCase(),
-      `TGR Order Submitted: ${orderId}`,
-      `<div style="font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;line-height:1.45;">
-        <h2 style="margin:0 0 10px;">Order submitted ✅</h2>
-        <p style="margin:0 0 10px;">Your order ID is <strong>${escapeHtml(orderId)}</strong>.</p>
-        <p style="margin:0 0 10px;">You can view status in your Member Portal.</p>
-        <p style="margin:0;"><a href="${escapeHtml(memberPortalUrl())}">Open Member Portal</a></p>
-      </div>`,
-      `Order submitted: ${orderId}\nPortal: ${memberPortalUrl()}`
-    );
 
     res.json({ ok: true, orderId, runKey: run.runKey, cancelToken, cancelUntilLocal });
   } catch (e) {
@@ -1457,7 +1358,7 @@ app.get("/api/public/tracking/:runKey", async (req, res) => {
 });
 
 // =========================
-// MEMBER APIs
+// MEMBER APIs + MEMBER PORTAL
 // =========================
 app.get("/api/member/orders", requireLogin, async (req, res) => {
   try {
@@ -1467,7 +1368,6 @@ app.get("/api/member/orders", requireLogin, async (req, res) => {
       .limit(60)
       .lean();
 
-    // Include cutoff info for each runKey so the portal can decide cancellation + tracking
     const runKeys = Array.from(new Set(items.map(o => o.runKey).filter(Boolean)));
     const runs = await Run.find({ runKey: { $in: runKeys } }).lean();
     const runByKey = new Map(runs.map(r => [r.runKey, r]));
@@ -1493,26 +1393,6 @@ app.get("/api/member/orders", requireLogin, async (req, res) => {
   }
 });
 
-app.post("/api/member/cancel-membership", requireLogin, async (req, res) => {
-  try {
-    const u = await User.findById(req.user._id);
-    if (!u) return res.status(404).json({ ok: false, error: "User not found" });
-
-    // NOTE: This cancels membership status inside TGR only.
-    // Payment-link billing (if any) must be canceled in Square by the customer/admin.
-    u.membershipLevel = "none";
-    u.membershipStatus = "inactive";
-    u.renewalDate = null;
-    await u.save();
-
-    res.json({ ok: true });
-  } catch (e) {
-    res.status(500).json({ ok: false, error: String(e) });
-  }
-});
-
-// Mint a tracking token for an order (member-only).
-// The live fix still requires Tracking.enabled=true and driver pings stored in Tracking doc.
 app.get("/api/member/tracking-token", requireLogin, async (req, res) => {
   try {
     const orderId = String(req.query.orderId || "").trim().toUpperCase();
@@ -1528,7 +1408,7 @@ app.get("/api/member/tracking-token", requireLogin, async (req, res) => {
     }
 
     const runKey = order.runKey;
-    const expMs = Date.now() + 1000 * 60 * 60 * 24; // 24h token
+    const expMs = Date.now() + 1000 * 60 * 60 * 24;
     const token = signTrackingToken(orderId, runKey, expMs);
 
     res.json({ ok: true, orderId, runKey, token, mapboxPublicToken: MAPBOX_PUBLIC_TOKEN || "" });
@@ -1537,9 +1417,6 @@ app.get("/api/member/tracking-token", requireLogin, async (req, res) => {
   }
 });
 
-// =========================
-// MEMBER PORTAL (FULL PAGE)
-// =========================
 app.get("/member", requireLogin, async (req, res) => {
   try {
     const u = await User.findById(req.user._id).lean();
@@ -1587,11 +1464,6 @@ app.get("/member", requireLogin, async (req, res) => {
   .toast.show{display:block;}
   .hr{height:1px;background:rgba(255,255,255,.12);margin:12px 0;}
   #map{height:380px;border-radius:12px;border:1px solid rgba(255,255,255,.12);overflow:hidden;}
-  .kpi{display:flex;gap:10px;flex-wrap:wrap;}
-  .kpi .box{border:1px solid rgba(255,255,255,.14);background:rgba(0,0,0,.22);border-radius:12px;padding:10px 12px;}
-  .kpi .label{font-size:12px;color:rgba(255,255,255,.72);text-transform:uppercase;letter-spacing:.08em;}
-  .kpi .value{font-weight:1000;font-size:18px;margin-top:4px;}
-  .small{font-size:12px;}
 </style>
 </head>
 <body>
@@ -1613,34 +1485,6 @@ app.get("/member", requireLogin, async (req, res) => {
     <div class="toast" id="toast"></div>
     <div class="hr"></div>
 
-    <div class="kpi">
-      <div class="box">
-        <div class="label">Membership</div>
-        <div class="value" id="mLevel">—</div>
-        <div class="muted small" id="mMeta">—</div>
-      </div>
-      <div class="box">
-        <div class="label">Renewal</div>
-        <div class="value" id="mRenew">—</div>
-        <div class="muted small">Auto-updated from Square payments when email matches.</div>
-      </div>
-      <div class="box">
-        <div class="label">Actions</div>
-        <div class="row" style="margin-top:6px;">
-          <a class="btn" id="buyStandard" target="_blank" rel="noopener">Buy Standard</a>
-          <a class="btn" id="buyRoute" target="_blank" rel="noopener">Buy Route</a>
-          <a class="btn" id="buyAccess" target="_blank" rel="noopener">Buy Access</a>
-          <a class="btn" id="buyAccessPro" target="_blank" rel="noopener">Buy Access Pro</a>
-          <button class="btn ghost" id="cancelMembershipBtn" type="button">Cancel membership (in portal)</button>
-        </div>
-        <div class="muted small" style="margin-top:8px;">
-          Note: Payment-link subscriptions (if any) must be canceled in Square separately.
-        </div>
-      </div>
-    </div>
-
-    <div class="hr"></div>
-
     <div style="font-weight:1000;font-size:18px;">Live Tracking</div>
     <div class="muted">Tracking appears when your order is active and the run’s tracking is enabled.</div>
     <div class="row" style="margin-top:10px;">
@@ -1648,7 +1492,7 @@ app.get("/member", requireLogin, async (req, res) => {
         <option value="">Select an active order…</option>
       </select>
       <button class="btn primary" id="startTrackBtn" type="button">Load Map</button>
-      <span class="muted small" id="trackHint"></span>
+      <span class="muted" id="trackHint" style="font-size:12px;"></span>
     </div>
     <div style="margin-top:12px;">
       <div id="map"></div>
@@ -1657,7 +1501,7 @@ app.get("/member", requireLogin, async (req, res) => {
     <div class="hr"></div>
 
     <div style="font-weight:1000;font-size:18px;">Order History</div>
-    <div class="muted">Shows up to your most recent 60 orders.</div>
+    <div class="muted">Cancel is available before cutoff for active orders.</div>
 
     <div style="overflow:auto;margin-top:10px;">
       <table>
@@ -1688,54 +1532,6 @@ app.get("/member", requireLogin, async (req, res) => {
     setTimeout(()=>el.classList.remove("show"), 3500);
   };
 
-  const LINKS = {
-    standard: "${escapeHtml(SQUARE_LINK_STANDARD)}",
-    route: "${escapeHtml(SQUARE_LINK_ROUTE)}",
-    access: "${escapeHtml(SQUARE_LINK_ACCESS)}",
-    accesspro: "${escapeHtml(SQUARE_LINK_ACCESSPRO)}"
-  };
-
-  document.getElementById("buyStandard").href = LINKS.standard;
-  document.getElementById("buyRoute").href = LINKS.route;
-  document.getElementById("buyAccess").href = LINKS.access;
-  document.getElementById("buyAccessPro").href = LINKS.accesspro;
-
-  async function loadMe(){
-    const r = await fetch("/api/me", { credentials:"include" });
-    const d = await r.json().catch(()=>({}));
-    if(!r.ok || d.ok===false) throw new Error(d.error || "Me failed");
-
-    document.getElementById("mLevel").textContent = (d.membershipLevel || "none").toUpperCase();
-    document.getElementById("mMeta").textContent = "Status: " + (d.membershipStatus || "inactive");
-    document.getElementById("mRenew").textContent = d.renewalDate ? String(d.renewalDate) : "—";
-  }
-
-  function fmtMoney(n){
-    const x = Number(n || 0);
-    return "$" + x.toFixed(2);
-  }
-
-  function fmtDate(d){
-    try{ return new Date(d).toLocaleString(); } catch { return ""; }
-  }
-
-  async function cancelMembership(){
-    const ok = confirm("Cancel membership in portal? (Square billing is separate for payment links.)");
-    if(!ok) return;
-    const r = await fetch("/api/member/cancel-membership", {
-      method:"POST",
-      headers:{ "Content-Type":"application/json" },
-      credentials:"include",
-      body: JSON.stringify({})
-    });
-    const d = await r.json().catch(()=>({}));
-    if(!r.ok || d.ok===false) return toast(d.error || "Cancel failed");
-    toast("Membership cancelled in portal.");
-    loadMe().catch(()=>{});
-  }
-
-  document.getElementById("cancelMembershipBtn").addEventListener("click", cancelMembership);
-
   async function cancelOrder(orderId, token){
     const ok = confirm("Cancel " + orderId + " before cutoff?");
     if(!ok) return;
@@ -1750,6 +1546,14 @@ app.get("/member", requireLogin, async (req, res) => {
     if(!r.ok || d.ok===false) return toast(d.error || "Cancel failed");
     toast("Cancelled " + orderId);
     await loadOrders();
+  }
+
+  function fmtMoney(n){
+    const x = Number(n || 0);
+    return "$" + x.toFixed(2);
+  }
+  function fmtDate(d){
+    try{ return new Date(d).toLocaleString(); } catch { return ""; }
   }
 
   let runsByKey = {};
@@ -1767,7 +1571,6 @@ app.get("/member", requireLogin, async (req, res) => {
     runsByKey = d.runs || {};
     const items = d.items || [];
 
-    // Active orders for tracking
     const ACTIVE = new Set(["submitted","confirmed","shopping","packed","out_for_delivery"]);
     activeOrders = items.filter(o => ACTIVE.has(o.status?.state || "submitted"));
 
@@ -1794,29 +1597,36 @@ app.get("/member", requireLogin, async (req, res) => {
       const fees = (o.pricingSnapshot && typeof o.pricingSnapshot.totalFees === "number") ? o.pricingSnapshot.totalFees : 0;
       const status = o.status?.state || "submitted";
 
-      let cancelHtml = '<span class="muted">Not available</span>';
-      if (ACTIVE.has(status) && cancelOpen){
-        // token created server-side? Your /api/orders returns cancelToken at submit time,
-        // but portal can’t know it. We keep "not available" unless you store token.
-        // Instead: show "Past cutoff" or "Use confirmation link".
-        cancelHtml = '<span class="muted">Use your order confirmation cancel link</span>';
+      let cancelCell = '<span class="muted">Not available</span>';
+
+      const storedToken = (o.cancel && o.cancel.token) ? String(o.cancel.token) : "";
+      if (ACTIVE.has(status) && cancelOpen && storedToken){
+        cancelCell = '<button class="btn" data-cancel="' + o.orderId + '" data-token="' + storedToken + '">Cancel</button>';
+      } else if (ACTIVE.has(status) && cancelOpen && !storedToken){
+        cancelCell = '<span class="muted">Token missing</span>';
       } else if (status === "cancelled") {
-        cancelHtml = '<span class="pill">Cancelled</span>';
+        cancelCell = '<span class="pill">Cancelled</span>';
       } else if (!cancelOpen && ACTIVE.has(status)) {
-        cancelHtml = '<span class="muted">Past cutoff</span>';
+        cancelCell = '<span class="muted">Past cutoff</span>';
       }
 
       const tr = document.createElement("tr");
       tr.innerHTML = \`
-        <td><div style="font-weight:1000;">\${o.orderId}</div><div class="muted small">\${fmtDate(o.createdAt)}</div></td>
+        <td><div style="font-weight:1000;">\${o.orderId}</div><div class="muted" style="font-size:12px;">\${fmtDate(o.createdAt)}</div></td>
         <td><div style="font-weight:900;">\${(o.address?.town||"")} (Zone \${(o.address?.zone||"")})</div>
-            <div class="muted small">\${(o.address?.streetAddress||"")} • \${(o.address?.postalCode||"")}</div></td>
-        <td><span class="pill">\${(o.runType||"")}</span><div class="muted small">\${(o.runKey||"")}</div></td>
-        <td><span class="pill">\${status}</span><div class="muted small">\${(o.status?.note||"")}</div></td>
+            <div class="muted" style="font-size:12px;">\${(o.address?.streetAddress||"")} • \${(o.address?.postalCode||"")}</div></td>
+        <td><span class="pill">\${(o.runType||"")}</span><div class="muted" style="font-size:12px;">\${(o.runKey||"")}</div></td>
+        <td><span class="pill">\${status}</span><div class="muted" style="font-size:12px;">\${(o.status?.note||"")}</div></td>
         <td>\${fmtMoney(fees)}</td>
-        <td>\${cancelHtml}</td>
+        <td>\${cancelCell}</td>
       \`;
       tbody.appendChild(tr);
+    });
+
+    tbody.querySelectorAll("[data-cancel]").forEach(btn=>{
+      btn.addEventListener("click", ()=>{
+        cancelOrder(btn.getAttribute("data-cancel"), btn.getAttribute("data-token"));
+      });
     });
 
     if (!items.length){
@@ -1824,13 +1634,11 @@ app.get("/member", requireLogin, async (req, res) => {
     }
   }
 
-  async function initMapIfNeeded(token){
-    // fetch mapbox token from server
+  async function initMapIfNeeded(){
     const r = await fetch("/api/public/config", { credentials:"include" });
     const d = await r.json().catch(()=>({}));
     const mb = d.mapboxPublicToken || "";
     if(!mb) { toast("Mapbox token missing on server."); return null; }
-
     mapboxgl.accessToken = mb;
 
     if (!map){
@@ -1865,7 +1673,7 @@ app.get("/member", requireLogin, async (req, res) => {
       return;
     }
 
-    document.getElementById("trackHint").textContent = "Live tracking active • last update: " + fmtDate(d.last.at);
+    document.getElementById("trackHint").textContent = "Live tracking • last update: " + fmtDate(d.last.at);
 
     const lng = Number(d.last.lng);
     const lat = Number(d.last.lat);
@@ -1899,11 +1707,7 @@ app.get("/member", requireLogin, async (req, res) => {
 
   document.getElementById("startTrackBtn").addEventListener("click", startTracking);
 
-  // Boot
-  Promise.resolve()
-    .then(loadMe)
-    .then(loadOrders)
-    .catch(e=>toast(String(e.message||e)));
+  loadOrders().catch(e=>toast(String(e.message||e)));
 </script>
 
 </body>
