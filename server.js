@@ -316,7 +316,14 @@ const OrderSchema = new mongoose.Schema(
       default: {},
     },
 
-    customer: { fullName: String, email: String, phone: String },
+    // UPDATED: dedicated customer fields
+    customer: {
+      fullName: String,
+      email: String,
+      phone: String,
+      altPhone: { type: String, default: "" },
+      dob: { type: String, default: "" }, // YYYY-MM-DD
+    },
 
     address: {
       town: String,
@@ -333,6 +340,57 @@ const OrderSchema = new mongoose.Schema(
       subsPref: String,
       contactPref: String,
       contactAuth: Boolean,
+    },
+
+    // NEW: dedicated add-ons
+    addOns: {
+      prescription: {
+        requested: { type: Boolean, default: false },
+        pharmacyName: { type: String, default: "" },
+        notes: { type: String, default: "" },
+      },
+      liquor: {
+        requested: { type: Boolean, default: false },
+        storeName: { type: String, default: "" },
+        notes: { type: String, default: "" },
+        idRequired: { type: Boolean, default: true },
+      },
+      printing: {
+        requested: { type: Boolean, default: false },
+        pages: { type: Number, default: 0 },
+        notes: { type: String, default: "" },
+      },
+      fastFood: {
+        requested: { type: Boolean, default: false },
+        restaurant: { type: String, default: "" },
+        orderDetails: { type: String, default: "" },
+      },
+      parcel: {
+        requested: { type: Boolean, default: false },
+        carrier: { type: String, default: "" },
+        details: { type: String, default: "" },
+      },
+      bulky: {
+        requested: { type: Boolean, default: false },
+        details: { type: String, default: "" },
+      },
+      ride: {
+        requested: { type: Boolean, default: false },
+        pickupAddress: { type: String, default: "" },
+        preferredWindow: { type: String, default: "" },
+        notes: { type: String, default: "" },
+      },
+      generalNotes: { type: String, default: "" },
+    },
+
+    // NEW: dedicated delivery meta (fills the left-side UX block)
+    deliveryMeta: {
+      gateCode: { type: String, default: "" },
+      buildingAccessNotes: { type: String, default: "" },
+      parkingNotes: { type: String, default: "" },
+      budgetCap: { type: Number, default: 0 },
+      receiptPreference: { type: String, default: "" },
+      photoProofOk: { type: Boolean, default: false },
     },
 
     list: {
@@ -1114,6 +1172,47 @@ app.post("/api/orders", requireLogin, requireProfileComplete, upload.single("gro
       return res.status(400).json({ ok: false, error: "All required consents must be accepted." });
     }
 
+    // ---- NEW: Dedicated fields for the new Order page (optional; backward compatible) ----
+    const dob = String(b.dob || "").trim(); // YYYY-MM-DD
+    const altPhone = String(b.altPhone || "").trim();
+
+    const addPrescription = yn(b.addon_prescription);
+    const addLiquor = yn(b.addon_liquor);
+    const addPrinting = yn(b.addon_printing);
+    const addFastFood = yn(b.addon_fastfood);
+    const addParcel = yn(b.addon_parcel);
+    const addBulky = yn(b.addon_bulky);
+    const addRide = yn(b.addon_ride);
+
+    const prescriptionPharmacy = String(b.prescriptionPharmacy || "").trim();
+    const prescriptionNotes = String(b.prescriptionNotes || "").trim();
+
+    const liquorStore = String(b.liquorStore || "").trim();
+    const liquorNotes = String(b.liquorNotes || "").trim();
+
+    const printingNotes = String(b.printingNotes || "").trim();
+
+    const fastFoodRestaurant = String(b.fastFoodRestaurant || "").trim();
+    const fastFoodOrder = String(b.fastFoodOrder || "").trim();
+
+    const parcelCarrier = String(b.parcelCarrier || "").trim();
+    const parcelDetails = String(b.parcelDetails || "").trim();
+
+    const bulkyDetails = String(b.bulkyDetails || "").trim();
+
+    const ridePickup = String(b.ridePickup || "").trim();
+    const rideWindow = String(b.rideWindow || "").trim();
+    const rideNotes = String(b.rideNotes || "").trim();
+
+    const generalNotes = String(b.optionalNotes || "").trim();
+
+    const gateCode = String(b.gateCode || "").trim();
+    const buildingAccessNotes = String(b.buildingAccessNotes || "").trim();
+    const parkingNotes = String(b.parkingNotes || "").trim();
+    const budgetCap = Math.max(0, Number(b.budgetCap || 0));
+    const receiptPreference = String(b.receiptPreference || "").trim();
+    const photoProofOk = yn(b.photoProofOk);
+
     const runs = await ensureUpcomingRuns();
     const runType = String(b.runType || "");
     const run = runs[runType];
@@ -1199,12 +1298,52 @@ app.post("/api/orders", requireLogin, requireProfileComplete, upload.single("gro
       orderId,
       runKey: run.runKey,
       runType,
+
       hold: false,
-      flags: {},
-      customer: { fullName, email: String(user.email || "").trim().toLowerCase(), phone },
+
+      // UPDATED: populate flags from dedicated add-ons (keeps your admin filters useful)
+      flags: {
+        prescription: addPrescription,
+        alcohol: addLiquor,
+        bulky: addBulky,
+        idRequired: addLiquor,
+      },
+
+      // UPDATED: dedicated customer fields
+      customer: {
+        fullName,
+        email: String(user.email || "").trim().toLowerCase(),
+        phone,
+        altPhone,
+        dob,
+      },
+
       address: { town, streetAddress, unit, postalCode, zone },
       stores: { primary: primaryStore, extra: extraStores },
       preferences: { dropoffPref, subsPref, contactPref, contactAuth: true },
+
+      // NEW: dedicated add-ons
+      addOns: {
+        prescription: { requested: addPrescription, pharmacyName: prescriptionPharmacy, notes: prescriptionNotes },
+        liquor: { requested: addLiquor, storeName: liquorStore, notes: liquorNotes, idRequired: true },
+        printing: { requested: addPrinting, pages: Math.max(0, Number(b.printPages || 0)), notes: printingNotes },
+        fastFood: { requested: addFastFood, restaurant: fastFoodRestaurant, orderDetails: fastFoodOrder },
+        parcel: { requested: addParcel, carrier: parcelCarrier, details: parcelDetails },
+        bulky: { requested: addBulky, details: bulkyDetails },
+        ride: { requested: addRide, pickupAddress: ridePickup, preferredWindow: rideWindow, notes: rideNotes },
+        generalNotes,
+      },
+
+      // NEW: delivery meta
+      deliveryMeta: {
+        gateCode,
+        buildingAccessNotes,
+        parkingNotes,
+        budgetCap,
+        receiptPreference,
+        photoProofOk,
+      },
+
       list: { groceryListText: groceryList, attachment },
       consents: { terms: true, accuracy: true, dropoff: true },
       pricingSnapshot,
@@ -1970,34 +2109,35 @@ app.get("/api/admin/routific/export-csv", requireLogin, requireAdmin, async (req
       const phone = o.customer?.phone || "";
       const email = o.customer?.email || "";
       const address =
-        \`\${o.address?.streetAddress || ""}\${o.address?.unit ? (" " + o.address.unit) : ""}, \` +
-        \`\${o.address?.town || ""}, ON, \${o.address?.postalCode || ""}, Canada\`
-          .replace(/\\s+/g, " ")
+        `${o.address?.streetAddress || ""}${o.address?.unit ? (" " + o.address.unit) : ""}, ` +
+        `${o.address?.town || ""}, ON, ${o.address?.postalCode || ""}, Canada`
+          .replace(/\s+/g, " ")
           .trim();
 
       const notes = [
-        \`TGR \${o.orderId}\`,
-        \`Zone \${o.address?.zone || ""}\`,
-        o.preferences?.dropoffPref ? \`Drop-off: \${o.preferences.dropoffPref}\` : "",
-        o.preferences?.subsPref ? \`Subs: \${o.preferences.subsPref}\` : "",
-        o.stores?.primary ? \`Store: \${o.stores.primary}\` : "",
-        (o.stores?.extra || []).length ? \`Extra: \${(o.stores.extra || []).join(", ")}\` : "",
+        `TGR ${o.orderId}`,
+        `Zone ${o.address?.zone || ""}`,
+        o.preferences?.dropoffPref ? `Drop-off: ${o.preferences.dropoffPref}` : "",
+        o.preferences?.subsPref ? `Subs: ${o.preferences.subsPref}` : "",
+        o.stores?.primary ? `Store: ${o.stores.primary}` : "",
+        (o.stores?.extra || []).length ? `Extra: ${(o.stores.extra || []).join(", ")}` : "",
       ].filter(Boolean).join(" | ");
 
       const duration = 360;
       return [o.orderId, name, address, phone, email, notes, String(duration)].map(csvEscape).join(",");
     });
 
-    const csv = header.join(",") + "\\n" + rows.join("\\n") + "\\n";
-    const filename = \`routific_\${runKey}_deliveries.csv\`;
+    const csv = header.join(",") + "\n" + rows.join("\n") + "\n";
+    const filename = `routific_${runKey}_deliveries.csv`;
 
     res.setHeader("Content-Type", "text/csv; charset=utf-8");
-    res.setHeader("Content-Disposition", \`attachment; filename="\${filename}"\`);
+    res.setHeader("Content-Disposition", `attachment; filename="${filename}"`);
     res.send(csv);
   } catch (e) {
     res.status(500).send(String(e));
   }
 });
+
 // =========================
 // ADMIN: Tracking Control mini-page (NEW)
 // =========================
