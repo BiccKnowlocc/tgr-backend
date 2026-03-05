@@ -64,10 +64,13 @@ const MAPBOX_PUBLIC_TOKEN = process.env.MAPBOX_PUBLIC_TOKEN || "";
 
 // Postmark outbound (optional)
 const POSTMARK_SERVER_TOKEN = process.env.POSTMARK_SERVER_TOKEN || "";
-const POSTMARK_FROM_EMAIL = process.env.POSTMARK_FROM_EMAIL || "orders@tobermorygroceryrun.ca";
+const POSTMARK_FROM_EMAIL =
+  process.env.POSTMARK_FROM_EMAIL || "orders@tobermorygroceryrun.ca";
 const POSTMARK_MESSAGE_STREAM = process.env.POSTMARK_MESSAGE_STREAM || "outbound";
 
-const pmClient = POSTMARK_SERVER_TOKEN ? new postmark.ServerClient(POSTMARK_SERVER_TOKEN) : null;
+const pmClient = POSTMARK_SERVER_TOKEN
+  ? new postmark.ServerClient(POSTMARK_SERVER_TOKEN)
+  : null;
 
 // Square pay links (member portal quick buttons)
 const SQUARE_PAY_GROCERIES_LINK =
@@ -76,10 +79,14 @@ const SQUARE_PAY_FEES_LINK =
   process.env.SQUARE_PAY_FEES_LINK || "https://square.link/u/r92W6XGs";
 
 // Membership purchase links (for your index.html)
-const SQUARE_LINK_STANDARD = process.env.SQUARE_LINK_STANDARD || "https://square.link/u/iaziCZjG";
-const SQUARE_LINK_ROUTE = process.env.SQUARE_LINK_ROUTE || "https://square.link/u/P5ROgqyp";
-const SQUARE_LINK_ACCESS = process.env.SQUARE_LINK_ACCESS || "https://square.link/u/lHtHtvqG";
-const SQUARE_LINK_ACCESSPRO = process.env.SQUARE_LINK_ACCESSPRO || "https://square.link/u/S0Y5Fysa";
+const SQUARE_LINK_STANDARD =
+  process.env.SQUARE_LINK_STANDARD || "https://square.link/u/iaziCZjG";
+const SQUARE_LINK_ROUTE =
+  process.env.SQUARE_LINK_ROUTE || "https://square.link/u/P5ROgqyp";
+const SQUARE_LINK_ACCESS =
+  process.env.SQUARE_LINK_ACCESS || "https://square.link/u/lHtHtvqG";
+const SQUARE_LINK_ACCESSPRO =
+  process.env.SQUARE_LINK_ACCESSPRO || "https://square.link/u/S0Y5Fysa";
 
 const ALLOWED_ORIGINS = [
   "https://tobermorygroceryrun.ca",
@@ -296,6 +303,7 @@ const ACTIVE_STATES = new Set([
   "out_for_delivery",
 ]);
 
+// ======= CHANGED (DEDICATED FIELDS ADDED) =======
 const OrderSchema = new mongoose.Schema(
   {
     orderId: { type: String, unique: true, index: true },
@@ -383,7 +391,7 @@ const OrderSchema = new mongoose.Schema(
       generalNotes: { type: String, default: "" },
     },
 
-    // NEW: dedicated delivery meta (fills the left-side UX block)
+    // NEW: dedicated delivery meta
     deliveryMeta: {
       gateCode: { type: String, default: "" },
       buildingAccessNotes: { type: String, default: "" },
@@ -1172,7 +1180,7 @@ app.post("/api/orders", requireLogin, requireProfileComplete, upload.single("gro
       return res.status(400).json({ ok: false, error: "All required consents must be accepted." });
     }
 
-    // ---- NEW: Dedicated fields for the new Order page (optional; backward compatible) ----
+    // ======= CHANGED (DEDICATED FIELDS PARSING) =======
     const dob = String(b.dob || "").trim(); // YYYY-MM-DD
     const altPhone = String(b.altPhone || "").trim();
 
@@ -1309,7 +1317,6 @@ app.post("/api/orders", requireLogin, requireProfileComplete, upload.single("gro
         idRequired: addLiquor,
       },
 
-      // UPDATED: dedicated customer fields
       customer: {
         fullName,
         email: String(user.email || "").trim().toLowerCase(),
@@ -1322,7 +1329,6 @@ app.post("/api/orders", requireLogin, requireProfileComplete, upload.single("gro
       stores: { primary: primaryStore, extra: extraStores },
       preferences: { dropoffPref, subsPref, contactPref, contactAuth: true },
 
-      // NEW: dedicated add-ons
       addOns: {
         prescription: { requested: addPrescription, pharmacyName: prescriptionPharmacy, notes: prescriptionNotes },
         liquor: { requested: addLiquor, storeName: liquorStore, notes: liquorNotes, idRequired: true },
@@ -1334,7 +1340,6 @@ app.post("/api/orders", requireLogin, requireProfileComplete, upload.single("gro
         generalNotes,
       },
 
-      // NEW: delivery meta
       deliveryMeta: {
         gateCode,
         buildingAccessNotes,
@@ -1805,14 +1810,12 @@ app.get("/member", requireLogin, async (req, res) => {
   (async function boot(){
     await loadConfig();
 
-    // Auto-start from link params (member?trackRunKey=...&token=...)
     const p = qs();
     if (p.runKey && p.token) {
       startMapTracking({ runKey: p.runKey, token: p.token, orderId: p.orderId || "" });
       return;
     }
 
-    // Otherwise keep map hidden until user clicks Track on map
     setMapWrap(false);
   })();
 </script>
@@ -2088,6 +2091,540 @@ app.get("/api/admin/orders/:orderId/tracking-link", requireLogin, requireAdmin, 
   } catch (e) {
     res.status(500).json({ ok: false, error: String(e) });
   }
+});
+
+// =========================
+// ADMIN COMMAND CENTER PAGE (RESTORED)
+// =========================
+app.get("/admin", requireLogin, requireAdmin, async (_req, res) => {
+  res.setHeader("Content-Type", "text/html; charset=utf-8");
+  res.send(`<!doctype html>
+<html lang="en-CA">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>TGR Admin</title>
+<style>
+  :root{
+    --bg:#0b0b0b; --panel:rgba(255,255,255,.06); --line:rgba(255,255,255,.14);
+    --text:#fff; --muted:rgba(255,255,255,.75);
+    --red:#e3342f; --red2:#ff4a44;
+    --radius:14px;
+  }
+  body{margin:0;background:var(--bg);color:var(--text);font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;}
+  .wrap{max-width:1400px;margin:0 auto;padding:16px;}
+  .card{border:1px solid var(--line);background:var(--panel);border-radius:var(--radius);padding:14px;}
+  .row{display:flex;gap:10px;flex-wrap:wrap;align-items:center;}
+  .btn{
+    border:1px solid rgba(255,255,255,.18);
+    background:rgba(255,255,255,.06);
+    color:#fff;font-weight:900;
+    border-radius:999px;
+    padding:10px 14px;
+    cursor:pointer;
+    text-decoration:none;
+    white-space:nowrap;
+  }
+  .btn.primary{background:linear-gradient(180deg,var(--red2),var(--red));border-color:rgba(0,0,0,.25);}
+  .btn.ghost{background:transparent;}
+  .muted{color:var(--muted);}
+  .pill{display:inline-block;padding:4px 10px;border-radius:999px;border:1px solid rgba(255,255,255,.18);background:rgba(255,255,255,.06);font-weight:900;font-size:12px;}
+  .hr{height:1px;background:rgba(255,255,255,.12);margin:12px 0;}
+  input,select,textarea{
+    width:100%;
+    padding:12px 12px;
+    border-radius:12px;
+    border:1px solid rgba(255,255,255,.18);
+    background:rgba(0,0,0,.22);
+    color:#fff;
+    font-size:15px;
+    outline:none;
+  }
+  textarea{min-height:90px;resize:vertical;}
+  table{width:100%;border-collapse:collapse;}
+  th,td{padding:10px 8px;border-bottom:1px solid rgba(255,255,255,.12);vertical-align:top;}
+  th{font-size:12px;color:rgba(255,255,255,.72);text-transform:uppercase;letter-spacing:.08em;text-align:left;}
+  .grid{display:grid;grid-template-columns: 1.1fr .9fr; gap:12px;}
+  @media (max-width: 980px){ .grid{grid-template-columns: 1fr;} }
+  .toast{margin-top:10px;padding:10px 12px;border-radius:12px;border:1px solid rgba(255,255,255,.18);background:rgba(0,0,0,.24);display:none;font-weight:900;}
+  .toast.show{display:block;}
+  .modalBack{
+    position:fixed; inset:0; background:rgba(0,0,0,.55);
+    display:none; align-items:center; justify-content:center; padding:16px;
+  }
+  .modal{
+    width:min(980px, 100%); max-height: 92vh; overflow:auto;
+    border:1px solid rgba(255,255,255,.16); background:#0b0b0b;
+    border-radius:16px; padding:14px;
+  }
+  .k{font-size:12px;color:rgba(255,255,255,.7);text-transform:uppercase;letter-spacing:.08em;}
+  .v{font-weight:900;}
+  .two{display:grid;grid-template-columns: 1fr 1fr; gap:10px;}
+  @media(max-width:800px){.two{grid-template-columns:1fr;}}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="card">
+    <div class="row" style="justify-content:space-between;">
+      <div>
+        <div style="font-weight:1000;font-size:22px;">Admin Command Center</div>
+        <div class="muted">Search, view, status updates, payments, tracking links, export.</div>
+      </div>
+      <div class="row">
+        <a class="btn ghost" href="${escapeHtml(PUBLIC_SITE_URL)}/">Back to site</a>
+        <a class="btn" href="/admin/tracking-control">Tracking Control</a>
+        <a class="btn ghost" href="/logout?returnTo=${encodeURIComponent(PUBLIC_SITE_URL + "/")}">Log out</a>
+      </div>
+    </div>
+
+    <div class="toast" id="toast"></div>
+
+    <div class="hr"></div>
+
+    <div class="grid">
+      <div class="card" style="box-shadow:none;">
+        <div style="font-weight:1000;">Search / Filters</div>
+        <div class="hr"></div>
+
+        <div class="row">
+          <div style="flex: 2 1 320px;">
+            <label class="muted" style="font-weight:900;">Search</label>
+            <input id="q" placeholder="orderId, name, email, phone, address" />
+          </div>
+          <div style="flex: 1 1 180px;">
+            <label class="muted" style="font-weight:900;">State</label>
+            <select id="state">
+              <option value="">Any</option>
+              <option>submitted</option>
+              <option>confirmed</option>
+              <option>shopping</option>
+              <option>packed</option>
+              <option>out_for_delivery</option>
+              <option>delivered</option>
+              <option>issue</option>
+              <option>cancelled</option>
+            </select>
+          </div>
+          <div style="flex: 1 1 180px;">
+            <label class="muted" style="font-weight:900;">Run Key</label>
+            <input id="runKey" placeholder="YYYY-MM-DD-local" />
+          </div>
+        </div>
+
+        <div class="row">
+          <div style="flex: 1 1 160px;">
+            <label class="muted" style="font-weight:900;">Zone</label>
+            <select id="zone">
+              <option value="">Any</option>
+              <option>A</option><option>B</option><option>C</option><option>D</option>
+            </select>
+          </div>
+          <div style="flex: 1 1 220px;">
+            <label class="muted" style="font-weight:900;">Town</label>
+            <input id="town" placeholder="e.g., Tobermory" />
+          </div>
+          <div style="flex: 1 1 220px;">
+            <label class="muted" style="font-weight:900;">Flag</label>
+            <select id="flag">
+              <option value="">Any</option>
+              <option value="idRequired">idRequired</option>
+              <option value="prescription">prescription</option>
+              <option value="alcohol">alcohol</option>
+              <option value="bulky">bulky</option>
+              <option value="needsContact">needsContact</option>
+              <option value="newCustomerDepositRequired">newCustomerDepositRequired</option>
+            </select>
+          </div>
+        </div>
+
+        <div class="row">
+          <label class="row" style="gap:8px;">
+            <input id="unpaidFees" type="checkbox" style="width:18px;height:18px;">
+            <span class="muted" style="font-weight:900;">Unpaid fees only</span>
+          </label>
+          <label class="row" style="gap:8px;">
+            <input id="hold" type="checkbox" style="width:18px;height:18px;">
+            <span class="muted" style="font-weight:900;">Hold only</span>
+          </label>
+        </div>
+
+        <div class="row" style="margin-top:8px;">
+          <button class="btn primary" id="searchBtn">Search</button>
+          <button class="btn" id="refreshBtn">Refresh</button>
+          <button class="btn ghost" id="clearBtn">Clear</button>
+          <span class="pill" id="countPill">—</span>
+        </div>
+      </div>
+
+      <div class="card" style="box-shadow:none;">
+        <div style="font-weight:1000;">Quick Tools</div>
+        <div class="hr"></div>
+
+        <div class="muted">Export active deliveries for Routific by runKey:</div>
+        <div class="row" style="margin-top:10px;">
+          <div style="flex:1 1 260px;">
+            <input id="exportRunKey" placeholder="YYYY-MM-DD-local" />
+          </div>
+          <button class="btn" id="exportBtn">Download CSV</button>
+        </div>
+
+        <div class="hr"></div>
+
+        <div class="muted">Tip: open an order to update state, payments, or copy tracking link.</div>
+      </div>
+    </div>
+
+    <div class="hr"></div>
+
+    <div style="overflow:auto;">
+      <table>
+        <thead>
+          <tr>
+            <th>Order</th>
+            <th>Customer</th>
+            <th>Address</th>
+            <th>Run</th>
+            <th>Status</th>
+            <th>Fees</th>
+            <th>Flags</th>
+            <th>Actions</th>
+          </tr>
+        </thead>
+        <tbody id="rows">
+          <tr><td colspan="8" class="muted">Loading…</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+</div>
+
+<div class="modalBack" id="modalBack" style="position:fixed;inset:0;background:rgba(0,0,0,.55);display:none;align-items:center;justify-content:center;padding:16px;">
+  <div class="modal" style="width:min(980px,100%);max-height:92vh;overflow:auto;border:1px solid rgba(255,255,255,.16);background:#0b0b0b;border-radius:16px;padding:14px;">
+    <div class="row" style="justify-content:space-between;">
+      <div style="font-weight:1000;font-size:20px;">Order Details</div>
+      <button class="btn ghost" id="closeModal">Close</button>
+    </div>
+    <div class="hr"></div>
+
+    <div class="two" style="display:grid;grid-template-columns:1fr 1fr;gap:10px;">
+      <div class="card" style="box-shadow:none;">
+        <div class="k">Order ID</div><div class="v" id="m_orderId">—</div>
+        <div class="hr"></div>
+        <div class="k">Customer</div><div class="v" id="m_customer">—</div>
+        <div class="k">Phone</div><div class="v" id="m_phone">—</div>
+        <div class="k">Email</div><div class="v" id="m_email">—</div>
+        <div class="hr"></div>
+        <div class="k">Address</div><div class="v" id="m_addr">—</div>
+        <div class="k">Zone</div><div class="v" id="m_zone">—</div>
+        <div class="k">Run</div><div class="v" id="m_run">—</div>
+      </div>
+
+      <div class="card" style="box-shadow:none;">
+        <div class="k">Fees total</div><div class="v" id="m_fees">—</div>
+
+        <label class="muted" style="font-weight:900;">Status state</label>
+        <select id="m_state">
+          <option>submitted</option>
+          <option>confirmed</option>
+          <option>shopping</option>
+          <option>packed</option>
+          <option>out_for_delivery</option>
+          <option>delivered</option>
+          <option>issue</option>
+          <option>cancelled</option>
+        </select>
+
+        <label class="muted" style="font-weight:900;">Status note (optional)</label>
+        <input id="m_stateNote" placeholder="Short note" />
+
+        <div class="row" style="margin-top:10px;">
+          <button class="btn primary" id="m_saveState">Save status</button>
+          <button class="btn" id="m_trackingLink">Copy tracking link</button>
+        </div>
+
+        <div class="hr"></div>
+
+        <div class="row">
+          <div style="flex:1 1 200px;">
+            <label class="muted" style="font-weight:900;">Fees status</label>
+            <select id="m_feesStatus">
+              <option value="">(no change)</option>
+              <option value="unpaid">unpaid</option>
+              <option value="paid">paid</option>
+            </select>
+          </div>
+          <div style="flex:1 1 200px;">
+            <label class="muted" style="font-weight:900;">Groceries status</label>
+            <select id="m_groceriesStatus">
+              <option value="">(no change)</option>
+              <option value="unpaid">unpaid</option>
+              <option value="deposit_paid">deposit_paid</option>
+              <option value="paid">paid</option>
+            </select>
+          </div>
+        </div>
+
+        <label class="muted" style="font-weight:900;">Payment note (optional)</label>
+        <input id="m_payNote" placeholder="e.g., paid cash, e-transfer, Square receipt #" />
+
+        <div class="row" style="margin-top:10px;">
+          <button class="btn" id="m_savePay">Save payments</button>
+          <button class="btn" id="m_cancelAdmin">Cancel order (admin)</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="hr"></div>
+
+    <div class="card" style="box-shadow:none;">
+      <div style="font-weight:1000;">Grocery list</div>
+      <div class="hr"></div>
+      <pre id="m_list" style="white-space:pre-wrap; margin:0; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;"></pre>
+    </div>
+  </div>
+</div>
+
+<script>
+  const toast = (msg)=>{
+    const el = document.getElementById("toast");
+    el.textContent = msg;
+    el.classList.add("show");
+    setTimeout(()=>el.classList.remove("show"), 3500);
+  };
+
+  const qs = (k)=> document.getElementById(k);
+  const rowsEl = qs("rows");
+  const countPill = qs("countPill");
+
+  let modalOrder = null;
+
+  function buildQuery(){
+    const p = new URLSearchParams();
+    const q = qs("q").value.trim();
+    const state = qs("state").value.trim();
+    const runKey = qs("runKey").value.trim();
+    const zone = qs("zone").value.trim();
+    const town = qs("town").value.trim();
+    const flag = qs("flag").value.trim();
+    const unpaidFees = qs("unpaidFees").checked ? "1" : "";
+    const hold = qs("hold").checked ? "1" : "";
+
+    if(q) p.set("q", q);
+    if(state) p.set("state", state);
+    if(runKey) p.set("runKey", runKey);
+    if(zone) p.set("zone", zone);
+    if(town) p.set("town", town);
+    if(flag) p.set("flag", flag);
+    if(unpaidFees) p.set("unpaidFees", unpaidFees);
+    if(hold) p.set("hold", hold);
+    p.set("limit","200");
+    return p.toString();
+  }
+
+  function esc(s){
+    return String(s||"").replaceAll("&","&amp;").replaceAll("<","&lt;").replaceAll(">","&gt;").replaceAll('"',"&quot;");
+  }
+
+  function money(n){
+    const x = Number(n||0);
+    return x.toFixed(2);
+  }
+
+  function render(items){
+    const list = items || [];
+    countPill.textContent = "Results: " + list.length;
+
+    if(!list.length){
+      rowsEl.innerHTML = '<tr><td colspan="8" class="muted">No results.</td></tr>';
+      return;
+    }
+
+    rowsEl.innerHTML = list.map(o=>{
+      const id = esc(o.orderId);
+      const cust = esc(o.customer?.fullName || "");
+      const phone = esc(o.customer?.phone || "");
+      const email = esc(o.customer?.email || "");
+      const addr = esc((o.address?.streetAddress||"") + (o.address?.unit ? (" " + o.address.unit) : "") + ", " + (o.address?.town||"") + " " + (o.address?.postalCode||""));
+      const run = esc(o.runKey || "");
+      const rt = esc(o.runType || "");
+      const st = esc(o.status?.state || "");
+      const fees = money(o.pricingSnapshot?.totalFees || 0);
+      const flags = [];
+      const f = o.flags || {};
+      Object.keys(f).forEach(k=>{ if (f[k] === true) flags.push(k); });
+      const flagTxt = esc(flags.join(", "));
+
+      return \`
+        <tr>
+          <td><div style="font-weight:1000;">\${id}</div><div class="muted" style="font-size:12px;">\${email}</div></td>
+          <td><div style="font-weight:900;">\${cust}</div><div class="muted" style="font-size:12px;">\${phone}</div></td>
+          <td>\${addr}</td>
+          <td><span class="pill">\${rt}</span><div class="muted" style="font-size:12px;margin-top:4px;">\${run}</div></td>
+          <td><span class="pill">\${st}</span></td>
+          <td>$\${fees}</td>
+          <td><div class="muted" style="font-size:12px;">\${flagTxt}</div></td>
+          <td><button class="btn" data-open="\${id}">Open</button></td>
+        </tr>
+      \`;
+    }).join("");
+
+    document.querySelectorAll("[data-open]").forEach(btn=>{
+      btn.addEventListener("click", ()=> openOrder(btn.getAttribute("data-open")));
+    });
+  }
+
+  async function search(){
+    rowsEl.innerHTML = '<tr><td colspan="8" class="muted">Loading…</td></tr>';
+    try{
+      const r = await fetch("/api/admin/orders?" + buildQuery(), { credentials:"include" });
+      const d = await r.json().catch(()=>({}));
+      if(!r.ok || d.ok===false) throw new Error(d.error || "Load failed");
+      render(d.items || []);
+    } catch(e){
+      rowsEl.innerHTML = '<tr><td colspan="8" class="muted">Error: ' + esc(e.message||e) + '</td></tr>';
+    }
+  }
+
+  function openModal(show){
+    qs("modalBack").style.display = show ? "flex" : "none";
+  }
+
+  async function openOrder(orderId){
+    try{
+      const r = await fetch("/api/admin/orders/" + encodeURIComponent(orderId), { credentials:"include" });
+      const d = await r.json().catch(()=>({}));
+      if(!r.ok || d.ok===false) throw new Error(d.error || "Order load failed");
+      modalOrder = d.order;
+
+      qs("m_orderId").textContent = modalOrder.orderId || "—";
+      qs("m_customer").textContent = modalOrder.customer?.fullName || "—";
+      qs("m_phone").textContent = modalOrder.customer?.phone || "—";
+      qs("m_email").textContent = modalOrder.customer?.email || "—";
+      qs("m_addr").textContent = (modalOrder.address?.streetAddress||"") + (modalOrder.address?.unit ? (" " + modalOrder.address.unit) : "");
+      qs("m_zone").textContent = modalOrder.address?.zone || "—";
+      qs("m_run").textContent = (modalOrder.runKey||"") + " (" + (modalOrder.runType||"") + ")";
+      qs("m_fees").textContent = "$" + money(modalOrder.pricingSnapshot?.totalFees || 0);
+
+      qs("m_state").value = (modalOrder.status?.state || "submitted");
+      qs("m_stateNote").value = (modalOrder.status?.note || "");
+      qs("m_list").textContent = modalOrder.list?.groceryListText || "";
+
+      qs("m_feesStatus").value = "";
+      qs("m_groceriesStatus").value = "";
+      qs("m_payNote").value = "";
+
+      openModal(true);
+    } catch(e){
+      toast(String(e.message||e));
+    }
+  }
+
+  async function saveStatus(){
+    if(!modalOrder?.orderId) return;
+    const state = qs("m_state").value;
+    const note = qs("m_stateNote").value.trim();
+    try{
+      const r = await fetch("/api/admin/orders/" + encodeURIComponent(modalOrder.orderId) + "/status", {
+        method:"POST",
+        headers:{ "Content-Type":"application/json" },
+        credentials:"include",
+        body: JSON.stringify({ state, note })
+      });
+      const d = await r.json().catch(()=>({}));
+      if(!r.ok || d.ok===false) throw new Error(d.error || "Save failed");
+      toast("Status saved ✅");
+      await search();
+    } catch(e){
+      toast(String(e.message||e));
+    }
+  }
+
+  async function savePayments(){
+    if(!modalOrder?.orderId) return;
+    const feesStatus = qs("m_feesStatus").value;
+    const groceriesStatus = qs("m_groceriesStatus").value;
+    const note = qs("m_payNote").value.trim();
+    try{
+      const r = await fetch("/api/admin/orders/" + encodeURIComponent(modalOrder.orderId) + "/payments", {
+        method:"POST",
+        headers:{ "Content-Type":"application/json" },
+        credentials:"include",
+        body: JSON.stringify({ feesStatus, groceriesStatus, note })
+      });
+      const d = await r.json().catch(()=>({}));
+      if(!r.ok || d.ok===false) throw new Error(d.error || "Save failed");
+      toast("Payments saved ✅");
+      await openOrder(modalOrder.orderId);
+      await search();
+    } catch(e){
+      toast(String(e.message||e));
+    }
+  }
+
+  async function cancelAdmin(){
+    if(!modalOrder?.orderId) return;
+    const ok = confirm("Cancel this order as admin?");
+    if(!ok) return;
+    const reason = prompt("Reason (optional):", "Cancelled by admin") || "Cancelled by admin";
+    try{
+      const r = await fetch("/api/admin/orders/" + encodeURIComponent(modalOrder.orderId) + "/cancel", {
+        method:"POST",
+        headers:{ "Content-Type":"application/json" },
+        credentials:"include",
+        body: JSON.stringify({ reason })
+      });
+      const d = await r.json().catch(()=>({}));
+      if(!r.ok || d.ok===false) throw new Error(d.error || "Cancel failed");
+      toast("Order cancelled ✅");
+      openModal(false);
+      await search();
+    } catch(e){
+      toast(String(e.message||e));
+    }
+  }
+
+  async function copyTrackingLink(){
+    if(!modalOrder?.orderId) return;
+    try{
+      const r = await fetch("/api/admin/orders/" + encodeURIComponent(modalOrder.orderId) + "/tracking-link", { credentials:"include" });
+      const d = await r.json().catch(()=>({}));
+      if(!r.ok || d.ok===false) throw new Error(d.error || "Link failed");
+      await navigator.clipboard.writeText(d.url || "");
+      toast("Tracking link copied ✅");
+    } catch(e){
+      toast(String(e.message||e));
+    }
+  }
+
+  function clearFilters(){
+    qs("q").value=""; qs("state").value=""; qs("runKey").value="";
+    qs("zone").value=""; qs("town").value=""; qs("flag").value="";
+    qs("unpaidFees").checked=false; qs("hold").checked=false;
+  }
+
+  qs("searchBtn").addEventListener("click", search);
+  qs("refreshBtn").addEventListener("click", search);
+  qs("clearBtn").addEventListener("click", ()=>{ clearFilters(); search(); });
+
+  qs("exportBtn").addEventListener("click", ()=>{
+    const rk = qs("exportRunKey").value.trim();
+    if(!rk) return toast("Enter runKey to export");
+    window.location.href = "/api/admin/routific/export-csv?runKey=" + encodeURIComponent(rk);
+  });
+
+  qs("closeModal").addEventListener("click", ()=> openModal(false));
+  qs("modalBack").addEventListener("click", (e)=>{ if(e.target.id==="modalBack") openModal(false); });
+
+  qs("m_saveState").addEventListener("click", saveStatus);
+  qs("m_savePay").addEventListener("click", savePayments);
+  qs("m_cancelAdmin").addEventListener("click", cancelAdmin);
+  qs("m_trackingLink").addEventListener("click", copyTrackingLink);
+
+  search();
+</script>
+</body>
+</html>`);
 });
 
 // =========================
