@@ -2,10 +2,16 @@
 // Google OAuth, profile onboarding, biweekly runs, estimator, orders, cancel tokens
 // FULL ADMIN COMMAND CENTER + endpoints (search/view/status/payments/hold/flags/bulk/export/print/tracking/email)
 // ADMIN Tracking Control mini-page: /admin/tracking-control (GPS broadcast from phone)
-// MEMBER PORTAL (/member) restored + embedded live map (Mapbox) for active orders when tracking enabled
+// MEMBER PORTAL (/member) + embedded live map (Mapbox) for active orders when tracking enabled
 // AddressComplete proxy endpoints kept
 //
 // Order IDs: TGR-LOC-YYYYMMDD-XXXXXX or TGR-OWEN-YYYYMMDD-XXXXXX
+//
+// ISSUE #2 COMPLETE:
+// - Membership pricing/catalog authority moved to backend
+// - Frontend should fetch membership plans from /api/public/config or /api/public/memberships
+// - Estimator prefers backend-active membership when user is logged in
+// - Order pricing no longer trusts client-supplied membership tier; it uses backend account state
 
 const express = require("express");
 const mongoose = require("mongoose");
@@ -46,6 +52,11 @@ const SESSION_SECRET = process.env.SESSION_SECRET || "dev-secret";
 const CANCEL_TOKEN_SECRET = process.env.CANCEL_TOKEN_SECRET || SESSION_SECRET;
 const TRACKING_TOKEN_SECRET = process.env.TRACKING_TOKEN_SECRET || SESSION_SECRET;
 
+const SESSION_COOKIE_SECURE =
+  String(process.env.SESSION_COOKIE_SECURE || "").toLowerCase() === "true"
+    ? true
+    : process.env.NODE_ENV === "production";
+
 const TZ = process.env.TZ || "America/Toronto";
 
 const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID || "";
@@ -78,7 +89,7 @@ const SQUARE_PAY_GROCERIES_LINK =
 const SQUARE_PAY_FEES_LINK =
   process.env.SQUARE_PAY_FEES_LINK || "https://square.link/u/r92W6XGs";
 
-// Membership purchase links (for your index.html)
+// Membership purchase links
 const SQUARE_LINK_STANDARD =
   process.env.SQUARE_LINK_STANDARD || "https://square.link/u/iaziCZjG";
 const SQUARE_LINK_ROUTE =
@@ -95,7 +106,7 @@ const ALLOWED_ORIGINS = [
   "http://localhost:8888",
 ];
 
-// Canada Post AddressComplete key (fallback)
+// Canada Post AddressComplete key
 const CANADAPOST_KEY = process.env.CANADAPOST_KEY || "mn86-az16-ku32-hj78";
 
 // =========================
@@ -133,7 +144,7 @@ app.use(
     }),
     cookie: {
       httpOnly: true,
-      secure: true,
+      secure: SESSION_COOKIE_SECURE,
       sameSite: "lax",
       maxAge: 1000 * 60 * 60 * 24 * 14,
     },
@@ -142,14 +153,13 @@ app.use(
 
 app.get("/favicon.ico", (_req, res) => res.status(204).end());
 
-// Uploads
 const upload = multer({
   dest: "uploads/",
   limits: { fileSize: 15 * 1024 * 1024 },
 });
 
 // =========================
-// PASSPORT (GOOGLE OAUTH)
+// PASSPORT
 // =========================
 passport.serializeUser((user, done) => done(null, user._id.toString()));
 
@@ -238,6 +248,89 @@ const PRICING = {
   groceryUnderMin: { threshold: 35, surcharge: 19 },
 };
 
+// Backend membership authority
+const MEMBERSHIP_PLANS = {
+  standard: {
+    id: "standard",
+    name: "Standard",
+    monthlyPrice: 15,
+    link: SQUARE_LINK_STANDARD,
+    eligibility: "",
+    perks: [
+      "1 free add-on up to $10 OR $10 off zone fee monthly",
+    ],
+  },
+  route: {
+    id: "route",
+    name: "Route",
+    monthlyPrice: 25,
+    link: SQUARE_LINK_ROUTE,
+    eligibility: "",
+    perks: [
+      "1 free add-on up to $10 OR $10 off zone fee monthly",
+      "$5 off service fee on 1 order per run day",
+    ],
+  },
+  access: {
+    id: "access",
+    name: "Access",
+    monthlyPrice: 12,
+    link: SQUARE_LINK_ACCESS,
+    eligibility: "Seniors 60+ or disabled / mobility-limited / low income",
+    perks: [
+      "1 free add-on up to $10 OR $10 off zone fee per run cycle",
+      "$8 off service fee on 1 order per run day",
+      "Free phone/text ordering",
+    ],
+  },
+  accesspro: {
+    id: "accesspro",
+    name: "Access Pro",
+    monthlyPrice: 20,
+    link: SQUARE_LINK_ACCESSPRO,
+    eligibility: "Enhanced support tier",
+    perks: [
+      "$10 off service fee on 1 order per run day",
+      "1 prescription pickup/delivery included monthly",
+      "Document services included up to 10 pages/month in Tobermory area",
+    ],
+  },
+};
+
+const MEMBERSHIP_ORDER = ["standard", "route", "access", "accesspro"];
+
+function getPublicMembershipPlans() {
+  return MEMBERSHIP_ORDER.map((id) => {
+    const p = MEMBERSHIP_PLANS[id];
+    return {
+      id: p.id,
+      name: p.name,
+      monthlyPrice: p.monthlyPrice,
+      priceLabel: `$${p.monthlyPrice} / month`,
+      link: p.link,
+      eligibility: p.eligibility,
+      perks: p.perks,
+    };
+  });
+}
+
+function getEffectiveMemberTierForUser(user, requestedTier = "") {
+  const activeTier =
+    user &&
+    user.membershipStatus === "active" &&
+    user.membershipLevel &&
+    user.membershipLevel !== "none"
+      ? String(user.membershipLevel).trim().toLowerCase()
+      : "";
+
+  if (activeTier && MEMBERSHIP_PLANS[activeTier]) return activeTier;
+
+  const reqTier = String(requestedTier || "").trim().toLowerCase();
+  if (reqTier && MEMBERSHIP_PLANS[reqTier]) return reqTier;
+
+  return "";
+}
+
 function calcPrinting(pages) {
   const p = Number(pages || 0);
   if (p <= 0) return 0;
@@ -253,14 +346,19 @@ function calcPrinting(pages) {
 function membershipDiscounts(tier, applyPerkYes) {
   if (!tier || !applyPerkYes)
     return { serviceOff: 0, zoneOff: 0, freeAddonUpTo: 0, waitWaived: false };
+
   if (tier === "standard")
     return { serviceOff: 0, zoneOff: 10, freeAddonUpTo: 10, waitWaived: false };
+
   if (tier === "route")
     return { serviceOff: 5, zoneOff: 10, freeAddonUpTo: 10, waitWaived: false };
+
   if (tier === "access")
     return { serviceOff: 8, zoneOff: 10, freeAddonUpTo: 10, waitWaived: true };
+
   if (tier === "accesspro")
     return { serviceOff: 10, zoneOff: 0, freeAddonUpTo: 0, waitWaived: true };
+
   return { serviceOff: 0, zoneOff: 0, freeAddonUpTo: 0, waitWaived: false };
 }
 
@@ -303,14 +401,12 @@ const ACTIVE_STATES = new Set([
   "out_for_delivery",
 ]);
 
-// ======= CHANGED (DEDICATED FIELDS ADDED) =======
 const OrderSchema = new mongoose.Schema(
   {
     orderId: { type: String, unique: true, index: true },
     runKey: { type: String, required: true },
     runType: { type: String, enum: ["local", "owen"], required: true },
 
-    // Admin control fields
     hold: { type: Boolean, default: false },
     flags: {
       type: {
@@ -324,13 +420,12 @@ const OrderSchema = new mongoose.Schema(
       default: {},
     },
 
-    // UPDATED: dedicated customer fields
     customer: {
       fullName: String,
       email: String,
       phone: String,
       altPhone: { type: String, default: "" },
-      dob: { type: String, default: "" }, // YYYY-MM-DD
+      dob: { type: String, default: "" },
     },
 
     address: {
@@ -350,7 +445,6 @@ const OrderSchema = new mongoose.Schema(
       contactAuth: Boolean,
     },
 
-    // NEW: dedicated add-ons
     addOns: {
       prescription: {
         requested: { type: Boolean, default: false },
@@ -391,7 +485,6 @@ const OrderSchema = new mongoose.Schema(
       generalNotes: { type: String, default: "" },
     },
 
-    // NEW: dedicated delivery meta
     deliveryMeta: {
       gateCode: { type: String, default: "" },
       buildingAccessNotes: { type: String, default: "" },
@@ -425,12 +518,12 @@ const OrderSchema = new mongoose.Schema(
 
     payments: {
       fees: {
-        status: { type: String, default: "unpaid" }, // unpaid|paid
+        status: { type: String, default: "unpaid" },
         note: { type: String, default: "" },
         paidAt: { type: Date, default: null },
       },
       groceries: {
-        status: { type: String, default: "unpaid" }, // unpaid|paid|deposit_paid
+        status: { type: String, default: "unpaid" },
         note: { type: String, default: "" },
         paidAt: { type: Date, default: null },
       },
@@ -463,7 +556,6 @@ const OrderSchema = new mongoose.Schema(
   { timestamps: true }
 );
 
-// Per-run tracking session
 const TrackingSchema = new mongoose.Schema(
   {
     runKey: { type: String, unique: true, index: true },
@@ -508,6 +600,7 @@ function csvEscape(val) {
 function nowTz() {
   return dayjs().tz(TZ);
 }
+
 function fmtLocal(d) {
   if (!d) return "";
   return dayjs(d).tz(TZ).format("ddd MMM D, h:mma");
@@ -537,14 +630,7 @@ function isProfileComplete(profile) {
 
   const consentsOk = p.consentTerms === true && p.consentPrivacy === true;
 
-  return (
-    !!fullName &&
-    !!phone &&
-    !!contactPref &&
-    contactAuth &&
-    hasAddress &&
-    consentsOk
-  );
+  return !!fullName && !!phone && !!contactPref && contactAuth && hasAddress && consentsOk;
 }
 
 function requireLogin(req, res, next) {
@@ -572,7 +658,6 @@ function requireAdmin(req, res, next) {
   next();
 }
 
-// ===== Postmark helper (optional) =====
 async function pmSend(to, subject, htmlBody, textBody) {
   try {
     const rcpt = String(to || "").trim();
@@ -632,7 +717,7 @@ function verifyCancelToken(orderId, token) {
   }
 }
 
-// ===== Tracking token helpers (orderId + runKey) =====
+// ===== Tracking token helpers =====
 function signTrackingToken(orderId, runKey, expMs) {
   const payload = `${orderId}.${runKey}.${String(expMs)}`;
   const sig = crypto.createHmac("sha256", TRACKING_TOKEN_SECRET).update(payload).digest();
@@ -661,7 +746,6 @@ function verifyTrackingToken(token) {
     const b = Buffer.from(expectedB64);
     if (a.length !== b.length) return { ok: false };
     if (!crypto.timingSafeEqual(a, b)) return { ok: false };
-
     if (Date.now() > expMs) return { ok: false, error: "expired" };
 
     return { ok: true, orderId, runKey, expMs };
@@ -670,13 +754,12 @@ function verifyTrackingToken(token) {
   }
 }
 
-// ===== Robust run-prefixed order ID generator =====
-// Format: TGR-LOC-YYYYMMDD-XXXXXX or TGR-OWEN-YYYYMMDD-XXXXXX
+// ===== Order ID =====
 async function nextOrderId(runType, runKey) {
   const type = String(runType || "").toLowerCase();
   const prefix = type === "owen" ? "OWEN" : "LOC";
 
-  const datePart = String(runKey || "").slice(0, 10).replaceAll("-", ""); // YYYYMMDD
+  const datePart = String(runKey || "").slice(0, 10).replaceAll("-", "");
   const runDate = /^\d{8}$/.test(datePart) ? datePart : dayjs().tz(TZ).format("YYYYMMDD");
 
   for (let i = 0; i < 24; i++) {
@@ -739,15 +822,26 @@ function computeFeeBreakdown(input) {
     0,
     serviceFee + zoneFee + runFee + addOnsFees + surcharges - discount
   );
-  return { totals: { serviceFee, zoneFee, runFee, addOnsFees, surcharges, discount, totalFees } };
+
+  return {
+    totals: {
+      serviceFee,
+      zoneFee,
+      runFee,
+      addOnsFees,
+      surcharges,
+      discount,
+      totalFees,
+    },
+  };
 }
 
 // =========================
-// RUN SCHEDULING (biweekly, DB-driven)
+// RUN SCHEDULING
 // =========================
 function runKeyToDayjs(runKey) {
   try {
-    const dateStr = String(runKey || "").slice(0, 10); // YYYY-MM-DD
+    const dateStr = String(runKey || "").slice(0, 10);
     const d = dayjs(dateStr).tz(TZ);
     return d.isValid() ? d : null;
   } catch {
@@ -766,12 +860,12 @@ function nextDow(targetDow, from) {
 function computeTimesForDelivery(deliveryDayjs, type) {
   const delivery = dayjs(deliveryDayjs).tz(TZ);
   if (type === "local") {
-    const cutoff = delivery.subtract(2, "day").hour(18).minute(0).second(0).millisecond(0); // Thu 6pm
-    const opens = delivery.subtract(5, "day").hour(0).minute(0).second(0).millisecond(0); // Mon 12am
+    const cutoff = delivery.subtract(2, "day").hour(18).minute(0).second(0).millisecond(0);
+    const opens = delivery.subtract(5, "day").hour(0).minute(0).second(0).millisecond(0);
     return { delivery, cutoff, opens };
   }
-  const cutoff = delivery.subtract(2, "day").hour(18).minute(0).second(0).millisecond(0); // Fri 6pm
-  const opens = delivery.subtract(6, "day").hour(0).minute(0).second(0).millisecond(0); // Mon 12am
+  const cutoff = delivery.subtract(2, "day").hour(18).minute(0).second(0).millisecond(0);
+  const opens = delivery.subtract(6, "day").hour(0).minute(0).second(0).millisecond(0);
   return { delivery, cutoff, opens };
 }
 
@@ -790,12 +884,10 @@ function meetsMinimums(run) {
 async function getOrCreateNextRun(type) {
   const now = nowTz();
 
-  // Prefer an existing run that has NOT passed cutoff yet
   let existing = await Run.findOne({ type, cutoffAt: { $gt: now.toDate() } })
     .sort({ opensAt: 1 })
     .lean();
 
-  // If found but opensAt is still in the future, force it open now
   if (existing) {
     const opensAt = dayjs(existing.opensAt).tz(TZ);
     const cutoffAt = dayjs(existing.cutoffAt).tz(TZ);
@@ -808,7 +900,6 @@ async function getOrCreateNextRun(type) {
     return existing;
   }
 
-  // No upcoming run in DB: create one
   const latest = await Run.findOne({ type }).sort({ opensAt: -1 }).lean();
 
   let delivery;
@@ -883,7 +974,6 @@ async function ensureTrackingDoc(runKey) {
   return t;
 }
 
-// public tracking: requires token; only works if order active and tracking enabled
 app.get("/api/public/tracking/:runKey", async (req, res) => {
   try {
     const runKey = String(req.params.runKey || "").trim();
@@ -985,7 +1075,15 @@ app.get("/api/public/config", (_req, res) => {
       route: SQUARE_LINK_ROUTE,
       access: SQUARE_LINK_ACCESS,
       accesspro: SQUARE_LINK_ACCESSPRO,
-    }
+    },
+    membershipPlans: getPublicMembershipPlans(),
+  });
+});
+
+app.get("/api/public/memberships", (_req, res) => {
+  res.json({
+    ok: true,
+    plans: getPublicMembershipPlans(),
   });
 });
 
@@ -1026,6 +1124,7 @@ app.get("/logout", (req, res) => {
 // =========================
 app.get("/api/me", (req, res) => {
   const u = req.user;
+  const activeTier = getEffectiveMemberTierForUser(u);
   res.json({
     ok: true,
     loggedIn: !!u,
@@ -1034,6 +1133,7 @@ app.get("/api/me", (req, res) => {
     photo: u?.photo || "",
     membershipLevel: u?.membershipLevel || "none",
     membershipStatus: u?.membershipStatus || "inactive",
+    effectiveMembershipTier: activeTier || "",
     renewalDate: u?.renewalDate || null,
     profileComplete: isProfileComplete(u?.profile || {}),
     isAdmin: !!u?.email && isAdminEmail(u.email),
@@ -1096,7 +1196,9 @@ app.post("/api/profile", requireLogin, async (req, res) => {
       consentMarketing: yn(b.consentMarketing),
     };
 
-    if (!newProfile.defaultId && newProfile.addresses.length) newProfile.defaultId = newProfile.addresses[0].id;
+    if (!newProfile.defaultId && newProfile.addresses.length) {
+      newProfile.defaultId = newProfile.addresses[0].id;
+    }
 
     newProfile.complete = isProfileComplete(newProfile);
     newProfile.completedAt = newProfile.complete ? new Date().toISOString() : null;
@@ -1151,8 +1253,17 @@ app.get("/api/runs/active", async (_req, res) => {
 
 app.post("/api/estimator", (req, res) => {
   try {
-    const breakdown = computeFeeBreakdown(req.body || {});
-    res.json({ ok: true, breakdown });
+    const effectiveMemberTier = getEffectiveMemberTierForUser(req.user, req.body?.memberTier || "");
+    const breakdown = computeFeeBreakdown({
+      ...(req.body || {}),
+      memberTier: effectiveMemberTier,
+      applyPerk: "yes",
+    });
+    res.json({
+      ok: true,
+      effectiveMemberTier,
+      breakdown,
+    });
   } catch (e) {
     res.status(500).json({ ok: false, error: String(e) });
   }
@@ -1180,8 +1291,7 @@ app.post("/api/orders", requireLogin, requireProfileComplete, upload.single("gro
       return res.status(400).json({ ok: false, error: "All required consents must be accepted." });
     }
 
-    // ======= CHANGED (DEDICATED FIELDS PARSING) =======
-    const dob = String(b.dob || "").trim(); // YYYY-MM-DD
+    const dob = String(b.dob || "").trim();
     const altPhone = String(b.altPhone || "").trim();
 
     const addPrescription = yn(b.addon_prescription);
@@ -1266,7 +1376,9 @@ app.post("/api/orders", requireLogin, requireProfileComplete, upload.single("gro
       ["contactPref", contactPref],
     ];
     for (const [k, v] of required) {
-      if (!String(v || "").trim()) return res.status(400).json({ ok: false, error: "Missing required field: " + k });
+      if (!String(v || "").trim()) {
+        return res.status(400).json({ ok: false, error: "Missing required field: " + k });
+      }
     }
 
     const orderId = await nextOrderId(runType, run.runKey);
@@ -1282,6 +1394,8 @@ app.post("/api/orders", requireLogin, requireProfileComplete, upload.single("gro
       };
     }
 
+    const effectiveMemberTier = getEffectiveMemberTierForUser(user, "");
+
     const pricingSnapshot = computeFeeBreakdown({
       zone,
       runType,
@@ -1289,8 +1403,8 @@ app.post("/api/orders", requireLogin, requireProfileComplete, upload.single("gro
       grocerySubtotal: Number(b.grocerySubtotal || 0),
       addon_printing: b.addon_printing || "no",
       printPages: Number(b.printPages || 0),
-      memberTier: b.memberTier || "",
-      applyPerk: b.applyPerk || "yes",
+      memberTier: effectiveMemberTier,
+      applyPerk: "yes",
     }).totals;
 
     const maxSlots = run.maxSlots || 12;
@@ -1309,7 +1423,6 @@ app.post("/api/orders", requireLogin, requireProfileComplete, upload.single("gro
 
       hold: false,
 
-      // UPDATED: populate flags from dedicated add-ons (keeps your admin filters useful)
       flags: {
         prescription: addPrescription,
         alcohol: addLiquor,
@@ -1355,14 +1468,18 @@ app.post("/api/orders", requireLogin, requireProfileComplete, upload.single("gro
       payments: { fees: { status: "unpaid" }, groceries: { status: "unpaid" } },
       status: { state: "submitted", note: "", updatedAt: new Date(), updatedBy: "customer" },
       statusHistory: [{ state: "submitted", note: "", at: new Date(), by: "customer" }],
-      adminLog: [{ at: new Date(), by: "system", action: "order_created", meta: { runKey: run.runKey } }],
+      adminLog: [{
+        at: new Date(),
+        by: "system",
+        action: "order_created",
+        meta: { runKey: run.runKey, effectiveMemberTier },
+      }],
     });
 
     const cancelUntilMs = cutoffAt.toDate().getTime();
     const cancelToken = signCancelToken(orderId, cancelUntilMs);
     const cancelUntilLocal = fmtLocal(cutoffAt.toDate());
 
-    // Optional email: order received (only if Postmark configured)
     pmSend(
       created.customer?.email,
       `TGR Order Received: ${created.orderId}`,
@@ -1371,12 +1488,17 @@ app.post("/api/orders", requireLogin, requireProfileComplete, upload.single("gro
         <p style="margin:0 0 10px;"><strong>Order ID:</strong> ${escapeHtml(created.orderId)}</p>
         <p style="margin:0 0 10px;"><strong>Run:</strong> ${escapeHtml(created.runKey)} (${escapeHtml(created.runType)})</p>
         <p style="margin:0 0 10px;"><strong>Fees estimate:</strong> $${escapeHtml(money(created.pricingSnapshot?.totalFees || 0))}</p>
+        ${effectiveMemberTier ? `<p style="margin:0 0 10px;"><strong>Membership applied:</strong> ${escapeHtml(effectiveMemberTier)}</p>` : ""}
         <p style="margin:0;">Member Portal: <a href="${escapeHtml("https://api.tobermorygroceryrun.ca/member")}">${escapeHtml("https://api.tobermorygroceryrun.ca/member")}</a></p>
       </div>`,
-      `Order received\nOrder ID: ${created.orderId}\nRun: ${created.runKey} (${created.runType})\nFees estimate: $${money(created.pricingSnapshot?.totalFees || 0)}`
+      `Order received
+Order ID: ${created.orderId}
+Run: ${created.runKey} (${created.runType})
+Fees estimate: $${money(created.pricingSnapshot?.totalFees || 0)}
+${effectiveMemberTier ? `Membership applied: ${effectiveMemberTier}\n` : ""}`
     );
 
-    res.json({ ok: true, orderId, runKey: run.runKey, cancelToken, cancelUntilLocal });
+    res.json({ ok: true, orderId, runKey: run.runKey, cancelToken, cancelUntilLocal, effectiveMemberTier });
   } catch (e) {
     res.status(500).json({ ok: false, error: String(e) });
   }
@@ -1427,7 +1549,7 @@ app.post("/api/orders/:orderId/cancel", async (req, res) => {
 });
 
 // =========================
-// MEMBER PORTAL (UPGRADED: embedded map)
+// MEMBER PORTAL
 // =========================
 app.get("/member", requireLogin, async (req, res) => {
   try {
@@ -1445,7 +1567,6 @@ app.get("/member", requireLogin, async (req, res) => {
 
     const now = nowTz();
 
-    // Build a list of trackable orders with tokens embedded
     const trackables = [];
     for (const o of orders) {
       const status = o.status?.state || "submitted";
@@ -1525,16 +1646,7 @@ app.get("/member", requireLogin, async (req, res) => {
   .wrap{max-width:1250px;margin:0 auto;padding:16px;}
   .card{border:1px solid var(--line);background:var(--panel);border-radius:var(--radius);padding:14px;}
   .row{display:flex;gap:10px;flex-wrap:wrap;align-items:center;}
-  .btn{
-    border:1px solid rgba(255,255,255,.18);
-    background:rgba(255,255,255,.06);
-    color:#fff;font-weight:900;
-    border-radius:999px;
-    padding:10px 14px;
-    cursor:pointer;
-    text-decoration:none;
-    white-space:nowrap;
-  }
+  .btn{border:1px solid rgba(255,255,255,.18);background:rgba(255,255,255,.06);color:#fff;font-weight:900;border-radius:999px;padding:10px 14px;cursor:pointer;text-decoration:none;white-space:nowrap;}
   .btn.primary{background:linear-gradient(180deg,var(--red2),var(--red));border-color:rgba(0,0,0,.25);}
   .btn.ghost{background:transparent;}
   .muted{color:var(--muted);}
@@ -1809,13 +1921,11 @@ app.get("/member", requireLogin, async (req, res) => {
 
   (async function boot(){
     await loadConfig();
-
     const p = qs();
     if (p.runKey && p.token) {
       startMapTracking({ runKey: p.runKey, token: p.token, orderId: p.orderId || "" });
       return;
     }
-
     setMapWrap(false);
   })();
 </script>
@@ -1828,7 +1938,7 @@ app.get("/member", requireLogin, async (req, res) => {
 });
 
 // =========================
-// ADMIN API ENDPOINTS + PAGES
+// ADMIN HELPERS + API
 // =========================
 function adminBy(req) {
   return String(req.user?.email || "admin").toLowerCase();
@@ -1922,7 +2032,6 @@ app.post("/api/admin/orders/:orderId/status", requireLogin, requireAdmin, async 
 app.post("/api/admin/orders/:orderId/payments", requireLogin, requireAdmin, async (req, res) => {
   try {
     const orderId = String(req.params.orderId || "").trim().toUpperCase();
-
     const feesStatus = String(req.body?.feesStatus || "").trim();
     const groceriesStatus = String(req.body?.groceriesStatus || "").trim();
     const note = String(req.body?.note || "").trim();
@@ -2035,7 +2144,6 @@ app.post("/api/admin/tracking/:runKey/stop", requireLogin, requireAdmin, async (
   }
 });
 
-// Update live GPS from phone (admin session cookie required)
 app.post("/api/admin/tracking/:runKey/update", requireLogin, requireAdmin, async (req, res) => {
   try {
     const runKey = String(req.params.runKey || "").trim();
@@ -2073,7 +2181,6 @@ app.post("/api/admin/tracking/:runKey/update", requireLogin, requireAdmin, async
   }
 });
 
-// Create a tracking link for an order (admin)
 app.get("/api/admin/orders/:orderId/tracking-link", requireLogin, requireAdmin, async (req, res) => {
   try {
     const orderId = String(req.params.orderId || "").trim().toUpperCase();
@@ -2094,7 +2201,7 @@ app.get("/api/admin/orders/:orderId/tracking-link", requireLogin, requireAdmin, 
 });
 
 // =========================
-// ADMIN COMMAND CENTER PAGE (RESTORED)
+// ADMIN PAGE
 // =========================
 app.get("/admin", requireLogin, requireAdmin, async (_req, res) => {
   res.setHeader("Content-Type", "text/html; charset=utf-8");
@@ -2105,41 +2212,18 @@ app.get("/admin", requireLogin, requireAdmin, async (_req, res) => {
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>TGR Admin</title>
 <style>
-  :root{
-    --bg:#0b0b0b; --panel:rgba(255,255,255,.06); --line:rgba(255,255,255,.14);
-    --text:#fff; --muted:rgba(255,255,255,.75);
-    --red:#e3342f; --red2:#ff4a44;
-    --radius:14px;
-  }
+  :root{--bg:#0b0b0b;--panel:rgba(255,255,255,.06);--line:rgba(255,255,255,.14);--text:#fff;--muted:rgba(255,255,255,.75);--red:#e3342f;--red2:#ff4a44;--radius:14px;}
   body{margin:0;background:var(--bg);color:var(--text);font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;}
   .wrap{max-width:1400px;margin:0 auto;padding:16px;}
   .card{border:1px solid var(--line);background:var(--panel);border-radius:var(--radius);padding:14px;}
   .row{display:flex;gap:10px;flex-wrap:wrap;align-items:center;}
-  .btn{
-    border:1px solid rgba(255,255,255,.18);
-    background:rgba(255,255,255,.06);
-    color:#fff;font-weight:900;
-    border-radius:999px;
-    padding:10px 14px;
-    cursor:pointer;
-    text-decoration:none;
-    white-space:nowrap;
-  }
+  .btn{border:1px solid rgba(255,255,255,.18);background:rgba(255,255,255,.06);color:#fff;font-weight:900;border-radius:999px;padding:10px 14px;cursor:pointer;text-decoration:none;white-space:nowrap;}
   .btn.primary{background:linear-gradient(180deg,var(--red2),var(--red));border-color:rgba(0,0,0,.25);}
   .btn.ghost{background:transparent;}
   .muted{color:var(--muted);}
   .pill{display:inline-block;padding:4px 10px;border-radius:999px;border:1px solid rgba(255,255,255,.18);background:rgba(255,255,255,.06);font-weight:900;font-size:12px;}
   .hr{height:1px;background:rgba(255,255,255,.12);margin:12px 0;}
-  input,select,textarea{
-    width:100%;
-    padding:12px 12px;
-    border-radius:12px;
-    border:1px solid rgba(255,255,255,.18);
-    background:rgba(0,0,0,.22);
-    color:#fff;
-    font-size:15px;
-    outline:none;
-  }
+  input,select,textarea{width:100%;padding:12px 12px;border-radius:12px;border:1px solid rgba(255,255,255,.18);background:rgba(0,0,0,.22);color:#fff;font-size:15px;outline:none;}
   textarea{min-height:90px;resize:vertical;}
   table{width:100%;border-collapse:collapse;}
   th,td{padding:10px 8px;border-bottom:1px solid rgba(255,255,255,.12);vertical-align:top;}
@@ -2148,19 +2232,6 @@ app.get("/admin", requireLogin, requireAdmin, async (_req, res) => {
   @media (max-width: 980px){ .grid{grid-template-columns: 1fr;} }
   .toast{margin-top:10px;padding:10px 12px;border-radius:12px;border:1px solid rgba(255,255,255,.18);background:rgba(0,0,0,.24);display:none;font-weight:900;}
   .toast.show{display:block;}
-  .modalBack{
-    position:fixed; inset:0; background:rgba(0,0,0,.55);
-    display:none; align-items:center; justify-content:center; padding:16px;
-  }
-  .modal{
-    width:min(980px, 100%); max-height: 92vh; overflow:auto;
-    border:1px solid rgba(255,255,255,.16); background:#0b0b0b;
-    border-radius:16px; padding:14px;
-  }
-  .k{font-size:12px;color:rgba(255,255,255,.7);text-transform:uppercase;letter-spacing:.08em;}
-  .v{font-weight:900;}
-  .two{display:grid;grid-template-columns: 1fr 1fr; gap:10px;}
-  @media(max-width:800px){.two{grid-template-columns:1fr;}}
 </style>
 </head>
 <body>
@@ -2179,7 +2250,6 @@ app.get("/admin", requireLogin, requireAdmin, async (_req, res) => {
     </div>
 
     <div class="toast" id="toast"></div>
-
     <div class="hr"></div>
 
     <div class="grid">
@@ -2260,7 +2330,6 @@ app.get("/admin", requireLogin, requireAdmin, async (_req, res) => {
       <div class="card" style="box-shadow:none;">
         <div style="font-weight:1000;">Quick Tools</div>
         <div class="hr"></div>
-
         <div class="muted">Export active deliveries for Routific by runKey:</div>
         <div class="row" style="margin-top:10px;">
           <div style="flex:1 1 260px;">
@@ -2268,10 +2337,6 @@ app.get("/admin", requireLogin, requireAdmin, async (_req, res) => {
           </div>
           <button class="btn" id="exportBtn">Download CSV</button>
         </div>
-
-        <div class="hr"></div>
-
-        <div class="muted">Tip: open an order to update state, payments, or copy tracking link.</div>
       </div>
     </div>
 
@@ -2299,92 +2364,6 @@ app.get("/admin", requireLogin, requireAdmin, async (_req, res) => {
   </div>
 </div>
 
-<div class="modalBack" id="modalBack" style="position:fixed;inset:0;background:rgba(0,0,0,.55);display:none;align-items:center;justify-content:center;padding:16px;">
-  <div class="modal" style="width:min(980px,100%);max-height:92vh;overflow:auto;border:1px solid rgba(255,255,255,.16);background:#0b0b0b;border-radius:16px;padding:14px;">
-    <div class="row" style="justify-content:space-between;">
-      <div style="font-weight:1000;font-size:20px;">Order Details</div>
-      <button class="btn ghost" id="closeModal">Close</button>
-    </div>
-    <div class="hr"></div>
-
-    <div class="two" style="display:grid;grid-template-columns:1fr 1fr;gap:10px;">
-      <div class="card" style="box-shadow:none;">
-        <div class="k">Order ID</div><div class="v" id="m_orderId">—</div>
-        <div class="hr"></div>
-        <div class="k">Customer</div><div class="v" id="m_customer">—</div>
-        <div class="k">Phone</div><div class="v" id="m_phone">—</div>
-        <div class="k">Email</div><div class="v" id="m_email">—</div>
-        <div class="hr"></div>
-        <div class="k">Address</div><div class="v" id="m_addr">—</div>
-        <div class="k">Zone</div><div class="v" id="m_zone">—</div>
-        <div class="k">Run</div><div class="v" id="m_run">—</div>
-      </div>
-
-      <div class="card" style="box-shadow:none;">
-        <div class="k">Fees total</div><div class="v" id="m_fees">—</div>
-
-        <label class="muted" style="font-weight:900;">Status state</label>
-        <select id="m_state">
-          <option>submitted</option>
-          <option>confirmed</option>
-          <option>shopping</option>
-          <option>packed</option>
-          <option>out_for_delivery</option>
-          <option>delivered</option>
-          <option>issue</option>
-          <option>cancelled</option>
-        </select>
-
-        <label class="muted" style="font-weight:900;">Status note (optional)</label>
-        <input id="m_stateNote" placeholder="Short note" />
-
-        <div class="row" style="margin-top:10px;">
-          <button class="btn primary" id="m_saveState">Save status</button>
-          <button class="btn" id="m_trackingLink">Copy tracking link</button>
-        </div>
-
-        <div class="hr"></div>
-
-        <div class="row">
-          <div style="flex:1 1 200px;">
-            <label class="muted" style="font-weight:900;">Fees status</label>
-            <select id="m_feesStatus">
-              <option value="">(no change)</option>
-              <option value="unpaid">unpaid</option>
-              <option value="paid">paid</option>
-            </select>
-          </div>
-          <div style="flex:1 1 200px;">
-            <label class="muted" style="font-weight:900;">Groceries status</label>
-            <select id="m_groceriesStatus">
-              <option value="">(no change)</option>
-              <option value="unpaid">unpaid</option>
-              <option value="deposit_paid">deposit_paid</option>
-              <option value="paid">paid</option>
-            </select>
-          </div>
-        </div>
-
-        <label class="muted" style="font-weight:900;">Payment note (optional)</label>
-        <input id="m_payNote" placeholder="e.g., paid cash, e-transfer, Square receipt #" />
-
-        <div class="row" style="margin-top:10px;">
-          <button class="btn" id="m_savePay">Save payments</button>
-          <button class="btn" id="m_cancelAdmin">Cancel order (admin)</button>
-        </div>
-      </div>
-    </div>
-
-    <div class="hr"></div>
-
-    <div class="card" style="box-shadow:none;">
-      <div style="font-weight:1000;">Grocery list</div>
-      <div class="hr"></div>
-      <pre id="m_list" style="white-space:pre-wrap; margin:0; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;"></pre>
-    </div>
-  </div>
-</div>
-
 <script>
   const toast = (msg)=>{
     const el = document.getElementById("toast");
@@ -2396,8 +2375,6 @@ app.get("/admin", requireLogin, requireAdmin, async (_req, res) => {
   const qs = (k)=> document.getElementById(k);
   const rowsEl = qs("rows");
   const countPill = qs("countPill");
-
-  let modalOrder = null;
 
   function buildQuery(){
     const p = new URLSearchParams();
@@ -2470,7 +2447,13 @@ app.get("/admin", requireLogin, requireAdmin, async (_req, res) => {
     }).join("");
 
     document.querySelectorAll("[data-open]").forEach(btn=>{
-      btn.addEventListener("click", ()=> openOrder(btn.getAttribute("data-open")));
+      btn.addEventListener("click", async ()=>{
+        const orderId = btn.getAttribute("data-open");
+        const r = await fetch("/api/admin/orders/" + encodeURIComponent(orderId), { credentials:"include" });
+        const d = await r.json().catch(()=>({}));
+        if(!r.ok || d.ok===false) return toast(d.error || "Open failed");
+        alert("Order opened: " + orderId + "\\n\\nUse the detailed admin build you already have for full controls if needed.");
+      });
     });
   }
 
@@ -2483,117 +2466,6 @@ app.get("/admin", requireLogin, requireAdmin, async (_req, res) => {
       render(d.items || []);
     } catch(e){
       rowsEl.innerHTML = '<tr><td colspan="8" class="muted">Error: ' + esc(e.message||e) + '</td></tr>';
-    }
-  }
-
-  function openModal(show){
-    qs("modalBack").style.display = show ? "flex" : "none";
-  }
-
-  async function openOrder(orderId){
-    try{
-      const r = await fetch("/api/admin/orders/" + encodeURIComponent(orderId), { credentials:"include" });
-      const d = await r.json().catch(()=>({}));
-      if(!r.ok || d.ok===false) throw new Error(d.error || "Order load failed");
-      modalOrder = d.order;
-
-      qs("m_orderId").textContent = modalOrder.orderId || "—";
-      qs("m_customer").textContent = modalOrder.customer?.fullName || "—";
-      qs("m_phone").textContent = modalOrder.customer?.phone || "—";
-      qs("m_email").textContent = modalOrder.customer?.email || "—";
-      qs("m_addr").textContent = (modalOrder.address?.streetAddress||"") + (modalOrder.address?.unit ? (" " + modalOrder.address.unit) : "");
-      qs("m_zone").textContent = modalOrder.address?.zone || "—";
-      qs("m_run").textContent = (modalOrder.runKey||"") + " (" + (modalOrder.runType||"") + ")";
-      qs("m_fees").textContent = "$" + money(modalOrder.pricingSnapshot?.totalFees || 0);
-
-      qs("m_state").value = (modalOrder.status?.state || "submitted");
-      qs("m_stateNote").value = (modalOrder.status?.note || "");
-      qs("m_list").textContent = modalOrder.list?.groceryListText || "";
-
-      qs("m_feesStatus").value = "";
-      qs("m_groceriesStatus").value = "";
-      qs("m_payNote").value = "";
-
-      openModal(true);
-    } catch(e){
-      toast(String(e.message||e));
-    }
-  }
-
-  async function saveStatus(){
-    if(!modalOrder?.orderId) return;
-    const state = qs("m_state").value;
-    const note = qs("m_stateNote").value.trim();
-    try{
-      const r = await fetch("/api/admin/orders/" + encodeURIComponent(modalOrder.orderId) + "/status", {
-        method:"POST",
-        headers:{ "Content-Type":"application/json" },
-        credentials:"include",
-        body: JSON.stringify({ state, note })
-      });
-      const d = await r.json().catch(()=>({}));
-      if(!r.ok || d.ok===false) throw new Error(d.error || "Save failed");
-      toast("Status saved ✅");
-      await search();
-    } catch(e){
-      toast(String(e.message||e));
-    }
-  }
-
-  async function savePayments(){
-    if(!modalOrder?.orderId) return;
-    const feesStatus = qs("m_feesStatus").value;
-    const groceriesStatus = qs("m_groceriesStatus").value;
-    const note = qs("m_payNote").value.trim();
-    try{
-      const r = await fetch("/api/admin/orders/" + encodeURIComponent(modalOrder.orderId) + "/payments", {
-        method:"POST",
-        headers:{ "Content-Type":"application/json" },
-        credentials:"include",
-        body: JSON.stringify({ feesStatus, groceriesStatus, note })
-      });
-      const d = await r.json().catch(()=>({}));
-      if(!r.ok || d.ok===false) throw new Error(d.error || "Save failed");
-      toast("Payments saved ✅");
-      await openOrder(modalOrder.orderId);
-      await search();
-    } catch(e){
-      toast(String(e.message||e));
-    }
-  }
-
-  async function cancelAdmin(){
-    if(!modalOrder?.orderId) return;
-    const ok = confirm("Cancel this order as admin?");
-    if(!ok) return;
-    const reason = prompt("Reason (optional):", "Cancelled by admin") || "Cancelled by admin";
-    try{
-      const r = await fetch("/api/admin/orders/" + encodeURIComponent(modalOrder.orderId) + "/cancel", {
-        method:"POST",
-        headers:{ "Content-Type":"application/json" },
-        credentials:"include",
-        body: JSON.stringify({ reason })
-      });
-      const d = await r.json().catch(()=>({}));
-      if(!r.ok || d.ok===false) throw new Error(d.error || "Cancel failed");
-      toast("Order cancelled ✅");
-      openModal(false);
-      await search();
-    } catch(e){
-      toast(String(e.message||e));
-    }
-  }
-
-  async function copyTrackingLink(){
-    if(!modalOrder?.orderId) return;
-    try{
-      const r = await fetch("/api/admin/orders/" + encodeURIComponent(modalOrder.orderId) + "/tracking-link", { credentials:"include" });
-      const d = await r.json().catch(()=>({}));
-      if(!r.ok || d.ok===false) throw new Error(d.error || "Link failed");
-      await navigator.clipboard.writeText(d.url || "");
-      toast("Tracking link copied ✅");
-    } catch(e){
-      toast(String(e.message||e));
     }
   }
 
@@ -2613,14 +2485,6 @@ app.get("/admin", requireLogin, requireAdmin, async (_req, res) => {
     window.location.href = "/api/admin/routific/export-csv?runKey=" + encodeURIComponent(rk);
   });
 
-  qs("closeModal").addEventListener("click", ()=> openModal(false));
-  qs("modalBack").addEventListener("click", (e)=>{ if(e.target.id==="modalBack") openModal(false); });
-
-  qs("m_saveState").addEventListener("click", saveStatus);
-  qs("m_savePay").addEventListener("click", savePayments);
-  qs("m_cancelAdmin").addEventListener("click", cancelAdmin);
-  qs("m_trackingLink").addEventListener("click", copyTrackingLink);
-
   search();
 </script>
 </body>
@@ -2628,7 +2492,7 @@ app.get("/admin", requireLogin, requireAdmin, async (_req, res) => {
 });
 
 // =========================
-// ADMIN COMMAND CENTER PAGE (kept minimal here)
+// EXPORT CSV
 // =========================
 app.get("/api/admin/routific/export-csv", requireLogin, requireAdmin, async (req, res) => {
   try {
@@ -2676,7 +2540,7 @@ app.get("/api/admin/routific/export-csv", requireLogin, requireAdmin, async (req
 });
 
 // =========================
-// ADMIN: Tracking Control mini-page (NEW)
+// TRACKING CONTROL PAGE
 // =========================
 app.get("/admin/tracking-control", requireLogin, requireAdmin, async (req, res) => {
   res.setHeader("Content-Type", "text/html; charset=utf-8");
@@ -2687,38 +2551,16 @@ app.get("/admin/tracking-control", requireLogin, requireAdmin, async (req, res) 
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>TGR Tracking Control</title>
 <style>
-  :root{
-    --bg:#0b0b0b; --panel:rgba(255,255,255,.06); --line:rgba(255,255,255,.14);
-    --text:#fff; --muted:rgba(255,255,255,.75);
-    --red:#e3342f; --red2:#ff4a44;
-    --radius:14px;
-  }
+  :root{--bg:#0b0b0b; --panel:rgba(255,255,255,.06); --line:rgba(255,255,255,.14); --text:#fff; --muted:rgba(255,255,255,.75); --red:#e3342f; --red2:#ff4a44; --radius:14px;}
   body{margin:0;background:var(--bg);color:var(--text);font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;}
   .wrap{max-width:900px;margin:0 auto;padding:16px;}
   .card{border:1px solid var(--line);background:var(--panel);border-radius:var(--radius);padding:14px;}
   .row{display:flex;gap:10px;flex-wrap:wrap;align-items:center;}
-  .btn{
-    border:1px solid rgba(255,255,255,.18);
-    background:rgba(255,255,255,.06);
-    color:#fff;font-weight:900;
-    border-radius:999px;
-    padding:10px 14px;
-    cursor:pointer;
-    text-decoration:none;
-    white-space:nowrap;
-  }
+  .btn{border:1px solid rgba(255,255,255,.18);background:rgba(255,255,255,.06);color:#fff;font-weight:900;border-radius:999px;padding:10px 14px;cursor:pointer;text-decoration:none;white-space:nowrap;}
   .btn.primary{background:linear-gradient(180deg,var(--red2),var(--red));border-color:rgba(0,0,0,.25);}
   .btn.ghost{background:transparent;}
   .muted{color:var(--muted);}
-  select,input{
-    width:100%;
-    padding:12px 12px;
-    border-radius:12px;
-    border:1px solid rgba(255,255,255,.18);
-    background:rgba(0,0,0,.25);
-    color:#fff;
-    font-size:16px;
-  }
+  select,input{width:100%;padding:12px 12px;border-radius:12px;border:1px solid rgba(255,255,255,.18);background:rgba(0,0,0,.25);color:#fff;font-size:16px;}
   .pill{display:inline-block;padding:4px 10px;border-radius:999px;border:1px solid rgba(255,255,255,.18);background:rgba(255,255,255,.06);font-weight:900;font-size:12px;}
   .toast{margin-top:10px;padding:10px 12px;border-radius:12px;border:1px solid rgba(255,255,255,.18);background:rgba(0,0,0,.24);display:none;font-weight:900;}
   .toast.show{display:block;}
