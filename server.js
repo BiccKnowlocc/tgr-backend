@@ -1,7 +1,7 @@
 // ======= MY NOTES =======
-// 1) Added POST /api/admin/catalogue/seed endpoint to auto-populate basic groceries.
-// 2) Updated the /admin HTML payload to include the "Seed Defaults" button and logic.
-// 3) All other endpoints, routing, and schema remain exactly as previously established.
+// 1) Added automatic catalogue seeding to the main() boot sequence.
+// 2) The catalogue will automatically populate itself with 55+ items if the database is empty.
+// 3) AddressComplete proxy endpoints remain intact to support the frontend fix.
 
 // ======= server.js (FULL FILE) — TGR backend =======
 const express = require("express");
@@ -760,7 +760,6 @@ app.get("/api/public/catalogue/search", async (req, res) => {
     const q = String(req.query.q || "").trim().toLowerCase();
     if (!q || q.length < 2) return res.json({ ok: true, items: [] });
     
-    // Simple regex search on name and category
     const safeQ = q.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
     const re = new RegExp(safeQ, "i");
     
@@ -804,7 +803,7 @@ app.post("/api/admin/catalogue", requireLogin, requireAdmin, async (req, res) =>
   }
 });
 
-// Seed defaults
+// Seed defaults manually via Admin Panel
 app.post("/api/admin/catalogue/seed", requireLogin, requireAdmin, async (req, res) => {
   try {
     const defaults = [
@@ -812,23 +811,61 @@ app.post("/api/admin/catalogue/seed", requireLogin, requireAdmin, async (req, re
       { name: "Milk (Skim, 2L)", category: "Dairy", estimatedPrice: 4.59 },
       { name: "Eggs (Large, 12)", category: "Dairy", estimatedPrice: 4.29 },
       { name: "Butter (Salted, 454g)", category: "Dairy", estimatedPrice: 6.99 },
+      { name: "Cheddar Cheese (Block, 400g)", category: "Dairy", estimatedPrice: 7.99 },
+      { name: "Yogurt (Vanilla, 650g tub)", category: "Dairy", estimatedPrice: 4.49 },
       { name: "Bread (White)", category: "Bakery", estimatedPrice: 3.49 },
       { name: "Bread (Whole Wheat)", category: "Bakery", estimatedPrice: 3.99 },
+      { name: "Hot Dog Buns (12-pack)", category: "Bakery", estimatedPrice: 3.99 },
       { name: "Bananas (Bunch)", category: "Produce", estimatedPrice: 2.50 },
       { name: "Apples (Bag)", category: "Produce", estimatedPrice: 5.99 },
       { name: "Onions (Yellow, 3lb)", category: "Produce", estimatedPrice: 3.99 },
       { name: "Potatoes (Yellow, 10lb)", category: "Produce", estimatedPrice: 6.99 },
+      { name: "Carrots (2lb bag)", category: "Produce", estimatedPrice: 2.99 },
+      { name: "Romaine Lettuce (Head)", category: "Produce", estimatedPrice: 3.49 },
+      { name: "Tomatoes (Vine, 4-pack)", category: "Produce", estimatedPrice: 4.99 },
+      { name: "Oranges (Bag, 3lb)", category: "Produce", estimatedPrice: 6.99 },
       { name: "Ground Beef (Lean, 1lb)", category: "Meat", estimatedPrice: 7.99 },
       { name: "Chicken Breasts (Boneless, 3-pack)", category: "Meat", estimatedPrice: 12.99 },
       { name: "Bacon (500g)", category: "Meat", estimatedPrice: 7.49 },
+      { name: "Hot Dogs (Wieners, 12-pack)", category: "Meat", estimatedPrice: 5.99 },
+      { name: "Sliced Ham (Deli, 175g)", category: "Deli", estimatedPrice: 6.49 },
+      { name: "Sliced Turkey (Deli, 175g)", category: "Deli", estimatedPrice: 6.99 },
       { name: "Cereal (Cheerios)", category: "Pantry", estimatedPrice: 5.49 },
       { name: "Peanut Butter (Smooth, 500g)", category: "Pantry", estimatedPrice: 6.49 },
       { name: "Pasta (Spaghetti, 500g)", category: "Pantry", estimatedPrice: 2.49 },
       { name: "Pasta Sauce (Tomato & Basil)", category: "Pantry", estimatedPrice: 3.49 },
       { name: "Coffee (Ground, 400g)", category: "Pantry", estimatedPrice: 8.99 },
+      { name: "All-Purpose Flour (2.5kg)", category: "Pantry", estimatedPrice: 5.49 },
+      { name: "White Sugar (2kg)", category: "Pantry", estimatedPrice: 3.99 },
+      { name: "White Rice (Long Grain, 2kg)", category: "Pantry", estimatedPrice: 6.49 },
+      { name: "Canned Soup (Chicken Noodle, 284ml)", category: "Pantry", estimatedPrice: 1.99 },
+      { name: "Canned Soup (Tomato, 284ml)", category: "Pantry", estimatedPrice: 1.49 },
+      { name: "Vegetable Oil (1L)", category: "Pantry", estimatedPrice: 5.99 },
+      { name: "Olive Oil (1L)", category: "Pantry", estimatedPrice: 9.99 },
+      { name: "Canned Baked Beans (398ml)", category: "Pantry", estimatedPrice: 1.99 },
+      { name: "Canned Tuna (Flaked, 170g)", category: "Pantry", estimatedPrice: 2.29 },
+      { name: "Tea Bags (Orange Pekoe, 72-pack)", category: "Pantry", estimatedPrice: 5.99 },
+      { name: "Oatmeal (Instant, 10-pack)", category: "Pantry", estimatedPrice: 4.49 },
       { name: "Toilet Paper (12 Rolls)", category: "Household", estimatedPrice: 10.99 },
       { name: "Paper Towels (6 Rolls)", category: "Household", estimatedPrice: 8.99 },
+      { name: "Dish Soap (800ml)", category: "Household", estimatedPrice: 3.99 },
+      { name: "Laundry Detergent (Liquid, 1.36L)", category: "Household", estimatedPrice: 7.99 },
+      { name: "Garbage Bags (Tall, 40-pack)", category: "Household", estimatedPrice: 8.99 },
+      { name: "Meal Replacement Shakes (Vanilla, 6-pack)", category: "Pharmacy", estimatedPrice: 14.99 },
+      { name: "Meal Replacement Shakes (Chocolate, 6-pack)", category: "Pharmacy", estimatedPrice: 14.99 },
+      { name: "Acetaminophen / Pain Reliever (100 tabs)", category: "Pharmacy", estimatedPrice: 9.99 },
+      { name: "Adult Incontinence Underwear (Large, Pack)", category: "Pharmacy", estimatedPrice: 19.99 },
+      { name: "Frozen Dinner (Meat & Potatoes)", category: "Frozen", estimatedPrice: 5.49 },
+      { name: "Frozen Vegetables (Mixed, 750g)", category: "Frozen", estimatedPrice: 4.99 },
+      { name: "Crackers (Saltines, Box)", category: "Snacks", estimatedPrice: 3.99 },
+      { name: "Dog Food (Dry, 2kg bag)", category: "Pets", estimatedPrice: 11.99 },
+      { name: "Cat Food (Canned, 156g)", category: "Pets", estimatedPrice: 1.29 },
+      { name: "Cat Litter (Clumping, 7kg)", category: "Pets", estimatedPrice: 12.99 },
+      { name: "Firewood (Bag)", category: "Outdoor", estimatedPrice: 10.00 },
+      { name: "Insect Repellent (Aerosol)", category: "Outdoor", estimatedPrice: 8.99 },
+      { name: "Marshmallows (Bag)", category: "Snacks", estimatedPrice: 3.49 }
     ];
+
     for (const item of defaults) {
       await CatalogueItem.findOneAndUpdate(
         { name: item.name },
@@ -1578,6 +1615,83 @@ app.get("/", (_req, res) => res.send("TGR backend up"));
 async function main() {
   await mongoose.connect(MONGODB_URI);
   console.log("Connected to MongoDB");
+
+  // Auto-seed catalogue if empty
+  try {
+    const count = await CatalogueItem.countDocuments();
+    if (count === 0) {
+      const defaults = [
+        { name: "Milk (2%, 4L)", category: "Dairy", estimatedPrice: 6.49 },
+        { name: "Milk (Skim, 2L)", category: "Dairy", estimatedPrice: 4.59 },
+        { name: "Eggs (Large, 12)", category: "Dairy", estimatedPrice: 4.29 },
+        { name: "Butter (Salted, 454g)", category: "Dairy", estimatedPrice: 6.99 },
+        { name: "Cheddar Cheese (Block, 400g)", category: "Dairy", estimatedPrice: 7.99 },
+        { name: "Yogurt (Vanilla, 650g tub)", category: "Dairy", estimatedPrice: 4.49 },
+        { name: "Bread (White)", category: "Bakery", estimatedPrice: 3.49 },
+        { name: "Bread (Whole Wheat)", category: "Bakery", estimatedPrice: 3.99 },
+        { name: "Hot Dog Buns (12-pack)", category: "Bakery", estimatedPrice: 3.99 },
+        { name: "Bananas (Bunch)", category: "Produce", estimatedPrice: 2.50 },
+        { name: "Apples (Bag)", category: "Produce", estimatedPrice: 5.99 },
+        { name: "Onions (Yellow, 3lb)", category: "Produce", estimatedPrice: 3.99 },
+        { name: "Potatoes (Yellow, 10lb)", category: "Produce", estimatedPrice: 6.99 },
+        { name: "Carrots (2lb bag)", category: "Produce", estimatedPrice: 2.99 },
+        { name: "Romaine Lettuce (Head)", category: "Produce", estimatedPrice: 3.49 },
+        { name: "Tomatoes (Vine, 4-pack)", category: "Produce", estimatedPrice: 4.99 },
+        { name: "Oranges (Bag, 3lb)", category: "Produce", estimatedPrice: 6.99 },
+        { name: "Ground Beef (Lean, 1lb)", category: "Meat", estimatedPrice: 7.99 },
+        { name: "Chicken Breasts (Boneless, 3-pack)", category: "Meat", estimatedPrice: 12.99 },
+        { name: "Bacon (500g)", category: "Meat", estimatedPrice: 7.49 },
+        { name: "Hot Dogs (Wieners, 12-pack)", category: "Meat", estimatedPrice: 5.99 },
+        { name: "Sliced Ham (Deli, 175g)", category: "Deli", estimatedPrice: 6.49 },
+        { name: "Sliced Turkey (Deli, 175g)", category: "Deli", estimatedPrice: 6.99 },
+        { name: "Cereal (Cheerios)", category: "Pantry", estimatedPrice: 5.49 },
+        { name: "Peanut Butter (Smooth, 500g)", category: "Pantry", estimatedPrice: 6.49 },
+        { name: "Pasta (Spaghetti, 500g)", category: "Pantry", estimatedPrice: 2.49 },
+        { name: "Pasta Sauce (Tomato & Basil)", category: "Pantry", estimatedPrice: 3.49 },
+        { name: "Coffee (Ground, 400g)", category: "Pantry", estimatedPrice: 8.99 },
+        { name: "All-Purpose Flour (2.5kg)", category: "Pantry", estimatedPrice: 5.49 },
+        { name: "White Sugar (2kg)", category: "Pantry", estimatedPrice: 3.99 },
+        { name: "White Rice (Long Grain, 2kg)", category: "Pantry", estimatedPrice: 6.49 },
+        { name: "Canned Soup (Chicken Noodle, 284ml)", category: "Pantry", estimatedPrice: 1.99 },
+        { name: "Canned Soup (Tomato, 284ml)", category: "Pantry", estimatedPrice: 1.49 },
+        { name: "Vegetable Oil (1L)", category: "Pantry", estimatedPrice: 5.99 },
+        { name: "Olive Oil (1L)", category: "Pantry", estimatedPrice: 9.99 },
+        { name: "Canned Baked Beans (398ml)", category: "Pantry", estimatedPrice: 1.99 },
+        { name: "Canned Tuna (Flaked, 170g)", category: "Pantry", estimatedPrice: 2.29 },
+        { name: "Tea Bags (Orange Pekoe, 72-pack)", category: "Pantry", estimatedPrice: 5.99 },
+        { name: "Oatmeal (Instant, 10-pack)", category: "Pantry", estimatedPrice: 4.49 },
+        { name: "Toilet Paper (12 Rolls)", category: "Household", estimatedPrice: 10.99 },
+        { name: "Paper Towels (6 Rolls)", category: "Household", estimatedPrice: 8.99 },
+        { name: "Dish Soap (800ml)", category: "Household", estimatedPrice: 3.99 },
+        { name: "Laundry Detergent (Liquid, 1.36L)", category: "Household", estimatedPrice: 7.99 },
+        { name: "Garbage Bags (Tall, 40-pack)", category: "Household", estimatedPrice: 8.99 },
+        { name: "Meal Replacement Shakes (Vanilla, 6-pack)", category: "Pharmacy", estimatedPrice: 14.99 },
+        { name: "Meal Replacement Shakes (Chocolate, 6-pack)", category: "Pharmacy", estimatedPrice: 14.99 },
+        { name: "Acetaminophen / Pain Reliever (100 tabs)", category: "Pharmacy", estimatedPrice: 9.99 },
+        { name: "Adult Incontinence Underwear (Large, Pack)", category: "Pharmacy", estimatedPrice: 19.99 },
+        { name: "Frozen Dinner (Meat & Potatoes)", category: "Frozen", estimatedPrice: 5.49 },
+        { name: "Frozen Vegetables (Mixed, 750g)", category: "Frozen", estimatedPrice: 4.99 },
+        { name: "Crackers (Saltines, Box)", category: "Snacks", estimatedPrice: 3.99 },
+        { name: "Dog Food (Dry, 2kg bag)", category: "Pets", estimatedPrice: 11.99 },
+        { name: "Cat Food (Canned, 156g)", category: "Pets", estimatedPrice: 1.29 },
+        { name: "Cat Litter (Clumping, 7kg)", category: "Pets", estimatedPrice: 12.99 },
+        { name: "Firewood (Bag)", category: "Outdoor", estimatedPrice: 10.00 },
+        { name: "Insect Repellent (Aerosol)", category: "Outdoor", estimatedPrice: 8.99 },
+        { name: "Marshmallows (Bag)", category: "Snacks", estimatedPrice: 3.49 }
+      ];
+      for (const item of defaults) {
+        await CatalogueItem.findOneAndUpdate(
+          { name: item.name },
+          { $set: item },
+          { upsert: true }
+        );
+      }
+      console.log("Catalogue auto-seeded with defaults.");
+    }
+  } catch (e) {
+    console.error("Auto-seed failed:", e);
+  }
+
   app.listen(PORT, () => console.log("Server running on port", PORT));
 }
 main().catch((err) => {
