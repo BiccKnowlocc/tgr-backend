@@ -1124,12 +1124,26 @@ app.get(
   async (req, res) => {
     const rt = req.session.returnTo || (PUBLIC_SITE_URL + "/");
     delete req.session.returnTo;
+    
     try {
       const u = await User.findById(req.user._id).lean();
+      
+      // If the request came from our new popup flow, send a script to close the window
+      if (rt === "popup") {
+        return res.send("<script>window.close();</script>");
+      }
+      
+      // Fallback for standard redirects
       if (!isProfileComplete(u?.profile || {})) {
         return res.redirect(PUBLIC_SITE_URL + "/?tab=account&onboarding=1");
       }
     } catch {}
+    
+    // Fallback in case of an error or missing profile
+    if (rt === "popup") {
+       return res.send("<script>window.close();</script>");
+    }
+    
     res.redirect(rt);
   }
 );
