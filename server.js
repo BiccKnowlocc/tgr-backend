@@ -1,8 +1,7 @@
 // ======= MY NOTES =======
-// 1) Added CatalogueItem Mongoose Schema.
-// 2) Added public endpoint: /api/public/catalogue/search
-// 3) Added admin endpoints: /api/admin/catalogue (GET, POST, DELETE)
-// 4) Updated the /admin HTML payload to include a "Catalogue Manager" card.
+// 1) Added POST /api/admin/catalogue/seed endpoint to auto-populate basic groceries.
+// 2) Updated the /admin HTML payload to include the "Seed Defaults" button and logic.
+// 3) All other endpoints, routing, and schema remain exactly as previously established.
 
 // ======= server.js (FULL FILE) — TGR backend =======
 const express = require("express");
@@ -461,7 +460,7 @@ const TrackingSchema = new mongoose.Schema(
   { timestamps: true }
 );
 
-// New Schema for the Frequent Items Database
+// Frequent Items Database
 const CatalogueItemSchema = new mongoose.Schema(
   {
     name: { type: String, required: true, unique: true, trim: true },
@@ -801,6 +800,44 @@ app.post("/api/admin/catalogue", requireLogin, requireAdmin, async (req, res) =>
     );
     res.json({ ok: true, item });
   } catch (e) {
+    res.status(500).json({ ok: false, error: String(e) });
+  }
+});
+
+// Seed defaults
+app.post("/api/admin/catalogue/seed", requireLogin, requireAdmin, async (req, res) => {
+  try {
+    const defaults = [
+      { name: "Milk (2%, 4L)", category: "Dairy", estimatedPrice: 6.49 },
+      { name: "Milk (Skim, 2L)", category: "Dairy", estimatedPrice: 4.59 },
+      { name: "Eggs (Large, 12)", category: "Dairy", estimatedPrice: 4.29 },
+      { name: "Butter (Salted, 454g)", category: "Dairy", estimatedPrice: 6.99 },
+      { name: "Bread (White)", category: "Bakery", estimatedPrice: 3.49 },
+      { name: "Bread (Whole Wheat)", category: "Bakery", estimatedPrice: 3.99 },
+      { name: "Bananas (Bunch)", category: "Produce", estimatedPrice: 2.50 },
+      { name: "Apples (Bag)", category: "Produce", estimatedPrice: 5.99 },
+      { name: "Onions (Yellow, 3lb)", category: "Produce", estimatedPrice: 3.99 },
+      { name: "Potatoes (Yellow, 10lb)", category: "Produce", estimatedPrice: 6.99 },
+      { name: "Ground Beef (Lean, 1lb)", category: "Meat", estimatedPrice: 7.99 },
+      { name: "Chicken Breasts (Boneless, 3-pack)", category: "Meat", estimatedPrice: 12.99 },
+      { name: "Bacon (500g)", category: "Meat", estimatedPrice: 7.49 },
+      { name: "Cereal (Cheerios)", category: "Pantry", estimatedPrice: 5.49 },
+      { name: "Peanut Butter (Smooth, 500g)", category: "Pantry", estimatedPrice: 6.49 },
+      { name: "Pasta (Spaghetti, 500g)", category: "Pantry", estimatedPrice: 2.49 },
+      { name: "Pasta Sauce (Tomato & Basil)", category: "Pantry", estimatedPrice: 3.49 },
+      { name: "Coffee (Ground, 400g)", category: "Pantry", estimatedPrice: 8.99 },
+      { name: "Toilet Paper (12 Rolls)", category: "Household", estimatedPrice: 10.99 },
+      { name: "Paper Towels (6 Rolls)", category: "Household", estimatedPrice: 8.99 },
+    ];
+    for (const item of defaults) {
+      await CatalogueItem.findOneAndUpdate(
+        { name: item.name },
+        { $set: item },
+        { upsert: true }
+      );
+    }
+    res.json({ ok: true });
+  } catch(e) {
     res.status(500).json({ ok: false, error: String(e) });
   }
 });
@@ -1274,6 +1311,7 @@ app.get("/admin", requireLogin, requireAdmin, async (_req, res) => {
           </div>
           <div class="row" style="margin-top:12px;">
              <button class="btn primary" id="addCatBtn">Add Item</button>
+             <button class="btn ghost" id="seedCatBtn">Seed Defaults</button>
           </div>
         </div>
         <div class="card" style="box-shadow:none;">
@@ -1474,6 +1512,17 @@ app.get("/admin", requireLogin, requireAdmin, async (_req, res) => {
       if(!d.ok) throw new Error(d.error || "Add failed");
       toast("Item added ✅");
       qs('catName').value = ''; qs('catCategory').value = ''; qs('catPrice').value = '';
+      loadCatalogue();
+    } catch(e) { toast(String(e.message || e)); }
+  });
+
+  qs('seedCatBtn').addEventListener('click', async () => {
+    if(!confirm("Add standard default grocery items to the catalogue?")) return;
+    try {
+      const r = await fetch('/api/admin/catalogue/seed', { method: 'POST', credentials: 'include' });
+      const d = await r.json();
+      if(!d.ok) throw new Error(d.error || "Seed failed");
+      toast("Defaults added ✅");
       loadCatalogue();
     } catch(e) { toast(String(e.message || e)); }
   });
