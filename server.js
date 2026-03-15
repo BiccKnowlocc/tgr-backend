@@ -1,38 +1,10 @@
 // ======= MY NOTES =======
-// 1) Restored the /admin page so the View/Open button now opens an in-page modal instead of a placeholder alert.
-// 2) Wired the restored admin modal to EXISTING endpoints already present in this file:
-//    - GET    /api/admin/orders/:orderId
-//    - POST   /api/admin/orders/:orderId/status
-//    - POST   /api/admin/orders/:orderId/payments
-//    - POST   /api/admin/orders/:orderId/cancel
-//    - DELETE /api/admin/orders/:orderId
-//    - GET    /api/admin/orders/:orderId/tracking-link
-// 3) Added admin modal controls for:
-//    - viewing full order details
-//    - updating status + note
-//    - updating fees/groceries payment status + note
-//    - copying tracking link
-//    - cancelling an order
-//    - deleting an order
-// 4) Kept everything else as-is unless required for the admin page to function.
-// 5) No pricing logic, order logic, OAuth, memberships, tracking endpoints, member portal, or AddressComplete backend routes were changed.
-// 6) If anything breaks, your rollback target is this file version with the restored full /admin page modal and controls only.
+// 1) Added CatalogueItem Mongoose Schema.
+// 2) Added public endpoint: /api/public/catalogue/search
+// 3) Added admin endpoints: /api/admin/catalogue (GET, POST, DELETE)
+// 4) Updated the /admin HTML payload to include a "Catalogue Manager" card.
 
 // ======= server.js (FULL FILE) — TGR backend =======
-// Google OAuth, profile onboarding, biweekly runs, estimator, orders, cancel tokens
-// FULL ADMIN COMMAND CENTER + endpoints
-// ADMIN Tracking Control mini-page: /admin/tracking-control (GPS broadcast from phone)
-// MEMBER PORTAL (/member) + embedded live map (Mapbox) for active orders when tracking enabled
-// AddressComplete proxy endpoints kept
-//
-// Order IDs: TGR-LOC-YYYYMMDD-XXXXXX or TGR-OWEN-YYYYMMDD-XXXXXX
-//
-// ISSUE #2 COMPLETE:
-// - Membership pricing/catalog authority moved to backend
-// - Frontend should fetch membership plans from /api/public/config or /api/public/memberships
-// - Estimator prefers backend-active membership when user is logged in
-// - Order pricing no longer trusts client-supplied membership tier; it uses backend account state
-
 const express = require("express");
 const mongoose = require("mongoose");
 const multer = require("multer");
@@ -276,9 +248,7 @@ const MEMBERSHIP_PLANS = {
     monthlyPrice: 15,
     link: SQUARE_LINK_STANDARD,
     eligibility: "",
-    perks: [
-      "1 free add-on up to $10 OR $10 off zone fee monthly",
-    ],
+    perks: ["1 free add-on up to $10 OR $10 off zone fee monthly"],
   },
   route: {
     id: "route",
@@ -286,10 +256,7 @@ const MEMBERSHIP_PLANS = {
     monthlyPrice: 25,
     link: SQUARE_LINK_ROUTE,
     eligibility: "",
-    perks: [
-      "1 free add-on up to $10 OR $10 off zone fee monthly",
-      "$5 off service fee on 1 order per run day",
-    ],
+    perks: ["1 free add-on up to $10 OR $10 off zone fee monthly", "$5 off service fee on 1 order per run day"],
   },
   access: {
     id: "access",
@@ -297,11 +264,7 @@ const MEMBERSHIP_PLANS = {
     monthlyPrice: 12,
     link: SQUARE_LINK_ACCESS,
     eligibility: "Seniors 60+ or disabled / mobility-limited / low income",
-    perks: [
-      "1 free add-on up to $10 OR $10 off zone fee per run cycle",
-      "$8 off service fee on 1 order per run day",
-      "Free phone/text ordering",
-    ],
+    perks: ["1 free add-on up to $10 OR $10 off zone fee per run cycle", "$8 off service fee on 1 order per run day", "Free phone/text ordering"],
   },
   accesspro: {
     id: "accesspro",
@@ -309,11 +272,7 @@ const MEMBERSHIP_PLANS = {
     monthlyPrice: 20,
     link: SQUARE_LINK_ACCESSPRO,
     eligibility: "Enhanced support tier",
-    perks: [
-      "$10 off service fee on 1 order per run day",
-      "1 prescription pickup/delivery included monthly",
-      "Document services included up to 10 pages/month in Tobermory area",
-    ],
+    perks: ["$10 off service fee on 1 order per run day", "1 prescription pickup/delivery included monthly", "Document services included up to 10 pages/month in Tobermory area"],
   },
 };
 
@@ -364,21 +323,11 @@ function calcPrinting(pages) {
 }
 
 function membershipDiscounts(tier, applyPerkYes) {
-  if (!tier || !applyPerkYes)
-    return { serviceOff: 0, zoneOff: 0, freeAddonUpTo: 0, waitWaived: false };
-
-  if (tier === "standard")
-    return { serviceOff: 0, zoneOff: 10, freeAddonUpTo: 10, waitWaived: false };
-
-  if (tier === "route")
-    return { serviceOff: 5, zoneOff: 10, freeAddonUpTo: 10, waitWaived: false };
-
-  if (tier === "access")
-    return { serviceOff: 8, zoneOff: 10, freeAddonUpTo: 10, waitWaived: true };
-
-  if (tier === "accesspro")
-    return { serviceOff: 10, zoneOff: 0, freeAddonUpTo: 0, waitWaived: true };
-
+  if (!tier || !applyPerkYes) return { serviceOff: 0, zoneOff: 0, freeAddonUpTo: 0, waitWaived: false };
+  if (tier === "standard") return { serviceOff: 0, zoneOff: 10, freeAddonUpTo: 10, waitWaived: false };
+  if (tier === "route") return { serviceOff: 5, zoneOff: 10, freeAddonUpTo: 10, waitWaived: false };
+  if (tier === "access") return { serviceOff: 8, zoneOff: 10, freeAddonUpTo: 10, waitWaived: true };
+  if (tier === "accesspro") return { serviceOff: 10, zoneOff: 0, freeAddonUpTo: 0, waitWaived: true };
   return { serviceOff: 0, zoneOff: 0, freeAddonUpTo: 0, waitWaived: false };
 }
 
@@ -402,24 +351,8 @@ const RunSchema = new mongoose.Schema(
   { timestamps: true }
 );
 
-const AllowedStates = [
-  "submitted",
-  "confirmed",
-  "shopping",
-  "packed",
-  "out_for_delivery",
-  "delivered",
-  "issue",
-  "cancelled",
-];
-
-const ACTIVE_STATES = new Set([
-  "submitted",
-  "confirmed",
-  "shopping",
-  "packed",
-  "out_for_delivery",
-]);
+const AllowedStates = ["submitted", "confirmed", "shopping", "packed", "out_for_delivery", "delivered", "issue", "cancelled"];
+const ACTIVE_STATES = new Set(["submitted", "confirmed", "shopping", "packed", "out_for_delivery"]);
 
 const OrderSchema = new mongoose.Schema(
   {
@@ -466,42 +399,13 @@ const OrderSchema = new mongoose.Schema(
     },
 
     addOns: {
-      prescription: {
-        requested: { type: Boolean, default: false },
-        pharmacyName: { type: String, default: "" },
-        notes: { type: String, default: "" },
-      },
-      liquor: {
-        requested: { type: Boolean, default: false },
-        storeName: { type: String, default: "" },
-        notes: { type: String, default: "" },
-        idRequired: { type: Boolean, default: true },
-      },
-      printing: {
-        requested: { type: Boolean, default: false },
-        pages: { type: Number, default: 0 },
-        notes: { type: String, default: "" },
-      },
-      fastFood: {
-        requested: { type: Boolean, default: false },
-        restaurant: { type: String, default: "" },
-        orderDetails: { type: String, default: "" },
-      },
-      parcel: {
-        requested: { type: Boolean, default: false },
-        carrier: { type: String, default: "" },
-        details: { type: String, default: "" },
-      },
-      bulky: {
-        requested: { type: Boolean, default: false },
-        details: { type: String, default: "" },
-      },
-      ride: {
-        requested: { type: Boolean, default: false },
-        pickupAddress: { type: String, default: "" },
-        preferredWindow: { type: String, default: "" },
-        notes: { type: String, default: "" },
-      },
+      prescription: { requested: { type: Boolean, default: false }, pharmacyName: { type: String, default: "" }, notes: { type: String, default: "" } },
+      liquor: { requested: { type: Boolean, default: false }, storeName: { type: String, default: "" }, notes: { type: String, default: "" }, idRequired: { type: Boolean, default: true } },
+      printing: { requested: { type: Boolean, default: false }, pages: { type: Number, default: 0 }, notes: { type: String, default: "" } },
+      fastFood: { requested: { type: Boolean, default: false }, restaurant: { type: String, default: "" }, orderDetails: { type: String, default: "" } },
+      parcel: { requested: { type: Boolean, default: false }, carrier: { type: String, default: "" }, details: { type: String, default: "" } },
+      bulky: { requested: { type: Boolean, default: false }, details: { type: String, default: "" } },
+      ride: { requested: { type: Boolean, default: false }, pickupAddress: { type: String, default: "" }, preferredWindow: { type: String, default: "" }, notes: { type: String, default: "" } },
       generalNotes: { type: String, default: "" },
     },
 
@@ -526,52 +430,16 @@ const OrderSchema = new mongoose.Schema(
 
     consents: { terms: Boolean, accuracy: Boolean, dropoff: Boolean },
 
-    pricingSnapshot: {
-      serviceFee: Number,
-      zoneFee: Number,
-      runFee: Number,
-      addOnsFees: Number,
-      surcharges: Number,
-      discount: Number,
-      totalFees: Number,
-    },
+    pricingSnapshot: { serviceFee: Number, zoneFee: Number, runFee: Number, addOnsFees: Number, surcharges: Number, discount: Number, totalFees: Number },
 
     payments: {
-      fees: {
-        status: { type: String, default: "unpaid" },
-        note: { type: String, default: "" },
-        paidAt: { type: Date, default: null },
-      },
-      groceries: {
-        status: { type: String, default: "unpaid" },
-        note: { type: String, default: "" },
-        paidAt: { type: Date, default: null },
-      },
+      fees: { status: { type: String, default: "unpaid" }, note: { type: String, default: "" }, paidAt: { type: Date, default: null } },
+      groceries: { status: { type: String, default: "unpaid" }, note: { type: String, default: "" }, paidAt: { type: Date, default: null } },
     },
 
-    status: {
-      state: { type: String, enum: AllowedStates, default: "submitted" },
-      note: { type: String, default: "" },
-      updatedAt: { type: Date, default: Date.now },
-      updatedBy: { type: String, default: "system" },
-    },
-
-    statusHistory: {
-      type: [
-        {
-          state: { type: String, enum: AllowedStates },
-          note: String,
-          at: Date,
-          by: String,
-        },
-      ],
-      default: [],
-    },
-
-    adminLog: {
-      type: [{ at: Date, by: String, action: String, meta: Object }],
-      default: [],
-    },
+    status: { state: { type: String, enum: AllowedStates, default: "submitted" }, note: { type: String, default: "" }, updatedAt: { type: Date, default: Date.now }, updatedBy: { type: String, default: "system" } },
+    statusHistory: { type: [{ state: { type: String, enum: AllowedStates }, note: String, at: Date, by: String }], default: [] },
+    adminLog: { type: [{ at: Date, by: String, action: String, meta: Object }], default: [] },
   },
   { timestamps: true }
 );
@@ -593,9 +461,30 @@ const TrackingSchema = new mongoose.Schema(
   { timestamps: true }
 );
 
+// New Schema for the Frequent Items Database
+const CatalogueItemSchema = new mongoose.Schema(
+  {
+    name: { type: String, required: true, unique: true, trim: true },
+    category: { type: String, default: "General", trim: true },
+    estimatedPrice: { type: Number, default: 0 },
+    searchTokens: { type: [String], default: [] }
+  },
+  { timestamps: true }
+);
+
+// Auto-generate search tokens before saving
+CatalogueItemSchema.pre('save', function(next) {
+  if (this.isModified('name') || this.isModified('category')) {
+    const raw = `${this.name} ${this.category}`.toLowerCase().replace(/[^a-z0-9\s]/g, '');
+    this.searchTokens = Array.from(new Set(raw.split(/\s+/).filter(t => t.length > 1)));
+  }
+  next();
+});
+
 const Run = mongoose.model("Run", RunSchema);
 const Order = mongoose.model("Order", OrderSchema);
 const Tracking = mongoose.model("Tracking", TrackingSchema);
+const CatalogueItem = mongoose.model("CatalogueItem", CatalogueItemSchema);
 
 // =========================
 // HELPERS
@@ -700,20 +589,9 @@ function money(n) {
   return x.toFixed(2);
 }
 
-// ===== Cancel token helpers =====
-function base64urlEncode(buf) {
-  return Buffer.from(buf).toString("base64").replaceAll("+", "-").replaceAll("/", "_").replaceAll("=", "");
-}
-function base64urlDecodeToString(b64url) {
-  const pad = b64url.length % 4 ? "=".repeat(4 - (b64url.length % 4)) : "";
-  const b64 = b64url.replaceAll("-", "+").replaceAll("_", "/") + pad;
-  return Buffer.from(b64, "base64").toString("utf8");
-}
-function signCancelToken(orderId, expMs) {
-  const payload = `${orderId}.${String(expMs)}`;
-  const sig = crypto.createHmac("sha256", CANCEL_TOKEN_SECRET).update(payload).digest();
-  return `${base64urlEncode(payload)}.${base64urlEncode(sig)}`;
-}
+function base64urlEncode(buf) { return Buffer.from(buf).toString("base64").replaceAll("+", "-").replaceAll("/", "_").replaceAll("=", ""); }
+function base64urlDecodeToString(b64url) { const pad = b64url.length % 4 ? "=".repeat(4 - (b64url.length % 4)) : ""; const b64 = b64url.replaceAll("-", "+").replaceAll("_", "/") + pad; return Buffer.from(b64, "base64").toString("utf8"); }
+function signCancelToken(orderId, expMs) { const payload = `${orderId}.${String(expMs)}`; const sig = crypto.createHmac("sha256", CANCEL_TOKEN_SECRET).update(payload).digest(); return `${base64urlEncode(payload)}.${base64urlEncode(sig)}`; }
 function verifyCancelToken(orderId, token) {
   try {
     const parts = String(token || "").trim().split(".");
@@ -723,65 +601,42 @@ function verifyCancelToken(orderId, token) {
     const [oid, expStr] = payloadStr.split(".");
     const expMs = Number(expStr);
     if (oid !== orderId || !Number.isFinite(expMs)) return { ok: false };
-
     const expectedSig = crypto.createHmac("sha256", CANCEL_TOKEN_SECRET).update(payloadStr).digest();
     const expectedB64 = base64urlEncode(expectedSig);
-
-    const a = Buffer.from(sigB64);
-    const b = Buffer.from(expectedB64);
-    if (a.length !== b.length) return { ok: false };
-    if (!crypto.timingSafeEqual(a, b)) return { ok: false };
+    const a = Buffer.from(sigB64); const b = Buffer.from(expectedB64);
+    if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) return { ok: false };
     return { ok: true, expMs };
-  } catch {
-    return { ok: false };
-  }
+  } catch { return { ok: false }; }
 }
 
-// ===== Tracking token helpers =====
-function signTrackingToken(orderId, runKey, expMs) {
-  const payload = `${orderId}.${runKey}.${String(expMs)}`;
-  const sig = crypto.createHmac("sha256", TRACKING_TOKEN_SECRET).update(payload).digest();
-  return `${base64urlEncode(payload)}.${base64urlEncode(sig)}`;
-}
+function signTrackingToken(orderId, runKey, expMs) { const payload = `${orderId}.${runKey}.${String(expMs)}`; const sig = crypto.createHmac("sha256", TRACKING_TOKEN_SECRET).update(payload).digest(); return `${base64urlEncode(payload)}.${base64urlEncode(sig)}`; }
 function verifyTrackingToken(token) {
   try {
     const parts = String(token || "").trim().split(".");
     if (parts.length !== 2) return { ok: false };
     const payloadStr = base64urlDecodeToString(parts[0]);
     const sigB64 = parts[1];
-
     const segs = payloadStr.split(".");
     if (segs.length < 3) return { ok: false };
     const orderId = segs[0];
     const expStr = segs[segs.length - 1];
     const runKey = segs.slice(1, -1).join(".");
-
     const expMs = Number(expStr);
     if (!orderId || !runKey || !Number.isFinite(expMs)) return { ok: false };
-
     const expectedSig = crypto.createHmac("sha256", TRACKING_TOKEN_SECRET).update(payloadStr).digest();
     const expectedB64 = base64urlEncode(expectedSig);
-
-    const a = Buffer.from(sigB64);
-    const b = Buffer.from(expectedB64);
-    if (a.length !== b.length) return { ok: false };
-    if (!crypto.timingSafeEqual(a, b)) return { ok: false };
+    const a = Buffer.from(sigB64); const b = Buffer.from(expectedB64);
+    if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) return { ok: false };
     if (Date.now() > expMs) return { ok: false, error: "expired" };
-
     return { ok: true, orderId, runKey, expMs };
-  } catch {
-    return { ok: false };
-  }
+  } catch { return { ok: false }; }
 }
 
-// ===== Order ID =====
 async function nextOrderId(runType, runKey) {
   const type = String(runType || "").toLowerCase();
   const prefix = type === "owen" ? "OWEN" : "LOC";
-
   const datePart = String(runKey || "").slice(0, 10).replaceAll("-", "");
   const runDate = /^\d{8}$/.test(datePart) ? datePart : dayjs().tz(TZ).format("YYYYMMDD");
-
   for (let i = 0; i < 24; i++) {
     const n = crypto.randomInt(0, 1000000);
     const rand = String(n).padStart(6, "0");
@@ -789,7 +644,6 @@ async function nextOrderId(runType, runKey) {
     const exists = await Order.exists({ orderId: candidate });
     if (!exists) return candidate;
   }
-
   const n = crypto.randomInt(0, 100000000);
   return `TGR-${prefix}-${runDate}-${String(n).padStart(8, "0")}`;
 }
@@ -799,84 +653,40 @@ function safeJsonArray(str) {
     const v = JSON.parse(str || "[]");
     if (Array.isArray(v)) return v.map((x) => String(x || "").trim()).filter(Boolean);
     return [];
-  } catch {
-    return [];
-  }
+  } catch { return []; }
 }
 
 function computeFeeBreakdown(input) {
   const zone = String(input.zone || "");
   const runType = String(input.runType || "local");
-
-  const extraStores = Array.isArray(input.extraStores)
-    ? input.extraStores.map(String).map((s) => s.trim()).filter(Boolean)
-    : safeJsonArray(input.extraStoresJson);
-
+  const extraStores = Array.isArray(input.extraStores) ? input.extraStores.map(String).map((s) => s.trim()).filter(Boolean) : safeJsonArray(input.extraStoresJson);
   const pages = Math.max(0, Number(input.printPages || 0));
   const grocerySubtotal = Math.max(0, Number(input.grocerySubtotal || 0));
-
   const memberTier = String(input.memberTier || "");
   const applyPerk = String(input.applyPerk || "yes") === "yes";
   const disc = membershipDiscounts(memberTier, applyPerk);
-
   const serviceFee = PRICING.serviceFee;
   const zoneFee = PRICING.zone[zone] || 0;
   const runFee = runType === "owen" ? PRICING.owenRunFeePerOrder : 0;
-
   let addOnsFees = 0;
   if (extraStores.length) addOnsFees += extraStores.length * PRICING.addOns.extraStore;
   if (String(input.addon_printing || "") === "yes" && pages > 0) addOnsFees += calcPrinting(pages);
-
   let surcharges = 0;
-  if (grocerySubtotal > 0 && grocerySubtotal < PRICING.groceryUnderMin.threshold) {
-    surcharges += PRICING.groceryUnderMin.surcharge;
-  }
-
+  if (grocerySubtotal > 0 && grocerySubtotal < PRICING.groceryUnderMin.threshold) surcharges += PRICING.groceryUnderMin.surcharge;
   const serviceOff = Math.min(serviceFee, disc.serviceOff || 0);
   const optionA = Math.min(zoneFee, disc.zoneOff || 0);
   const optionB = Math.min(addOnsFees + runFee, disc.freeAddonUpTo || 0);
   const bestOr = Math.max(optionA, optionB);
   const discount = serviceOff + bestOr;
-
-  const totalFees = Math.max(
-    0,
-    serviceFee + zoneFee + runFee + addOnsFees + surcharges - discount
-  );
-
-  return {
-    totals: {
-      serviceFee,
-      zoneFee,
-      runFee,
-      addOnsFees,
-      surcharges,
-      discount,
-      totalFees,
-    },
-  };
+  const totalFees = Math.max(0, serviceFee + zoneFee + runFee + addOnsFees + surcharges - discount);
+  return { totals: { serviceFee, zoneFee, runFee, addOnsFees, surcharges, discount, totalFees } };
 }
 
 // =========================
 // RUN SCHEDULING
 // =========================
-function runKeyToDayjs(runKey) {
-  try {
-    const dateStr = String(runKey || "").slice(0, 10);
-    const d = dayjs(dateStr).tz(TZ);
-    return d.isValid() ? d : null;
-  } catch {
-    return null;
-  }
-}
-
-function nextDow(targetDow, from) {
-  let d = dayjs(from).tz(TZ);
-  const current = d.day();
-  let diff = (targetDow - current + 7) % 7;
-  if (diff === 0) diff = 7;
-  return d.add(diff, "day");
-}
-
+function runKeyToDayjs(runKey) { try { const dateStr = String(runKey || "").slice(0, 10); const d = dayjs(dateStr).tz(TZ); return d.isValid() ? d : null; } catch { return null; } }
+function nextDow(targetDow, from) { let d = dayjs(from).tz(TZ); const current = d.day(); let diff = (targetDow - current + 7) % 7; if (diff === 0) diff = 7; return d.add(diff, "day"); }
 function computeTimesForDelivery(deliveryDayjs, type) {
   const delivery = dayjs(deliveryDayjs).tz(TZ);
   if (type === "local") {
@@ -888,14 +698,10 @@ function computeTimesForDelivery(deliveryDayjs, type) {
   const opens = delivery.subtract(6, "day").hour(0).minute(0).second(0).millisecond(0);
   return { delivery, cutoff, opens };
 }
-
 function runMinimumConfig(type) {
-  if (type === "local") {
-    return { minOrders: 6, minFees: 200, minLogic: "OR", minimumText: "Minimum: 6 orders OR $200 booked fees" };
-  }
+  if (type === "local") return { minOrders: 6, minFees: 200, minLogic: "OR", minimumText: "Minimum: 6 orders OR $200 booked fees" };
   return { minOrders: 6, minFees: 300, minLogic: "AND", minimumText: "Minimum: 6 orders AND $300 booked fees" };
 }
-
 function meetsMinimums(run) {
   if (run.minLogic === "AND") return run.bookedOrdersCount >= run.minOrders && run.bookedFeesTotal >= run.minFees;
   return run.bookedOrdersCount >= run.minOrders || run.bookedFeesTotal >= run.minFees;
@@ -903,15 +709,10 @@ function meetsMinimums(run) {
 
 async function getOrCreateNextRun(type) {
   const now = nowTz();
-
-  let existing = await Run.findOne({ type, cutoffAt: { $gt: now.toDate() } })
-    .sort({ opensAt: 1 })
-    .lean();
-
+  let existing = await Run.findOne({ type, cutoffAt: { $gt: now.toDate() } }).sort({ opensAt: 1 }).lean();
   if (existing) {
     const opensAt = dayjs(existing.opensAt).tz(TZ);
     const cutoffAt = dayjs(existing.cutoffAt).tz(TZ);
-
     if (now.isBefore(cutoffAt) && now.isBefore(opensAt)) {
       const forced = now.subtract(1, "minute").toDate();
       await Run.updateOne({ runKey: existing.runKey }, { $set: { opensAt: forced } });
@@ -919,9 +720,7 @@ async function getOrCreateNextRun(type) {
     }
     return existing;
   }
-
   const latest = await Run.findOne({ type }).sort({ opensAt: -1 }).lean();
-
   let delivery;
   if (latest?.runKey) {
     const lastDelivery = runKeyToDayjs(latest.runKey);
@@ -929,24 +728,11 @@ async function getOrCreateNextRun(type) {
   } else {
     delivery = type === "local" ? nextDow(6, now) : nextDow(0, now);
   }
-
   let { cutoff, opens } = computeTimesForDelivery(delivery, type);
   if (opens.isAfter(now)) opens = now.subtract(1, "minute");
-
   const runKey = delivery.format("YYYY-MM-DD") + "-" + type;
   const cfg = runMinimumConfig(type);
-
-  const created = await Run.create({
-    runKey,
-    type,
-    opensAt: opens.toDate(),
-    cutoffAt: cutoff.toDate(),
-    maxSlots: 12,
-    minOrders: cfg.minOrders,
-    minFees: cfg.minFees,
-    minLogic: cfg.minLogic,
-  });
-
+  const created = await Run.create({ runKey, type, opensAt: opens.toDate(), cutoffAt: cutoff.toDate(), maxSlots: 12, minOrders: cfg.minOrders, minFees: cfg.minFees, minLogic: cfg.minLogic });
   return created.toObject();
 }
 
@@ -954,43 +740,85 @@ async function ensureUpcomingRuns() {
   const out = {};
   for (const type of ["local", "owen"]) {
     let run = await getOrCreateNextRun(type);
-
-    const needsRecalc =
-      !run.lastRecalcAt ||
-      dayjs(run.lastRecalcAt).isBefore(nowTz().subtract(60, "second").toDate());
-
+    const needsRecalc = !run.lastRecalcAt || dayjs(run.lastRecalcAt).isBefore(nowTz().subtract(60, "second").toDate());
     if (needsRecalc) {
-      const agg = await Order.aggregate([
-        { $match: { runKey: run.runKey, "status.state": { $in: Array.from(ACTIVE_STATES) } } },
-        { $group: { _id: "$runKey", c: { $sum: 1 }, fees: { $sum: "$pricingSnapshot.totalFees" } } },
-      ]);
+      const agg = await Order.aggregate([{ $match: { runKey: run.runKey, "status.state": { $in: Array.from(ACTIVE_STATES) } } }, { $group: { _id: "$runKey", c: { $sum: 1 }, fees: { $sum: "$pricingSnapshot.totalFees" } } }]);
       const c = agg?.[0]?.c || 0;
       const fees = agg?.[0]?.fees || 0;
-
-      await Run.updateOne(
-        { runKey: run.runKey },
-        { $set: { bookedOrdersCount: c, bookedFeesTotal: fees, lastRecalcAt: new Date() } }
-      );
-
-      run.bookedOrdersCount = c;
-      run.bookedFeesTotal = fees;
-      run.lastRecalcAt = new Date();
+      await Run.updateOne({ runKey: run.runKey }, { $set: { bookedOrdersCount: c, bookedFeesTotal: fees, lastRecalcAt: new Date() } });
+      run.bookedOrdersCount = c; run.bookedFeesTotal = fees; run.lastRecalcAt = new Date();
     }
-
     out[type] = run;
   }
   return out;
 }
 
 // =========================
+// CATALOGUE API
+// =========================
+app.get("/api/public/catalogue/search", async (req, res) => {
+  try {
+    const q = String(req.query.q || "").trim().toLowerCase();
+    if (!q || q.length < 2) return res.json({ ok: true, items: [] });
+    
+    // Simple regex search on name and category
+    const safeQ = q.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const re = new RegExp(safeQ, "i");
+    
+    const items = await CatalogueItem.find({
+      $or: [{ name: re }, { category: re }]
+    }).limit(15).lean();
+    
+    res.json({ ok: true, items });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: String(e) });
+  }
+});
+
+app.get("/api/admin/catalogue", requireLogin, requireAdmin, async (req, res) => {
+  try {
+    const items = await CatalogueItem.find().sort({ category: 1, name: 1 }).lean();
+    res.json({ ok: true, items });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: String(e) });
+  }
+});
+
+app.post("/api/admin/catalogue", requireLogin, requireAdmin, async (req, res) => {
+  try {
+    const { name, category, estimatedPrice } = req.body;
+    if (!name) return res.status(400).json({ ok: false, error: "Name is required" });
+    
+    const item = await CatalogueItem.findOneAndUpdate(
+      { name: String(name).trim() },
+      { 
+        $set: { 
+          category: String(category || "General").trim(), 
+          estimatedPrice: Number(estimatedPrice || 0) 
+        } 
+      },
+      { upsert: true, new: true }
+    );
+    res.json({ ok: true, item });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: String(e) });
+  }
+});
+
+app.delete("/api/admin/catalogue/:id", requireLogin, requireAdmin, async (req, res) => {
+  try {
+    await CatalogueItem.findByIdAndDelete(req.params.id);
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: String(e) });
+  }
+});
+
+// =========================
 // TRACKING
 // =========================
 async function ensureTrackingDoc(runKey) {
-  const t = await Tracking.findOneAndUpdate(
-    { runKey },
-    { $setOnInsert: { runKey, enabled: false, startedAt: null, stoppedAt: null, updatedBy: "system" } },
-    { upsert: true, new: true }
-  ).lean();
+  const t = await Tracking.findOneAndUpdate({ runKey }, { $setOnInsert: { runKey, enabled: false, startedAt: null, stoppedAt: null, updatedBy: "system" } }, { upsert: true, new: true }).lean();
   return t;
 }
 
@@ -998,39 +826,17 @@ app.get("/api/public/tracking/:runKey", async (req, res) => {
   try {
     const runKey = String(req.params.runKey || "").trim();
     const token = String(req.query.token || "").trim();
-
     const vt = verifyTrackingToken(token);
     if (!vt.ok) return res.status(403).json({ ok: false, error: "Invalid tracking token." });
     if (vt.runKey !== runKey) return res.status(403).json({ ok: false, error: "Token/run mismatch." });
-
     const order = await Order.findOne({ orderId: vt.orderId, runKey }).lean();
     if (!order) return res.status(404).json({ ok: false, error: "Order not found." });
-
     const state = order?.status?.state || "submitted";
-    if (!ACTIVE_STATES.has(state)) {
-      return res.status(403).json({ ok: false, error: "Tracking is only available for active orders." });
-    }
-
+    if (!ACTIVE_STATES.has(state)) return res.status(403).json({ ok: false, error: "Tracking is only available for active orders." });
     const t = await ensureTrackingDoc(runKey);
     if (!t.enabled) return res.json({ ok: true, enabled: false, hasFix: false });
-
-    if (!t.lastAt || typeof t.lastLat !== "number" || typeof t.lastLng !== "number") {
-      return res.json({ ok: true, enabled: true, hasFix: false });
-    }
-
-    res.json({
-      ok: true,
-      enabled: true,
-      hasFix: true,
-      last: {
-        lat: t.lastLat,
-        lng: t.lastLng,
-        heading: t.lastHeading,
-        speed: t.lastSpeed,
-        accuracy: t.lastAccuracy,
-        at: t.lastAt,
-      },
-    });
+    if (!t.lastAt || typeof t.lastLat !== "number" || typeof t.lastLng !== "number") return res.json({ ok: true, enabled: true, hasFix: false });
+    res.json({ ok: true, enabled: true, hasFix: true, last: { lat: t.lastLat, lng: t.lastLng, heading: t.lastHeading, speed: t.lastSpeed, accuracy: t.lastAccuracy, at: t.lastAt } });
   } catch (e) {
     res.status(500).json({ ok: false, error: String(e) });
   }
@@ -1040,211 +846,71 @@ app.get("/api/public/tracking/:runKey", async (req, res) => {
 // AddressComplete proxy
 // =========================
 function proxyRemote(url, res, contentType) {
-  res.setHeader("Cache-Control", "no-store, max-age=0");
-  res.setHeader("Content-Type", contentType);
-
-  https
-    .get(url, (r) => {
-      if (r.statusCode && r.statusCode >= 300 && r.statusCode < 400 && r.headers.location) {
-        return proxyRemote(r.headers.location, res, contentType);
-      }
-      if (r.statusCode !== 200) {
-        res.statusCode = 502;
-        let body = "";
-        r.on("data", (c) => (body += c.toString("utf8")));
-        r.on("end", () => {
-          res.end(`Upstream error (${r.statusCode}): ${body.slice(0, 400)}`);
-        });
-        return;
-      }
-      r.pipe(res);
-    })
-    .on("error", (e) => {
-      res.statusCode = 502;
-      res.end("Proxy error: " + String(e));
-    });
+  res.setHeader("Cache-Control", "no-store, max-age=0"); res.setHeader("Content-Type", contentType);
+  https.get(url, (r) => {
+    if (r.statusCode && r.statusCode >= 300 && r.statusCode < 400 && r.headers.location) return proxyRemote(r.headers.location, res, contentType);
+    if (r.statusCode !== 200) {
+      res.statusCode = 502; let body = ""; r.on("data", (c) => (body += c.toString("utf8"))); r.on("end", () => { res.end(`Upstream error (${r.statusCode}): ${body.slice(0, 400)}`); });
+      return;
+    }
+    r.pipe(res);
+  }).on("error", (e) => { res.statusCode = 502; res.end("Proxy error: " + String(e)); });
 }
 
-app.get("/vendor/addresscomplete.css", (_req, res) => {
-  const url = `https://ws1.postescanada-canadapost.ca/css/addresscomplete-2.50.min.css?key=${encodeURIComponent(CANADAPOST_KEY)}`;
-  proxyRemote(url, res, "text/css; charset=utf-8");
-});
-
-app.get("/vendor/addresscomplete.js", (_req, res) => {
-  const url = `https://ws1.postescanada-canadapost.ca/js/addresscomplete-2.50.min.js?key=${encodeURIComponent(CANADAPOST_KEY)}`;
-  proxyRemote(url, res, "application/javascript; charset=utf-8");
-});
-
-app.get("/api/public/addresscomplete", (_req, res) => {
-  res.json({
-    ok: true,
-    css: `https://api.tobermorygroceryrun.ca/vendor/addresscomplete.css`,
-    js: `https://api.tobermorygroceryrun.ca/vendor/addresscomplete.js`,
-  });
-});
+app.get("/vendor/addresscomplete.css", (_req, res) => { proxyRemote(`https://ws1.postescanada-canadapost.ca/css/addresscomplete-2.30.min.css?key=${encodeURIComponent(CANADAPOST_KEY)}`, res, "text/css; charset=utf-8"); });
+app.get("/vendor/addresscomplete.js", (_req, res) => { proxyRemote(`https://ws1.postescanada-canadapost.ca/js/addresscomplete-2.30.min.js?key=${encodeURIComponent(CANADAPOST_KEY)}`, res, "application/javascript; charset=utf-8"); });
+app.get("/api/public/addresscomplete", (_req, res) => { res.json({ ok: true, css: `https://api.tobermorygroceryrun.ca/vendor/addresscomplete.css`, js: `https://api.tobermorygroceryrun.ca/vendor/addresscomplete.js` }); });
 
 // =========================
 // PUBLIC CONFIG
 // =========================
-app.get("/api/public/config", (_req, res) => {
-  res.json({
-    ok: true,
-    mapboxPublicToken: MAPBOX_PUBLIC_TOKEN || "",
-    canadaPostKey: CANADAPOST_KEY || "",
-    squareMembershipLinks: {
-      standard: SQUARE_LINK_STANDARD,
-      route: SQUARE_LINK_ROUTE,
-      access: SQUARE_LINK_ACCESS,
-      accesspro: SQUARE_LINK_ACCESSPRO,
-    }
-  });
-});
-
-app.get("/api/public/memberships", (_req, res) => {
-  res.json({
-    ok: true,
-    plans: getPublicMembershipPlans(),
-  });
-});
+app.get("/api/public/config", (_req, res) => { res.json({ ok: true, mapboxPublicToken: MAPBOX_PUBLIC_TOKEN || "", canadaPostKey: CANADAPOST_KEY || "", squareMembershipLinks: { standard: SQUARE_LINK_STANDARD, route: SQUARE_LINK_ROUTE, access: SQUARE_LINK_ACCESS, accesspro: SQUARE_LINK_ACCESSPRO } }); });
+app.get("/api/public/memberships", (_req, res) => { res.json({ ok: true, plans: getPublicMembershipPlans() }); });
 
 // =========================
 // AUTH ROUTES
 // =========================
 app.get("/auth/google", (req, res, next) => {
-  if (!GOOGLE_CLIENT_ID || !GOOGLE_CLIENT_SECRET || !GOOGLE_CALLBACK_URL) {
-    return res.status(500).send("Google auth is not configured on this server.");
-  }
-  req.session.returnTo = String(req.query.returnTo || (PUBLIC_SITE_URL + "/")).trim();
-  return passport.authenticate("google", { scope: ["profile", "email"] })(req, res, next);
+  if (!GOOGLE_CLIENT_ID || !GOOGLE_CLIENT_SECRET || !GOOGLE_CALLBACK_URL) return res.status(500).send("Google auth is not configured on this server.");
+  const rt = String(req.query.returnTo || "").trim();
+  const state = rt === "popup" ? "popup" : "home";
+  return passport.authenticate("google", { scope: ["profile", "email"], state })(req, res, next);
 });
 
-app.get(
-  "/auth/google/callback",
-  passport.authenticate("google", { failureRedirect: PUBLIC_SITE_URL + "/?login=failed" }),
-  async (req, res) => {
-    const rt = req.session.returnTo || (PUBLIC_SITE_URL + "/");
-    delete req.session.returnTo;
-    
-    try {
-      const u = await User.findById(req.user._id).lean();
-      
-      // If the request came from our new popup flow, send a script to close the window
-      if (rt === "popup") {
-        return res.send("<script>window.close();</script>");
-      }
-      
-      // Fallback for standard redirects
-      if (!isProfileComplete(u?.profile || {})) {
-        return res.redirect(PUBLIC_SITE_URL + "/?tab=account&onboarding=1");
-      }
-    } catch {}
-    
-    // Fallback in case of an error or missing profile
-    if (rt === "popup") {
-       return res.send("<script>window.close();</script>");
-    }
-    
-    res.redirect(rt);
-  }
-);
-
-app.get("/logout", (req, res) => {
-  const returnTo = String(req.query.returnTo || (PUBLIC_SITE_URL + "/")).trim();
-  req.session.destroy(() => res.redirect(returnTo));
+app.get("/auth/google/callback", passport.authenticate("google", { failureRedirect: PUBLIC_SITE_URL + "/?login=failed" }), async (req, res) => {
+  const state = String(req.query.state || "");
+  if (state === "popup") return res.send("<script>window.close();</script>");
+  try {
+    const u = await User.findById(req.user._id).lean();
+    if (!isProfileComplete(u?.profile || {})) return res.redirect(PUBLIC_SITE_URL + "/?tab=account&onboarding=1");
+  } catch {}
+  res.redirect(PUBLIC_SITE_URL + "/");
 });
+app.get("/logout", (req, res) => { const returnTo = String(req.query.returnTo || (PUBLIC_SITE_URL + "/")).trim(); req.session.destroy(() => res.redirect(returnTo)); });
 
 // =========================
 // API: ME + PROFILE
 // =========================
-app.get("/api/me", (req, res) => {
-  const u = req.user;
-  const activeTier = getEffectiveMemberTierForUser(u);
-  res.json({
-    ok: true,
-    loggedIn: !!u,
-    email: u?.email || null,
-    name: u?.name || "",
-    photo: u?.photo || "",
-    membershipLevel: u?.membershipLevel || "none",
-    membershipStatus: u?.membershipStatus || "inactive",
-    effectiveMembershipTier: activeTier || "",
-    renewalDate: u?.renewalDate || null,
-    profileComplete: isProfileComplete(u?.profile || {}),
-    isAdmin: !!u?.email && isAdminEmail(u.email),
-  });
-});
-
-app.get("/api/profile", requireLogin, async (req, res) => {
-  const u = await User.findById(req.user._id).lean();
-  res.json({
-    ok: true,
-    profile: u?.profile || {},
-    profileComplete: isProfileComplete(u?.profile || {}),
-    email: u?.email || "",
-    name: u?.name || "",
-    photo: u?.photo || "",
-  });
-});
-
+app.get("/api/me", (req, res) => { const u = req.user; const activeTier = getEffectiveMemberTierForUser(u); res.json({ ok: true, loggedIn: !!u, email: u?.email || null, name: u?.name || "", photo: u?.photo || "", membershipLevel: u?.membershipLevel || "none", membershipStatus: u?.membershipStatus || "inactive", effectiveMembershipTier: activeTier || "", renewalDate: u?.renewalDate || null, profileComplete: isProfileComplete(u?.profile || {}), isAdmin: !!u?.email && isAdminEmail(u.email) }); });
+app.get("/api/profile", requireLogin, async (req, res) => { const u = await User.findById(req.user._id).lean(); res.json({ ok: true, profile: u?.profile || {}, profileComplete: isProfileComplete(u?.profile || {}), email: u?.email || "", name: u?.name || "", photo: u?.photo || "" }); });
 app.post("/api/profile", requireLogin, async (req, res) => {
   try {
     const b = req.body || {};
     const u = await User.findById(req.user._id);
     if (!u) return res.status(404).json({ ok: false, error: "User not found" });
-
     const addresses = Array.isArray(b.addresses) ? b.addresses : [];
-
     const newProfile = {
-      version: 1,
-      fullName: String(b.fullName || "").trim(),
-      preferredName: String(b.preferredName || "").trim(),
-      phone: String(b.phone || "").trim(),
-      altPhone: String(b.altPhone || "").trim(),
-      contactPref: String(b.contactPref || "").trim(),
-      contactAuth: yn(b.contactAuth),
-
-      subsDefault: String(b.subsDefault || "").trim(),
-      dropoffDefault: String(b.dropoffDefault || "").trim(),
-
-      customerType: String(b.customerType || "").trim(),
-      accessibility: String(b.accessibility || "").trim(),
-      dietary: String(b.dietary || "").trim(),
-      notes: String(b.notes || "").trim(),
-
-      addresses: addresses.map((a) => ({
-        id: String(a.id || "").trim() || String(Math.random()).slice(2),
-        label: String(a.label || "").trim(),
-        town: String(a.town || "").trim(),
-        zone: String(a.zone || "").trim(),
-        streetAddress: String(a.streetAddress || "").trim(),
-        unit: String(a.unit || "").trim(),
-        postalCode: String(a.postalCode || "").trim(),
-        instructions: String(a.instructions || "").trim(),
-        gateCode: String(a.gateCode || "").trim(),
-      })),
-
-      defaultId: String(b.defaultId || "").trim(),
-
-      consentTerms: yn(b.consentTerms),
-      consentPrivacy: yn(b.consentPrivacy),
-      consentMarketing: yn(b.consentMarketing),
+      version: 1, fullName: String(b.fullName || "").trim(), preferredName: String(b.preferredName || "").trim(), phone: String(b.phone || "").trim(), altPhone: String(b.altPhone || "").trim(), contactPref: String(b.contactPref || "").trim(), contactAuth: yn(b.contactAuth),
+      subsDefault: String(b.subsDefault || "").trim(), dropoffDefault: String(b.dropoffDefault || "").trim(),
+      customerType: String(b.customerType || "").trim(), accessibility: String(b.accessibility || "").trim(), dietary: String(b.dietary || "").trim(), notes: String(b.notes || "").trim(),
+      addresses: addresses.map((a) => ({ id: String(a.id || "").trim() || String(Math.random()).slice(2), label: String(a.label || "").trim(), town: String(a.town || "").trim(), zone: String(a.zone || "").trim(), streetAddress: String(a.streetAddress || "").trim(), unit: String(a.unit || "").trim(), postalCode: String(a.postalCode || "").trim(), instructions: String(a.instructions || "").trim(), gateCode: String(a.gateCode || "").trim() })),
+      defaultId: String(b.defaultId || "").trim(), consentTerms: yn(b.consentTerms), consentPrivacy: yn(b.consentPrivacy), consentMarketing: yn(b.consentMarketing),
     };
-
-    if (!newProfile.defaultId && newProfile.addresses.length) {
-      newProfile.defaultId = newProfile.addresses[0].id;
-    }
-
-    newProfile.complete = isProfileComplete(newProfile);
-    newProfile.completedAt = newProfile.complete ? new Date().toISOString() : null;
-
-    u.profile = newProfile;
-    u.markModified("profile");
-    await u.save();
-
+    if (!newProfile.defaultId && newProfile.addresses.length) newProfile.defaultId = newProfile.addresses[0].id;
+    newProfile.complete = isProfileComplete(newProfile); newProfile.completedAt = newProfile.complete ? new Date().toISOString() : null;
+    u.profile = newProfile; u.markModified("profile"); await u.save();
     res.json({ ok: true, profileComplete: newProfile.complete === true, profile: newProfile });
-  } catch (e) {
-    res.status(500).json({ ok: false, error: String(e) });
-  }
+  } catch (e) { res.status(500).json({ ok: false, error: String(e) }); }
 });
 
 // =========================
@@ -1253,67 +919,29 @@ app.post("/api/profile", requireLogin, async (req, res) => {
 app.get("/api/runs/active", async (_req, res) => {
   try {
     const runs = await ensureUpcomingRuns();
-    const now = nowTz();
-    const out = {};
+    const now = nowTz(); const out = {};
     for (const type of ["local", "owen"]) {
-      const run = runs[type];
-      const opensAt = dayjs(run.opensAt).tz(TZ);
-      const cutoffAt = dayjs(run.cutoffAt).tz(TZ);
-      const windowOpen = now.isAfter(opensAt) && now.isBefore(cutoffAt);
-      const slotsRemaining = Math.max(0, (run.maxSlots || 12) - (run.bookedOrdersCount || 0));
+      const run = runs[type]; const opensAt = dayjs(run.opensAt).tz(TZ); const cutoffAt = dayjs(run.cutoffAt).tz(TZ);
+      const windowOpen = now.isAfter(opensAt) && now.isBefore(cutoffAt); const slotsRemaining = Math.max(0, (run.maxSlots || 12) - (run.bookedOrdersCount || 0));
       const minCfg = runMinimumConfig(type);
-
-      out[type] = {
-        runKey: run.runKey,
-        type: run.type,
-        maxSlots: run.maxSlots || 12,
-        bookedOrdersCount: run.bookedOrdersCount || 0,
-        bookedFeesTotal: run.bookedFeesTotal || 0,
-        slotsRemaining,
-        isOpen: windowOpen && slotsRemaining > 0,
-        opensAtLocal: fmtLocal(run.opensAt),
-        cutoffAtLocal: fmtLocal(run.cutoffAt),
-        meetsMinimums: meetsMinimums(run),
-        minimumText: minCfg.minimumText,
-        cutoffAtISO: run.cutoffAt,
-        opensAtISO: run.opensAt,
-      };
+      out[type] = { runKey: run.runKey, type: run.type, maxSlots: run.maxSlots || 12, bookedOrdersCount: run.bookedOrdersCount || 0, bookedFeesTotal: run.bookedFeesTotal || 0, slotsRemaining, isOpen: windowOpen && slotsRemaining > 0, opensAtLocal: fmtLocal(run.opensAt), cutoffAtLocal: fmtLocal(run.cutoffAt), meetsMinimums: meetsMinimums(run), minimumText: minCfg.minimumText, cutoffAtISO: run.cutoffAt, opensAtISO: run.opensAt };
     }
     res.json({ ok: true, runs: out });
-  } catch (e) {
-    res.status(500).json({ ok: false, error: String(e) });
-  }
+  } catch (e) { res.status(500).json({ ok: false, error: String(e) }); }
 });
 
 app.post("/api/estimator", (req, res) => {
   try {
     const effectiveMemberTier = getEffectiveMemberTierForUser(req.user, req.body?.memberTier || "");
-    const breakdown = computeFeeBreakdown({
-      ...(req.body || {}),
-      memberTier: effectiveMemberTier,
-      applyPerk: "yes",
-    });
-    res.json({
-      ok: true,
-      effectiveMemberTier,
-      breakdown,
-    });
-  } catch (e) {
-    res.status(500).json({ ok: false, error: String(e) });
-  }
+    const breakdown = computeFeeBreakdown({ ...(req.body || {}), memberTier: effectiveMemberTier, applyPerk: "yes" });
+    res.json({ ok: true, effectiveMemberTier, breakdown });
+  } catch (e) { res.status(500).json({ ok: false, error: String(e) }); }
 });
 
 // =========================
 // ORDERS
 // =========================
-function pickDefaultAddress(profile) {
-  const p = profile || {};
-  const arr = Array.isArray(p.addresses) ? p.addresses : [];
-  if (!arr.length) return null;
-  const defId = String(p.defaultId || "").trim();
-  const found = defId ? arr.find((a) => String(a.id) === defId) : null;
-  return found || arr[0] || null;
-}
+function pickDefaultAddress(profile) { const p = profile || {}; const arr = Array.isArray(p.addresses) ? p.addresses : []; if (!arr.length) return null; const defId = String(p.defaultId || "").trim(); const found = defId ? arr.find((a) => String(a.id) === defId) : null; return found || arr[0] || null; }
 
 app.post("/api/orders", requireLogin, requireProfileComplete, upload.single("groceryFile"), async (req, res) => {
   try {
@@ -1321,265 +949,86 @@ app.post("/api/orders", requireLogin, requireProfileComplete, upload.single("gro
     const user = await User.findById(req.user._id).lean();
     const profile = user?.profile || {};
 
-    if (!yn(b.consent_terms) || !yn(b.consent_accuracy) || !yn(b.consent_dropoff)) {
-      return res.status(400).json({ ok: false, error: "All required consents must be accepted." });
-    }
+    if (!yn(b.consent_terms) || !yn(b.consent_accuracy) || !yn(b.consent_dropoff)) return res.status(400).json({ ok: false, error: "All required consents must be accepted." });
 
-    const dob = String(b.dob || "").trim();
-    const altPhone = String(b.altPhone || "").trim();
-
-    const addPrescription = yn(b.addon_prescription);
-    const addLiquor = yn(b.addon_liquor);
-    const addPrinting = yn(b.addon_printing);
-    const addFastFood = yn(b.addon_fastfood);
-    const addParcel = yn(b.addon_parcel);
-    const addBulky = yn(b.addon_bulky);
-    const addRide = yn(b.addon_ride);
-
-    const prescriptionPharmacy = String(b.prescriptionPharmacy || "").trim();
-    const prescriptionNotes = String(b.prescriptionNotes || "").trim();
-
-    const liquorStore = String(b.liquorStore || "").trim();
-    const liquorNotes = String(b.liquorNotes || "").trim();
-
+    const dob = String(b.dob || "").trim(); const altPhone = String(b.altPhone || "").trim();
+    const addPrescription = yn(b.addon_prescription); const addLiquor = yn(b.addon_liquor); const addPrinting = yn(b.addon_printing); const addFastFood = yn(b.addon_fastfood); const addParcel = yn(b.addon_parcel); const addBulky = yn(b.addon_bulky); const addRide = yn(b.addon_ride);
+    const prescriptionPharmacy = String(b.prescriptionPharmacy || "").trim(); const prescriptionNotes = String(b.prescriptionNotes || "").trim();
+    const liquorStore = String(b.liquorStore || "").trim(); const liquorNotes = String(b.liquorNotes || "").trim();
     const printingNotes = String(b.printingNotes || "").trim();
-
-    const fastFoodRestaurant = String(b.fastFoodRestaurant || "").trim();
-    const fastFoodOrder = String(b.fastFoodOrder || "").trim();
-
-    const parcelCarrier = String(b.parcelCarrier || "").trim();
-    const parcelDetails = String(b.parcelDetails || "").trim();
-
+    const fastFoodRestaurant = String(b.fastFoodRestaurant || "").trim(); const fastFoodOrder = String(b.fastFoodOrder || "").trim();
+    const parcelCarrier = String(b.parcelCarrier || "").trim(); const parcelDetails = String(b.parcelDetails || "").trim();
     const bulkyDetails = String(b.bulkyDetails || "").trim();
-
-    const ridePickup = String(b.ridePickup || "").trim();
-    const rideWindow = String(b.rideWindow || "").trim();
-    const rideNotes = String(b.rideNotes || "").trim();
-
+    const ridePickup = String(b.ridePickup || "").trim(); const rideWindow = String(b.rideWindow || "").trim(); const rideNotes = String(b.rideNotes || "").trim();
     const generalNotes = String(b.optionalNotes || "").trim();
-
-    const gateCode = String(b.gateCode || "").trim();
-    const buildingAccessNotes = String(b.buildingAccessNotes || "").trim();
-    const parkingNotes = String(b.parkingNotes || "").trim();
-    const budgetCap = Math.max(0, Number(b.budgetCap || 0));
-    const receiptPreference = String(b.receiptPreference || "").trim();
-    const photoProofOk = yn(b.photoProofOk);
+    const gateCode = String(b.gateCode || "").trim(); const buildingAccessNotes = String(b.buildingAccessNotes || "").trim(); const parkingNotes = String(b.parkingNotes || "").trim(); const budgetCap = Math.max(0, Number(b.budgetCap || 0)); const receiptPreference = String(b.receiptPreference || "").trim(); const photoProofOk = yn(b.photoProofOk);
 
     const runs = await ensureUpcomingRuns();
-    const runType = String(b.runType || "");
-    const run = runs[runType];
+    const runType = String(b.runType || ""); const run = runs[runType];
     if (!run) return res.status(400).json({ ok: false, error: "Invalid runType." });
 
-    const now = nowTz();
-    const opensAt = dayjs(run.opensAt).tz(TZ);
-    const cutoffAt = dayjs(run.cutoffAt).tz(TZ);
-    if (!(now.isAfter(opensAt) && now.isBefore(cutoffAt))) {
-      return res.status(403).json({ ok: false, error: "Ordering is closed for this run." });
-    }
+    const now = nowTz(); const opensAt = dayjs(run.opensAt).tz(TZ); const cutoffAt = dayjs(run.cutoffAt).tz(TZ);
+    if (!(now.isAfter(opensAt) && now.isBefore(cutoffAt))) return res.status(403).json({ ok: false, error: "Ordering is closed for this run." });
 
     const defAddr = pickDefaultAddress(profile);
+    const fullName = String(b.fullName || profile.fullName || user.name || "").trim(); const phone = String(b.phone || profile.phone || "").trim();
+    const town = String(b.town || defAddr?.town || "").trim(); const streetAddress = String(b.streetAddress || defAddr?.streetAddress || "").trim(); const unit = String(b.unit || defAddr?.unit || "").trim(); const postalCode = String(b.postalCode || defAddr?.postalCode || "").trim(); const zone = String(b.zone || defAddr?.zone || "").trim();
+    const primaryStore = String(b.primaryStore || "").trim(); const groceryList = String(b.groceryList || "").trim();
+    const dropoffPref = String(b.dropoffPref || profile.dropoffDefault || "").trim(); const subsPref = String(b.subsPref || profile.subsDefault || "").trim(); const contactPref = String(b.contactPref || profile.contactPref || "").trim();
 
-    const fullName = String(b.fullName || profile.fullName || user.name || "").trim();
-    const phone = String(b.phone || profile.phone || "").trim();
-
-    const town = String(b.town || defAddr?.town || "").trim();
-    const streetAddress = String(b.streetAddress || defAddr?.streetAddress || "").trim();
-    const unit = String(b.unit || defAddr?.unit || "").trim();
-    const postalCode = String(b.postalCode || defAddr?.postalCode || "").trim();
-    const zone = String(b.zone || defAddr?.zone || "").trim();
-
-    const primaryStore = String(b.primaryStore || "").trim();
-    const groceryList = String(b.groceryList || "").trim();
-
-    const dropoffPref = String(b.dropoffPref || profile.dropoffDefault || "").trim();
-    const subsPref = String(b.subsPref || profile.subsDefault || "").trim();
-    const contactPref = String(b.contactPref || profile.contactPref || "").trim();
-
-    const required = [
-      ["fullName", fullName],
-      ["phone", phone],
-      ["town", town],
-      ["streetAddress", streetAddress],
-      ["postalCode", postalCode],
-      ["zone", zone],
-      ["runType", runType],
-      ["primaryStore", primaryStore],
-      ["groceryList", groceryList],
-      ["dropoffPref", dropoffPref],
-      ["subsPref", subsPref],
-      ["contactPref", contactPref],
-    ];
-    for (const [k, v] of required) {
-      if (!String(v || "").trim()) {
-        return res.status(400).json({ ok: false, error: "Missing required field: " + k });
-      }
-    }
+    const required = [["fullName", fullName], ["phone", phone], ["town", town], ["streetAddress", streetAddress], ["postalCode", postalCode], ["zone", zone], ["runType", runType], ["primaryStore", primaryStore], ["groceryList", groceryList], ["dropoffPref", dropoffPref], ["subsPref", subsPref], ["contactPref", contactPref]];
+    for (const [k, v] of required) { if (!String(v || "").trim()) return res.status(400).json({ ok: false, error: "Missing required field: " + k }); }
 
     const orderId = await nextOrderId(runType, run.runKey);
     const extraStores = safeJsonArray(b.extraStores);
-
     let attachment = null;
-    if (req.file) {
-      attachment = {
-        originalName: req.file.originalname,
-        mimeType: req.file.mimetype,
-        size: req.file.size,
-        path: req.file.path,
-      };
-    }
+    if (req.file) attachment = { originalName: req.file.originalname, mimeType: req.file.mimetype, size: req.file.size, path: req.file.path };
 
     const effectiveMemberTier = getEffectiveMemberTierForUser(user, "");
-
-    const pricingSnapshot = computeFeeBreakdown({
-      zone,
-      runType,
-      extraStores,
-      grocerySubtotal: Number(b.grocerySubtotal || 0),
-      addon_printing: b.addon_printing || "no",
-      printPages: Number(b.printPages || 0),
-      memberTier: effectiveMemberTier,
-      applyPerk: "yes",
-    }).totals;
+    const pricingSnapshot = computeFeeBreakdown({ zone, runType, extraStores, grocerySubtotal: Number(b.grocerySubtotal || 0), addon_printing: b.addon_printing || "no", printPages: Number(b.printPages || 0), memberTier: effectiveMemberTier, applyPerk: "yes" }).totals;
 
     const maxSlots = run.maxSlots || 12;
-    const runUpdate = await Run.findOneAndUpdate(
-      { runKey: run.runKey, bookedOrdersCount: { $lt: maxSlots } },
-      { $inc: { bookedOrdersCount: 1, bookedFeesTotal: pricingSnapshot.totalFees }, $set: { lastRecalcAt: new Date() } },
-      { new: true }
-    ).lean();
-
+    const runUpdate = await Run.findOneAndUpdate({ runKey: run.runKey, bookedOrdersCount: { $lt: maxSlots } }, { $inc: { bookedOrdersCount: 1, bookedFeesTotal: pricingSnapshot.totalFees }, $set: { lastRecalcAt: new Date() } }, { new: true }).lean();
     if (!runUpdate) return res.status(409).json({ ok: false, error: "This run is full." });
 
     const created = await Order.create({
-      orderId,
-      runKey: run.runKey,
-      runType,
-
-      hold: false,
-
-      flags: {
-        prescription: addPrescription,
-        alcohol: addLiquor,
-        bulky: addBulky,
-        idRequired: addLiquor,
-      },
-
-      customer: {
-        fullName,
-        email: String(user.email || "").trim().toLowerCase(),
-        phone,
-        altPhone,
-        dob,
-      },
-
-      address: { town, streetAddress, unit, postalCode, zone },
-      stores: { primary: primaryStore, extra: extraStores },
-      preferences: { dropoffPref, subsPref, contactPref, contactAuth: true },
-
-      addOns: {
-        prescription: { requested: addPrescription, pharmacyName: prescriptionPharmacy, notes: prescriptionNotes },
-        liquor: { requested: addLiquor, storeName: liquorStore, notes: liquorNotes, idRequired: true },
-        printing: { requested: addPrinting, pages: Math.max(0, Number(b.printPages || 0)), notes: printingNotes },
-        fastFood: { requested: addFastFood, restaurant: fastFoodRestaurant, orderDetails: fastFoodOrder },
-        parcel: { requested: addParcel, carrier: parcelCarrier, details: parcelDetails },
-        bulky: { requested: addBulky, details: bulkyDetails },
-        ride: { requested: addRide, pickupAddress: ridePickup, preferredWindow: rideWindow, notes: rideNotes },
-        generalNotes,
-      },
-
-      deliveryMeta: {
-        gateCode,
-        buildingAccessNotes,
-        parkingNotes,
-        budgetCap,
-        receiptPreference,
-        photoProofOk,
-      },
-
-      list: { groceryListText: groceryList, attachment },
-      consents: { terms: true, accuracy: true, dropoff: true },
-      pricingSnapshot,
-      payments: { fees: { status: "unpaid" }, groceries: { status: "unpaid" } },
-      status: { state: "submitted", note: "", updatedAt: new Date(), updatedBy: "customer" },
-      statusHistory: [{ state: "submitted", note: "", at: new Date(), by: "customer" }],
-      adminLog: [{
-        at: new Date(),
-        by: "system",
-        action: "order_created",
-        meta: { runKey: run.runKey, effectiveMemberTier },
-      }],
+      orderId, runKey: run.runKey, runType, hold: false,
+      flags: { prescription: addPrescription, alcohol: addLiquor, bulky: addBulky, idRequired: addLiquor },
+      customer: { fullName, email: String(user.email || "").trim().toLowerCase(), phone, altPhone, dob },
+      address: { town, streetAddress, unit, postalCode, zone }, stores: { primary: primaryStore, extra: extraStores }, preferences: { dropoffPref, subsPref, contactPref, contactAuth: true },
+      addOns: { prescription: { requested: addPrescription, pharmacyName: prescriptionPharmacy, notes: prescriptionNotes }, liquor: { requested: addLiquor, storeName: liquorStore, notes: liquorNotes, idRequired: true }, printing: { requested: addPrinting, pages: Math.max(0, Number(b.printPages || 0)), notes: printingNotes }, fastFood: { requested: addFastFood, restaurant: fastFoodRestaurant, orderDetails: fastFoodOrder }, parcel: { requested: addParcel, carrier: parcelCarrier, details: parcelDetails }, bulky: { requested: addBulky, details: bulkyDetails }, ride: { requested: addRide, pickupAddress: ridePickup, preferredWindow: rideWindow, notes: rideNotes }, generalNotes },
+      deliveryMeta: { gateCode, buildingAccessNotes, parkingNotes, budgetCap, receiptPreference, photoProofOk },
+      list: { groceryListText: groceryList, attachment }, consents: { terms: true, accuracy: true, dropoff: true }, pricingSnapshot,
+      payments: { fees: { status: "unpaid" }, groceries: { status: "unpaid" } }, status: { state: "submitted", note: "", updatedAt: new Date(), updatedBy: "customer" }, statusHistory: [{ state: "submitted", note: "", at: new Date(), by: "customer" }],
+      adminLog: [{ at: new Date(), by: "system", action: "order_created", meta: { runKey: run.runKey, effectiveMemberTier } }],
     });
 
     const cancelUntilMs = cutoffAt.toDate().getTime();
     const cancelToken = signCancelToken(orderId, cancelUntilMs);
     const cancelUntilLocal = fmtLocal(cutoffAt.toDate());
 
-    pmSend(
-      created.customer?.email,
-      `TGR Order Received: ${created.orderId}`,
-      `<div style="font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;line-height:1.45;">
-        <h2 style="margin:0 0 10px;">Order received ✅</h2>
-        <p style="margin:0 0 10px;"><strong>Order ID:</strong> ${escapeHtml(created.orderId)}</p>
-        <p style="margin:0 0 10px;"><strong>Run:</strong> ${escapeHtml(created.runKey)} (${escapeHtml(created.runType)})</p>
-        <p style="margin:0 0 10px;"><strong>Fees estimate:</strong> $${escapeHtml(money(created.pricingSnapshot?.totalFees || 0))}</p>
-        ${effectiveMemberTier ? `<p style="margin:0 0 10px;"><strong>Membership applied:</strong> ${escapeHtml(effectiveMemberTier)}</p>` : ""}
-        <p style="margin:0;">Member Portal: <a href="${escapeHtml("https://api.tobermorygroceryrun.ca/member")}">${escapeHtml("https://api.tobermorygroceryrun.ca/member")}</a></p>
-      </div>`,
-      `Order received
-Order ID: ${created.orderId}
-Run: ${created.runKey} (${created.runType})
-Fees estimate: $${money(created.pricingSnapshot?.totalFees || 0)}
-${effectiveMemberTier ? `Membership applied: ${effectiveMemberTier}\n` : ""}`
-    );
-
+    pmSend(created.customer?.email, `TGR Order Received: ${created.orderId}`, `<div style="font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;line-height:1.45;"><h2 style="margin:0 0 10px;">Order received ✅</h2><p style="margin:0 0 10px;"><strong>Order ID:</strong> ${escapeHtml(created.orderId)}</p><p style="margin:0 0 10px;"><strong>Run:</strong> ${escapeHtml(created.runKey)} (${escapeHtml(created.runType)})</p><p style="margin:0 0 10px;"><strong>Fees estimate:</strong> $${escapeHtml(money(created.pricingSnapshot?.totalFees || 0))}</p>${effectiveMemberTier ? `<p style="margin:0 0 10px;"><strong>Membership applied:</strong> ${escapeHtml(effectiveMemberTier)}</p>` : ""}<p style="margin:0;">Member Portal: <a href="${escapeHtml("https://api.tobermorygroceryrun.ca/member")}">${escapeHtml("https://api.tobermorygroceryrun.ca/member")}</a></p></div>`, `Order received\nOrder ID: ${created.orderId}\nRun: ${created.runKey} (${created.runType})\nFees estimate: $${money(created.pricingSnapshot?.totalFees || 0)}\n${effectiveMemberTier ? `Membership applied: ${effectiveMemberTier}\n` : ""}`);
     res.json({ ok: true, orderId, runKey: run.runKey, cancelToken, cancelUntilLocal, effectiveMemberTier });
-  } catch (e) {
-    res.status(500).json({ ok: false, error: String(e) });
-  }
+  } catch (e) { res.status(500).json({ ok: false, error: String(e) }); }
 });
 
 app.post("/api/orders/:orderId/cancel", async (req, res) => {
   try {
-    const orderId = String(req.params.orderId || "").trim().toUpperCase();
-    const token = String(req.body?.token || "").trim();
-
-    const order = await Order.findOne({ orderId });
-    if (!order) return res.status(404).json({ ok: false, error: "Order not found" });
-
-    const run = await Run.findOne({ runKey: order.runKey }).lean();
-    if (!run?.cutoffAt) return res.status(500).json({ ok: false, error: "Run cutoff not available" });
-
-    const cutoffAt = dayjs(run.cutoffAt).tz(TZ);
-    const now = nowTz();
-
+    const orderId = String(req.params.orderId || "").trim().toUpperCase(); const token = String(req.body?.token || "").trim();
+    const order = await Order.findOne({ orderId }); if (!order) return res.status(404).json({ ok: false, error: "Order not found" });
+    const run = await Run.findOne({ runKey: order.runKey }).lean(); if (!run?.cutoffAt) return res.status(500).json({ ok: false, error: "Run cutoff not available" });
+    const cutoffAt = dayjs(run.cutoffAt).tz(TZ); const now = nowTz();
     const isActive = ACTIVE_STATES.has(order.status?.state || "submitted");
     if (!isActive) return res.status(400).json({ ok: false, error: "Order cannot be cancelled in its current status." });
-
-    const v = verifyCancelToken(orderId, token);
-    if (!v.ok) return res.status(403).json({ ok: false, error: "Invalid cancel token." });
-
-    if (!now.isBefore(cutoffAt)) {
-      return res.status(403).json({ ok: false, error: "Cancellation window closed (past cutoff)." });
-    }
+    const v = verifyCancelToken(orderId, token); if (!v.ok) return res.status(403).json({ ok: false, error: "Invalid cancel token." });
+    if (!now.isBefore(cutoffAt)) return res.status(403).json({ ok: false, error: "Cancellation window closed (past cutoff)." });
 
     const fees = Number(order.pricingSnapshot?.totalFees || 0);
-    await Run.updateOne(
-      { runKey: order.runKey },
-      { $inc: { bookedOrdersCount: -1, bookedFeesTotal: -fees }, $set: { lastRecalcAt: new Date() } }
-    );
-
-    order.status.state = "cancelled";
-    order.status.note = "Cancelled by customer";
-    order.status.updatedAt = new Date();
-    order.status.updatedBy = "customer";
-    order.statusHistory.push({ state: "cancelled", note: "Cancelled by customer", at: new Date(), by: "customer" });
-    order.adminLog.push({ at: new Date(), by: "customer", action: "cancel", meta: {} });
-
-    await order.save();
-    return res.json({ ok: true });
-  } catch (e) {
-    return res.status(500).json({ ok: false, error: String(e) });
-  }
+    await Run.updateOne({ runKey: order.runKey }, { $inc: { bookedOrdersCount: -1, bookedFeesTotal: -fees }, $set: { lastRecalcAt: new Date() } });
+    order.status.state = "cancelled"; order.status.note = "Cancelled by customer"; order.status.updatedAt = new Date(); order.status.updatedBy = "customer";
+    order.statusHistory.push({ state: "cancelled", note: "Cancelled by customer", at: new Date(), by: "customer" }); order.adminLog.push({ at: new Date(), by: "customer", action: "cancel", meta: {} });
+    await order.save(); return res.json({ ok: true });
+  } catch (e) { return res.status(500).json({ ok: false, error: String(e) }); }
 });
 
 // =========================
@@ -1587,655 +1036,120 @@ app.post("/api/orders/:orderId/cancel", async (req, res) => {
 // =========================
 app.get("/member", requireLogin, async (req, res) => {
   try {
-    const email = String(req.user?.email || "").toLowerCase().trim();
-    const name = String(req.user?.name || "").trim();
-
-    const orders = await Order.find({ "customer.email": email })
-      .sort({ createdAt: -1 })
-      .limit(80)
-      .lean();
-
+    const email = String(req.user?.email || "").toLowerCase().trim(); const name = String(req.user?.name || "").trim();
+    const orders = await Order.find({ "customer.email": email }).sort({ createdAt: -1 }).limit(80).lean();
     const runKeys = Array.from(new Set(orders.map(o => o.runKey).filter(Boolean)));
-    const runs = await Run.find({ runKey: { $in: runKeys } }).lean();
-    const runByKey = new Map(runs.map(r => [r.runKey, r]));
-
-    const now = nowTz();
-
-    const trackables = [];
+    const runs = await Run.find({ runKey: { $in: runKeys } }).lean(); const runByKey = new Map(runs.map(r => [r.runKey, r]));
+    const now = nowTz(); const trackables = [];
     for (const o of orders) {
-      const status = o.status?.state || "submitted";
-      if (!ACTIVE_STATES.has(status)) continue;
-      const run = runByKey.get(o.runKey);
-      if (!run?.runKey || !run?.cutoffAt) continue;
-      const expMs = dayjs(run.cutoffAt).add(1, "day").valueOf();
-      const tkn = signTrackingToken(o.orderId, run.runKey, expMs);
-      trackables.push({
-        orderId: o.orderId,
-        runKey: run.runKey,
-        token: tkn,
-        status,
-      });
+      const status = o.status?.state || "submitted"; if (!ACTIVE_STATES.has(status)) continue;
+      const run = runByKey.get(o.runKey); if (!run?.runKey || !run?.cutoffAt) continue;
+      const expMs = dayjs(run.cutoffAt).add(1, "day").valueOf(); const tkn = signTrackingToken(o.orderId, run.runKey, expMs);
+      trackables.push({ orderId: o.orderId, runKey: run.runKey, token: tkn, status });
     }
 
     const rows = orders.map(o => {
       const fees = typeof o.pricingSnapshot?.totalFees === "number" ? o.pricingSnapshot.totalFees.toFixed(2) : "0.00";
-      const status = o.status?.state || "submitted";
-      const run = runByKey.get(o.runKey);
-      const cutoffAt = run?.cutoffAt ? dayjs(run.cutoffAt).tz(TZ) : null;
-      const cancelOpen = cutoffAt ? now.isBefore(cutoffAt) : false;
-
+      const status = o.status?.state || "submitted"; const run = runByKey.get(o.runKey);
+      const cutoffAt = run?.cutoffAt ? dayjs(run.cutoffAt).tz(TZ) : null; const cancelOpen = cutoffAt ? now.isBefore(cutoffAt) : false;
       let cancelHtml = `<span class="muted">—</span>`;
-      if (ACTIVE_STATES.has(status) && cancelOpen) {
-        const token = signCancelToken(o.orderId, cutoffAt.toDate().getTime());
-        cancelHtml = `<button class="btn" data-cancel="${escapeHtml(o.orderId)}" data-token="${escapeHtml(token)}">Cancel</button>`;
-      } else if (status === "cancelled") {
-        cancelHtml = `<span class="pill">Cancelled</span>`;
-      } else if (!cancelOpen && ACTIVE_STATES.has(status)) {
-        cancelHtml = `<span class="muted">Past cutoff</span>`;
-      }
+      if (ACTIVE_STATES.has(status) && cancelOpen) { const token = signCancelToken(o.orderId, cutoffAt.toDate().getTime()); cancelHtml = `<button class="btn" data-cancel="${escapeHtml(o.orderId)}" data-token="${escapeHtml(token)}">Cancel</button>`; }
+      else if (status === "cancelled") { cancelHtml = `<span class="pill">Cancelled</span>`; }
+      else if (!cancelOpen && ACTIVE_STATES.has(status)) { cancelHtml = `<span class="muted">Past cutoff</span>`; }
 
       let trackHtml = `<span class="muted">—</span>`;
       if (ACTIVE_STATES.has(status) && run?.runKey && run?.cutoffAt) {
-        const expMs = dayjs(run.cutoffAt).add(1, "day").valueOf();
-        const tkn = signTrackingToken(o.orderId, run.runKey, expMs);
+        const expMs = dayjs(run.cutoffAt).add(1, "day").valueOf(); const tkn = signTrackingToken(o.orderId, run.runKey, expMs);
         const link = `https://api.tobermorygroceryrun.ca/member?trackRunKey=${encodeURIComponent(run.runKey)}&token=${encodeURIComponent(tkn)}&orderId=${encodeURIComponent(o.orderId)}`;
-        trackHtml = `
-          <button class="btn" data-track-run="${escapeHtml(run.runKey)}" data-track-token="${escapeHtml(tkn)}" data-track-order="${escapeHtml(o.orderId)}">Track on map</button>
-          <button class="btn" data-copy="${escapeHtml(link)}">Copy link</button>
-        `;
+        trackHtml = `<button class="btn" data-track-run="${escapeHtml(run.runKey)}" data-track-token="${escapeHtml(tkn)}" data-track-order="${escapeHtml(o.orderId)}">Track on map</button> <button class="btn" data-copy="${escapeHtml(link)}">Copy link</button>`;
       }
-
-      const addr =
-        `${o.address?.streetAddress || ""}${o.address?.unit ? " " + o.address.unit : ""}, ` +
-        `${o.address?.town || ""}, ON ${o.address?.postalCode || ""}`.trim();
-
-      return `
-        <tr>
-          <td><div style="font-weight:1000;">${escapeHtml(o.orderId)}</div><div class="muted" style="font-size:12px;">${escapeHtml(fmtLocal(o.createdAt))}</div></td>
-          <td><div style="font-weight:900;">${escapeHtml(addr)}</div><div class="muted" style="font-size:12px;">Zone ${escapeHtml(o.address?.zone || "")}</div></td>
-          <td><span class="pill">${escapeHtml(o.runType || "")}</span><div class="muted" style="font-size:12px;margin-top:4px;">${escapeHtml(o.runKey || "")}</div></td>
-          <td><span class="pill">${escapeHtml(status)}</span><div class="muted" style="font-size:12px;margin-top:4px;">${escapeHtml(o.status?.note || "")}</div></td>
-          <td>$${escapeHtml(fees)}</td>
-          <td>${trackHtml}</td>
-          <td>${cancelHtml}</td>
-        </tr>
-      `;
+      const addr = `${o.address?.streetAddress || ""}${o.address?.unit ? " " + o.address.unit : ""}, ${o.address?.town || ""}, ON ${o.address?.postalCode || ""}`.trim();
+      return `<tr><td><div style="font-weight:1000;">${escapeHtml(o.orderId)}</div><div class="muted" style="font-size:12px;">${escapeHtml(fmtLocal(o.createdAt))}</div></td><td><div style="font-weight:900;">${escapeHtml(addr)}</div><div class="muted" style="font-size:12px;">Zone ${escapeHtml(o.address?.zone || "")}</div></td><td><span class="pill">${escapeHtml(o.runType || "")}</span><div class="muted" style="font-size:12px;margin-top:4px;">${escapeHtml(o.runKey || "")}</div></td><td><span class="pill">${escapeHtml(status)}</span><div class="muted" style="font-size:12px;margin-top:4px;">${escapeHtml(o.status?.note || "")}</div></td><td>$${escapeHtml(fees)}</td><td>${trackHtml}</td><td>${cancelHtml}</td></tr>`;
     }).join("");
 
     res.setHeader("Content-Type", "text/html; charset=utf-8");
-    res.send(`<!doctype html>
-<html lang="en-CA">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>TGR Member Portal</title>
-<style>
-  :root{
-    --bg:#0b0b0b; --panel:rgba(255,255,255,.06); --line:rgba(255,255,255,.14);
-    --text:#fff; --muted:rgba(255,255,255,.75);
-    --red:#e3342f; --red2:#ff4a44;
-    --radius:14px;
-  }
-  body{margin:0;background:var(--bg);color:var(--text);font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;}
-  .wrap{max-width:1250px;margin:0 auto;padding:16px;}
-  .card{border:1px solid var(--line);background:var(--panel);border-radius:var(--radius);padding:14px;}
-  .row{display:flex;gap:10px;flex-wrap:wrap;align-items:center;}
-  .btn{border:1px solid rgba(255,255,255,.18);background:rgba(255,255,255,.06);color:#fff;font-weight:900;border-radius:999px;padding:10px 14px;cursor:pointer;text-decoration:none;white-space:nowrap;}
-  .btn.primary{background:linear-gradient(180deg,var(--red2),var(--red));border-color:rgba(0,0,0,.25);}
-  .btn.ghost{background:transparent;}
-  .muted{color:var(--muted);}
-  .pill{display:inline-block;padding:4px 10px;border-radius:999px;border:1px solid rgba(255,255,255,.18);background:rgba(255,255,255,.06);font-weight:900;font-size:12px;}
-  table{width:100%;border-collapse:collapse;}
-  th,td{padding:10px 8px;border-bottom:1px solid rgba(255,255,255,.12);vertical-align:top;}
-  th{font-size:12px;color:rgba(255,255,255,.72);text-transform:uppercase;letter-spacing:.08em;text-align:left;}
-  .toast{margin-top:10px;padding:10px 12px;border-radius:12px;border:1px solid rgba(255,255,255,.18);background:rgba(0,0,0,.24);display:none;font-weight:900;}
-  .toast.show{display:block;}
-  .hr{height:1px;background:rgba(255,255,255,.12);margin:12px 0;}
-  .grid{display:grid;grid-template-columns: 1fr 1fr; gap:12px;}
-  @media (max-width: 980px){ .grid{grid-template-columns: 1fr;} }
-  #mapWrap{display:none;}
-  #map{height: 420px; border-radius: 14px; border:1px solid rgba(255,255,255,.14); overflow:hidden;}
-  .small{font-size:13px;}
-  .warn{border:1px solid rgba(227,52,47,.45);background:rgba(227,52,47,.12);border-radius:12px;padding:10px 12px;}
-</style>
-</head>
-<body>
-<div class="wrap">
-  <div class="card">
-    <div class="row" style="justify-content:space-between;">
-      <div>
-        <div style="font-weight:1000;font-size:22px;">Member Portal</div>
-        <div class="muted">Signed in as <strong>${escapeHtml(email)}</strong>${name ? ` • ${escapeHtml(name)}` : ""}</div>
-      </div>
-      <div class="row">
-        <a class="btn ghost" href="${escapeHtml(PUBLIC_SITE_URL)}/">Back to site</a>
-        <a class="btn" href="${escapeHtml(SQUARE_PAY_GROCERIES_LINK)}" target="_blank" rel="noopener">Pay Grocery Total</a>
-        <a class="btn" href="${escapeHtml(SQUARE_PAY_FEES_LINK)}" target="_blank" rel="noopener">Pay Service & Delivery Fees</a>
-        <a class="btn ghost" href="/logout?returnTo=${encodeURIComponent(PUBLIC_SITE_URL + "/")}">Log out</a>
-      </div>
-    </div>
-
-    <div class="toast" id="toast"></div>
-
-    <div class="hr"></div>
-
-    <div class="grid" id="mapWrap">
-      <div class="card" style="box-shadow:none;">
-        <div style="font-weight:1000;font-size:18px;">Live Tracking Map</div>
-        <div class="muted small" id="mapSub">Select an order to track. Tracking only works when enabled for the run.</div>
-        <div class="hr"></div>
-        <div id="map"></div>
-        <div class="hr"></div>
-        <div class="row">
-          <span class="pill" id="mapStatus">—</span>
-          <span class="pill" id="mapLast">Last: —</span>
-          <button class="btn" id="stopMap">Stop</button>
-        </div>
-        <div class="muted small" id="mapErr" style="margin-top:10px;"></div>
-      </div>
-
-      <div class="card" style="box-shadow:none;">
-        <div style="font-weight:1000;font-size:18px;">Tracking controls</div>
-        <div class="muted small">Only your active orders can track. If tracking is disabled, you’ll see “Tracking off”.</div>
-        <div class="hr"></div>
-        <div class="warn">
-          <div style="font-weight:1000;">Tip</div>
-          <div class="muted small">If your map is blank, the driver hasn’t started tracking or hasn’t sent a GPS fix yet.</div>
-        </div>
-      </div>
-    </div>
-
-    <div class="hr"></div>
-
-    <div style="overflow:auto;">
-      <table>
-        <thead>
-          <tr>
-            <th>Order</th>
-            <th>Address</th>
-            <th>Run</th>
-            <th>Status</th>
-            <th>Fees</th>
-            <th>Tracking</th>
-            <th>Cancel</th>
-          </tr>
-        </thead>
-        <tbody>
-          ${rows || `<tr><td colspan="7" class="muted">No orders yet.</td></tr>`}
-        </tbody>
-      </table>
-    </div>
-  </div>
-</div>
-
-<script>
-  const TRACKABLES = ${JSON.stringify(trackables)};
-  let MAPBOX_TOKEN = "";
-  let map = null;
-  let marker = null;
-  let pollTimer = null;
-  let activeTrack = null;
-
-  const toast = (msg)=>{
-    const el = document.getElementById("toast");
-    el.textContent = msg;
-    el.classList.add("show");
-    setTimeout(()=>el.classList.remove("show"), 3500);
-  };
-
-  async function cancelOrder(orderId, token){
-    const ok = confirm("Cancel " + orderId + " before cutoff?");
-    if(!ok) return;
-
-    const r = await fetch("/api/orders/" + encodeURIComponent(orderId) + "/cancel", {
-      method:"POST",
-      headers:{ "Content-Type":"application/json" },
-      credentials:"include",
-      body: JSON.stringify({ token }),
-    });
-    const d = await r.json().catch(()=>({}));
-    if(!r.ok || d.ok===false) return toast(d.error || "Cancel failed");
-    toast("Cancelled " + orderId);
-    setTimeout(()=>location.reload(), 700);
-  }
-
-  async function copy(text){
-    try{ await navigator.clipboard.writeText(text); return true; } catch { return false; }
-  }
-
-  document.querySelectorAll("[data-cancel]").forEach(btn=>{
-    btn.addEventListener("click", ()=>{
-      cancelOrder(btn.getAttribute("data-cancel"), btn.getAttribute("data-token"));
-    });
-  });
-
-  document.querySelectorAll("[data-copy]").forEach(btn=>{
-    btn.addEventListener("click", async ()=>{
-      const url = btn.getAttribute("data-copy");
-      if (await copy(url)) toast("Link copied ✅");
-      else toast("Copy failed");
-    });
-  });
-
-  document.querySelectorAll("[data-track-run]").forEach(btn=>{
-    btn.addEventListener("click", ()=>{
-      const runKey = btn.getAttribute("data-track-run");
-      const token = btn.getAttribute("data-track-token");
-      const orderId = btn.getAttribute("data-track-order");
-      startMapTracking({ runKey, token, orderId });
-    });
-  });
-
-  document.getElementById("stopMap").addEventListener("click", ()=> stopMapTracking());
-
-  function qs(){
-    const u = new URL(location.href);
-    return {
-      runKey: u.searchParams.get("trackRunKey") || "",
-      token: u.searchParams.get("token") || "",
-      orderId: u.searchParams.get("orderId") || "",
-    };
-  }
-
-  async function loadConfig(){
-    const r = await fetch("/api/public/config");
-    const d = await r.json().catch(()=>({}));
-    if(r.ok && d.ok) MAPBOX_TOKEN = d.mapboxPublicToken || "";
-  }
-
-  function setMapWrap(show){
-    document.getElementById("mapWrap").style.display = show ? "grid" : "none";
-  }
-
-  function setStatus(text){ document.getElementById("mapStatus").textContent = text; }
-  function setLast(text){ document.getElementById("mapLast").textContent = text; }
-  function setErr(text){ document.getElementById("mapErr").textContent = text || ""; }
-
-  function loadMapboxLib(){
-    return new Promise((resolve, reject)=>{
-      if (window.mapboxgl) return resolve();
-      const css = document.createElement("link");
-      css.rel = "stylesheet";
-      css.href = "https://api.mapbox.com/mapbox-gl-js/v2.15.0/mapbox-gl.css";
-      document.head.appendChild(css);
-
-      const s = document.createElement("script");
-      s.src = "https://api.mapbox.com/mapbox-gl-js/v2.15.0/mapbox-gl.js";
-      s.onload = ()=> resolve();
-      s.onerror = ()=> reject(new Error("Mapbox failed to load"));
-      document.head.appendChild(s);
-    });
-  }
-
-  async function ensureMap(){
-    if (map) return;
-    if (!MAPBOX_TOKEN) throw new Error("Mapbox token missing on server");
-    await loadMapboxLib();
-
-    mapboxgl.accessToken = MAPBOX_TOKEN;
-    map = new mapboxgl.Map({
-      container: "map",
-      style: "mapbox://styles/mapbox/dark-v11",
-      center: [-81.7, 45.25],
-      zoom: 9,
-    });
-    marker = new mapboxgl.Marker({ color: "#ff4a44" }).setLngLat([-81.7, 45.25]).addTo(map);
-  }
-
-  function stopMapTracking(){
-    activeTrack = null;
-    if (pollTimer) clearInterval(pollTimer);
-    pollTimer = null;
-    setStatus("—");
-    setLast("Last: —");
-    setErr("");
-    toast("Tracking stopped");
-  }
-
-  async function pollOnce(){
-    if (!activeTrack) return;
-    const { runKey, token } = activeTrack;
-    try{
-      const r = await fetch("/api/public/tracking/" + encodeURIComponent(runKey) + "?token=" + encodeURIComponent(token));
-      const d = await r.json().catch(()=>({}));
-      if(!r.ok || d.ok===false){
-        setStatus("Error");
-        setErr(d.error || "Tracking error");
-        return;
-      }
-
-      if (!d.enabled){
-        setStatus("Tracking off");
-        setErr("Tracking is not enabled for this run yet.");
-        return;
-      }
-      if (!d.hasFix){
-        setStatus("Waiting for GPS");
-        setErr("No GPS fix yet. Try again in a moment.");
-        return;
-      }
-
-      const lat = d.last.lat;
-      const lng = d.last.lng;
-      const at = d.last.at ? new Date(d.last.at).toLocaleString() : "—";
-
-      setStatus("Live ✅");
-      setLast("Last: " + at);
-      setErr("");
-
-      marker.setLngLat([lng, lat]);
-      map.easeTo({ center: [lng, lat], zoom: 12, duration: 900 });
-    } catch (e){
-      setStatus("Error");
-      setErr(String(e.message || e));
-    }
-  }
-
-  async function startMapTracking(t){
-    activeTrack = t;
-    setMapWrap(true);
-    setStatus("Loading…");
-    setLast("Last: —");
-    setErr("");
-
-    document.getElementById("mapSub").textContent =
-      "Tracking " + (t.orderId || "") + " • " + (t.runKey || "");
-
-    try{
-      await ensureMap();
-      await pollOnce();
-      if (pollTimer) clearInterval(pollTimer);
-      pollTimer = setInterval(pollOnce, 2500);
-      toast("Map tracking started ✅");
-    } catch (e){
-      setStatus("Error");
-      setErr(String(e.message || e));
-    }
-  }
-
-  (async function boot(){
-    await loadConfig();
-    const p = qs();
-    if (p.runKey && p.token) {
-      startMapTracking({ runKey: p.runKey, token: p.token, orderId: p.orderId || "" });
-      return;
-    }
-    setMapWrap(false);
-  })();
-</script>
-
-</body>
-</html>`);
-  } catch (e) {
-    res.status(500).send("Member portal error: " + String(e));
-  }
+    res.send(`<!doctype html><html lang="en-CA"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>TGR Member Portal</title><style>:root{--bg:#0b0b0b; --panel:rgba(255,255,255,.06); --line:rgba(255,255,255,.14); --text:#fff; --muted:rgba(255,255,255,.75); --red:#e3342f; --red2:#ff4a44; --radius:14px;} body{margin:0;background:var(--bg);color:var(--text);font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;} .wrap{max-width:1250px;margin:0 auto;padding:16px;} .card{border:1px solid var(--line);background:var(--panel);border-radius:var(--radius);padding:14px;} .row{display:flex;gap:10px;flex-wrap:wrap;align-items:center;} .btn{border:1px solid rgba(255,255,255,.18);background:rgba(255,255,255,.06);color:#fff;font-weight:900;border-radius:999px;padding:10px 14px;cursor:pointer;text-decoration:none;white-space:nowrap;} .btn.primary{background:linear-gradient(180deg,var(--red2),var(--red));border-color:rgba(0,0,0,.25);} .btn.ghost{background:transparent;} .muted{color:var(--muted);} .pill{display:inline-block;padding:4px 10px;border-radius:999px;border:1px solid rgba(255,255,255,.18);background:rgba(255,255,255,.06);font-weight:900;font-size:12px;} table{width:100%;border-collapse:collapse;} th,td{padding:10px 8px;border-bottom:1px solid rgba(255,255,255,.12);vertical-align:top;} th{font-size:12px;color:rgba(255,255,255,.72);text-transform:uppercase;letter-spacing:.08em;text-align:left;} .toast{margin-top:10px;padding:10px 12px;border-radius:12px;border:1px solid rgba(255,255,255,.18);background:rgba(0,0,0,.24);display:none;font-weight:900;} .toast.show{display:block;} .hr{height:1px;background:rgba(255,255,255,.12);margin:12px 0;} .grid{display:grid;grid-template-columns: 1fr 1fr; gap:12px;} @media (max-width: 980px){ .grid{grid-template-columns: 1fr;} } #mapWrap{display:none;} #map{height: 420px; border-radius: 14px; border:1px solid rgba(255,255,255,.14); overflow:hidden;} .small{font-size:13px;} .warn{border:1px solid rgba(227,52,47,.45);background:rgba(227,52,47,.12);border-radius:12px;padding:10px 12px;}</style></head><body><div class="wrap"><div class="card"><div class="row" style="justify-content:space-between;"><div><div style="font-weight:1000;font-size:22px;">Member Portal</div><div class="muted">Signed in as <strong>${escapeHtml(email)}</strong>${name ? ` • ${escapeHtml(name)}` : ""}</div></div><div class="row"><a class="btn ghost" href="${escapeHtml(PUBLIC_SITE_URL)}/">Back to site</a><a class="btn" href="${escapeHtml(SQUARE_PAY_GROCERIES_LINK)}" target="_blank" rel="noopener">Pay Grocery Total</a><a class="btn" href="${escapeHtml(SQUARE_PAY_FEES_LINK)}" target="_blank" rel="noopener">Pay Service & Delivery Fees</a><a class="btn ghost" href="/logout?returnTo=${encodeURIComponent(PUBLIC_SITE_URL + "/")}">Log out</a></div></div><div class="toast" id="toast"></div><div class="hr"></div><div class="grid" id="mapWrap"><div class="card" style="box-shadow:none;"><div style="font-weight:1000;font-size:18px;">Live Tracking Map</div><div class="muted small" id="mapSub">Select an order to track. Tracking only works when enabled for the run.</div><div class="hr"></div><div id="map"></div><div class="hr"></div><div class="row"><span class="pill" id="mapStatus">—</span><span class="pill" id="mapLast">Last: —</span><button class="btn" id="stopMap">Stop</button></div><div class="muted small" id="mapErr" style="margin-top:10px;"></div></div><div class="card" style="box-shadow:none;"><div style="font-weight:1000;font-size:18px;">Tracking controls</div><div class="muted small">Only your active orders can track. If tracking is disabled, you’ll see “Tracking off”.</div><div class="hr"></div><div class="warn"><div style="font-weight:1000;">Tip</div><div class="muted small">If your map is blank, the driver hasn’t started tracking or hasn’t sent a GPS fix yet.</div></div></div></div><div class="hr"></div><div style="overflow:auto;"><table><thead><tr><th>Order</th><th>Address</th><th>Run</th><th>Status</th><th>Fees</th><th>Tracking</th><th>Cancel</th></tr></thead><tbody>${rows || `<tr><td colspan="7" class="muted">No orders yet.</td></tr>`}</tbody></table></div></div></div><script>const TRACKABLES = ${JSON.stringify(trackables)}; let MAPBOX_TOKEN = ""; let map = null; let marker = null; let pollTimer = null; let activeTrack = null; const toast = (msg)=>{const el = document.getElementById("toast"); el.textContent = msg; el.classList.add("show"); setTimeout(()=>el.classList.remove("show"), 3500);}; async function cancelOrder(orderId, token){const ok = confirm("Cancel " + orderId + " before cutoff?"); if(!ok) return; const r = await fetch("/api/orders/" + encodeURIComponent(orderId) + "/cancel", {method:"POST", headers:{ "Content-Type":"application/json" }, credentials:"include", body: JSON.stringify({ token })}); const d = await r.json().catch(()=>({})); if(!r.ok || d.ok===false) return toast(d.error || "Cancel failed"); toast("Cancelled " + orderId); setTimeout(()=>location.reload(), 700);} async function copy(text){try{ await navigator.clipboard.writeText(text); return true; } catch { return false; }} document.querySelectorAll("[data-cancel]").forEach(btn=>{btn.addEventListener("click", ()=>{cancelOrder(btn.getAttribute("data-cancel"), btn.getAttribute("data-token"));});}); document.querySelectorAll("[data-copy]").forEach(btn=>{btn.addEventListener("click", async ()=>{const url = btn.getAttribute("data-copy"); if (await copy(url)) toast("Link copied ✅"); else toast("Copy failed");});}); document.querySelectorAll("[data-track-run]").forEach(btn=>{btn.addEventListener("click", ()=>{const runKey = btn.getAttribute("data-track-run"); const token = btn.getAttribute("data-track-token"); const orderId = btn.getAttribute("data-track-order"); startMapTracking({ runKey, token, orderId });});}); document.getElementById("stopMap").addEventListener("click", ()=> stopMapTracking()); function qs(){const u = new URL(location.href); return {runKey: u.searchParams.get("trackRunKey") || "", token: u.searchParams.get("token") || "", orderId: u.searchParams.get("orderId") || ""};} async function loadConfig(){const r = await fetch("/api/public/config"); const d = await r.json().catch(()=>({})); if(r.ok && d.ok) MAPBOX_TOKEN = d.mapboxPublicToken || "";} function setMapWrap(show){document.getElementById("mapWrap").style.display = show ? "grid" : "none";} function setStatus(text){ document.getElementById("mapStatus").textContent = text; } function setLast(text){ document.getElementById("mapLast").textContent = text; } function setErr(text){ document.getElementById("mapErr").textContent = text || ""; } function loadMapboxLib(){return new Promise((resolve, reject)=>{if (window.mapboxgl) return resolve(); const css = document.createElement("link"); css.rel = "stylesheet"; css.href = "https://api.mapbox.com/mapbox-gl-js/v2.15.0/mapbox-gl.css"; document.head.appendChild(css); const s = document.createElement("script"); s.src = "https://api.mapbox.com/mapbox-gl-js/v2.15.0/mapbox-gl.js"; s.onload = ()=> resolve(); s.onerror = ()=> reject(new Error("Mapbox failed to load")); document.head.appendChild(s);});} async function ensureMap(){if (map) return; if (!MAPBOX_TOKEN) throw new Error("Mapbox token missing on server"); await loadMapboxLib(); mapboxgl.accessToken = MAPBOX_TOKEN; map = new mapboxgl.Map({container: "map", style: "mapbox://styles/mapbox/dark-v11", center: [-81.7, 45.25], zoom: 9}); marker = new mapboxgl.Marker({ color: "#ff4a44" }).setLngLat([-81.7, 45.25]).addTo(map);} function stopMapTracking(){activeTrack = null; if (pollTimer) clearInterval(pollTimer); pollTimer = null; setStatus("—"); setLast("Last: —"); setErr(""); toast("Tracking stopped");} async function pollOnce(){if (!activeTrack) return; const { runKey, token } = activeTrack; try{const r = await fetch("/api/public/tracking/" + encodeURIComponent(runKey) + "?token=" + encodeURIComponent(token)); const d = await r.json().catch(()=>({})); if(!r.ok || d.ok===false){setStatus("Error"); setErr(d.error || "Tracking error"); return;} if (!d.enabled){setStatus("Tracking off"); setErr("Tracking is not enabled for this run yet."); return;} if (!d.hasFix){setStatus("Waiting for GPS"); setErr("No GPS fix yet. Try again in a moment."); return;} const lat = d.last.lat; const lng = d.last.lng; const at = d.last.at ? new Date(d.last.at).toLocaleString() : "—"; setStatus("Live ✅"); setLast("Last: " + at); setErr(""); marker.setLngLat([lng, lat]); map.easeTo({ center: [lng, lat], zoom: 12, duration: 900 });} catch (e){setStatus("Error"); setErr(String(e.message || e));}} async function startMapTracking(t){activeTrack = t; setMapWrap(true); setStatus("Loading…"); setLast("Last: —"); setErr(""); document.getElementById("mapSub").textContent = "Tracking " + (t.orderId || "") + " • " + (t.runKey || ""); try{await ensureMap(); await pollOnce(); if (pollTimer) clearInterval(pollTimer); pollTimer = setInterval(pollOnce, 2500); toast("Map tracking started ✅");} catch (e){setStatus("Error"); setErr(String(e.message || e));}} (async function boot(){await loadConfig(); const p = qs(); if (p.runKey && p.token) {startMapTracking({ runKey: p.runKey, token: p.token, orderId: p.orderId || "" }); return;} setMapWrap(false);})();</script></body></html>`);
+  } catch (e) { res.status(500).send("Member portal error: " + String(e)); }
 });
 
 // =========================
 // ADMIN HELPERS + API
 // =========================
-function adminBy(req) {
-  return String(req.user?.email || "admin").toLowerCase();
-}
-
+function adminBy(req) { return String(req.user?.email || "admin").toLowerCase(); }
 function buildOrderFilterFromQuery(qs) {
-  const q = String(qs.q || "").trim();
-  const state = String(qs.state || "").trim();
-  const runKey = String(qs.runKey || "").trim();
-  const zone = String(qs.zone || "").trim();
-  const town = String(qs.town || "").trim();
-  const unpaidFees = String(qs.unpaidFees || "").trim() === "1";
-  const hold = String(qs.hold || "").trim() === "1";
-  const flag = String(qs.flag || "").trim();
-
+  const q = String(qs.q || "").trim(); const state = String(qs.state || "").trim(); const runKey = String(qs.runKey || "").trim(); const zone = String(qs.zone || "").trim(); const town = String(qs.town || "").trim(); const unpaidFees = String(qs.unpaidFees || "").trim() === "1"; const hold = String(qs.hold || "").trim() === "1"; const flag = String(qs.flag || "").trim();
   const filter = {};
-  if (runKey) filter.runKey = runKey;
-  if (state) filter["status.state"] = state;
-  if (zone) filter["address.zone"] = zone;
+  if (runKey) filter.runKey = runKey; if (state) filter["status.state"] = state; if (zone) filter["address.zone"] = zone;
   if (town) filter["address.town"] = new RegExp("^" + town.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") + "$", "i");
-  if (unpaidFees) filter["payments.fees.status"] = "unpaid";
-  if (hold) filter["hold"] = true;
-  if (flag) filter[`flags.${flag}`] = true;
-
-  if (q) {
-    const safe = q.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-    const re = new RegExp(safe, "i");
-    filter.$or = [
-      { orderId: re },
-      { "customer.fullName": re },
-      { "customer.email": re },
-      { "customer.phone": re },
-      { "address.town": re },
-      { "address.streetAddress": re },
-      { "address.postalCode": re },
-    ];
-  }
-
+  if (unpaidFees) filter["payments.fees.status"] = "unpaid"; if (hold) filter["hold"] = true; if (flag) filter[`flags.${flag}`] = true;
+  if (q) { const safe = q.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"); const re = new RegExp(safe, "i"); filter.$or = [{ orderId: re }, { "customer.fullName": re }, { "customer.email": re }, { "customer.phone": re }, { "address.town": re }, { "address.streetAddress": re }, { "address.postalCode": re }]; }
   return filter;
 }
 
-app.get("/api/admin/orders", requireLogin, requireAdmin, async (req, res) => {
-  try {
-    const limit = Math.min(500, Math.max(1, Number(req.query.limit || 120)));
-    const filter = buildOrderFilterFromQuery(req.query);
-    const items = await Order.find(filter).sort({ createdAt: -1 }).limit(limit).lean();
-    res.json({ ok: true, items });
-  } catch (e) {
-    res.status(500).json({ ok: false, error: String(e) });
-  }
-});
-
-app.get("/api/admin/orders/:orderId", requireLogin, requireAdmin, async (req, res) => {
-  try {
-    const orderId = String(req.params.orderId || "").trim().toUpperCase();
-    const o = await Order.findOne({ orderId }).lean();
-    if (!o) return res.status(404).json({ ok: false, error: "Order not found" });
-    res.json({ ok: true, order: o });
-  } catch (e) {
-    res.status(500).json({ ok: false, error: String(e) });
-  }
-});
-
+app.get("/api/admin/orders", requireLogin, requireAdmin, async (req, res) => { try { const limit = Math.min(500, Math.max(1, Number(req.query.limit || 120))); const filter = buildOrderFilterFromQuery(req.query); const items = await Order.find(filter).sort({ createdAt: -1 }).limit(limit).lean(); res.json({ ok: true, items }); } catch (e) { res.status(500).json({ ok: false, error: String(e) }); } });
+app.get("/api/admin/orders/:orderId", requireLogin, requireAdmin, async (req, res) => { try { const orderId = String(req.params.orderId || "").trim().toUpperCase(); const o = await Order.findOne({ orderId }).lean(); if (!o) return res.status(404).json({ ok: false, error: "Order not found" }); res.json({ ok: true, order: o }); } catch (e) { res.status(500).json({ ok: false, error: String(e) }); } });
 app.post("/api/admin/orders/:orderId/status", requireLogin, requireAdmin, async (req, res) => {
   try {
-    const orderId = String(req.params.orderId || "").trim().toUpperCase();
-    const state = String(req.body?.state || "").trim();
-    const note = String(req.body?.note || "").trim();
-    const by = adminBy(req);
-
-    if (!AllowedStates.includes(state)) {
-      return res.status(400).json({ ok: false, error: "Invalid state" });
-    }
-
-    const order = await Order.findOne({ orderId });
-    if (!order) return res.status(404).json({ ok: false, error: "Order not found" });
-
-    order.status.state = state;
-    order.status.note = note;
-    order.status.updatedAt = new Date();
-    order.status.updatedBy = by;
-    order.statusHistory.push({ state, note, at: new Date(), by });
-
-    await order.save();
-    res.json({ ok: true });
-  } catch (e) {
-    res.status(500).json({ ok: false, error: String(e) });
-  }
+    const orderId = String(req.params.orderId || "").trim().toUpperCase(); const state = String(req.body?.state || "").trim(); const note = String(req.body?.note || "").trim(); const by = adminBy(req);
+    if (!AllowedStates.includes(state)) return res.status(400).json({ ok: false, error: "Invalid state" });
+    const order = await Order.findOne({ orderId }); if (!order) return res.status(404).json({ ok: false, error: "Order not found" });
+    order.status.state = state; order.status.note = note; order.status.updatedAt = new Date(); order.status.updatedBy = by; order.statusHistory.push({ state, note, at: new Date(), by });
+    await order.save(); res.json({ ok: true });
+  } catch (e) { res.status(500).json({ ok: false, error: String(e) }); }
 });
-
 app.post("/api/admin/orders/:orderId/payments", requireLogin, requireAdmin, async (req, res) => {
   try {
-    const orderId = String(req.params.orderId || "").trim().toUpperCase();
-    const feesStatus = String(req.body?.feesStatus || "").trim();
-    const groceriesStatus = String(req.body?.groceriesStatus || "").trim();
-    const note = String(req.body?.note || "").trim();
-
-    const order = await Order.findOne({ orderId });
-    if (!order) return res.status(404).json({ ok: false, error: "Order not found" });
-
-    if (feesStatus) {
-      order.payments.fees.status = feesStatus;
-      order.payments.fees.paidAt = feesStatus === "paid" ? new Date() : null;
-    }
-    if (groceriesStatus) {
-      order.payments.groceries.status = groceriesStatus;
-      order.payments.groceries.paidAt = (groceriesStatus === "paid" || groceriesStatus === "deposit_paid") ? new Date() : null;
-    }
-    if (note) {
-      order.payments.fees.note = note;
-      order.payments.groceries.note = note;
-    }
-
-    await order.save();
-    res.json({ ok: true });
-  } catch (e) {
-    res.status(500).json({ ok: false, error: String(e) });
-  }
+    const orderId = String(req.params.orderId || "").trim().toUpperCase(); const feesStatus = String(req.body?.feesStatus || "").trim(); const groceriesStatus = String(req.body?.groceriesStatus || "").trim(); const note = String(req.body?.note || "").trim();
+    const order = await Order.findOne({ orderId }); if (!order) return res.status(404).json({ ok: false, error: "Order not found" });
+    if (feesStatus) { order.payments.fees.status = feesStatus; order.payments.fees.paidAt = feesStatus === "paid" ? new Date() : null; }
+    if (groceriesStatus) { order.payments.groceries.status = groceriesStatus; order.payments.groceries.paidAt = (groceriesStatus === "paid" || groceriesStatus === "deposit_paid") ? new Date() : null; }
+    if (note) { order.payments.fees.note = note; order.payments.groceries.note = note; }
+    await order.save(); res.json({ ok: true });
+  } catch (e) { res.status(500).json({ ok: false, error: String(e) }); }
 });
-
 app.post("/api/admin/orders/:orderId/cancel", requireLogin, requireAdmin, async (req, res) => {
   try {
-    const orderId = String(req.params.orderId || "").trim().toUpperCase();
-    const reason = String(req.body?.reason || "").trim() || "Cancelled by admin";
-    const by = adminBy(req);
-
-    const order = await Order.findOne({ orderId });
-    if (!order) return res.status(404).json({ ok: false, error: "Order not found" });
-
+    const orderId = String(req.params.orderId || "").trim().toUpperCase(); const reason = String(req.body?.reason || "").trim() || "Cancelled by admin"; const by = adminBy(req);
+    const order = await Order.findOne({ orderId }); if (!order) return res.status(404).json({ ok: false, error: "Order not found" });
     const wasActive = ACTIVE_STATES.has(order.status?.state || "submitted");
-    if (wasActive) {
-      const fees = Number(order.pricingSnapshot?.totalFees || 0);
-      await Run.updateOne(
-        { runKey: order.runKey },
-        { $inc: { bookedOrdersCount: -1, bookedFeesTotal: -fees }, $set: { lastRecalcAt: new Date() } }
-      );
-    }
-
-    order.status.state = "cancelled";
-    order.status.note = reason;
-    order.status.updatedAt = new Date();
-    order.status.updatedBy = by;
-    order.statusHistory.push({ state: "cancelled", note: reason, at: new Date(), by });
-
-    await order.save();
-    res.json({ ok: true });
-  } catch (e) {
-    res.status(500).json({ ok: false, error: String(e) });
-  }
+    if (wasActive) { const fees = Number(order.pricingSnapshot?.totalFees || 0); await Run.updateOne({ runKey: order.runKey }, { $inc: { bookedOrdersCount: -1, bookedFeesTotal: -fees }, $set: { lastRecalcAt: new Date() } }); }
+    order.status.state = "cancelled"; order.status.note = reason; order.status.updatedAt = new Date(); order.status.updatedBy = by; order.statusHistory.push({ state: "cancelled", note: reason, at: new Date(), by });
+    await order.save(); res.json({ ok: true });
+  } catch (e) { res.status(500).json({ ok: false, error: String(e) }); }
 });
-
 app.delete("/api/admin/orders/:orderId", requireLogin, requireAdmin, async (req, res) => {
   try {
     const orderId = String(req.params.orderId || "").trim().toUpperCase();
-
-    const order = await Order.findOne({ orderId }).lean();
-    if (!order) return res.status(404).json({ ok: false, error: "Order not found" });
-
+    const order = await Order.findOne({ orderId }).lean(); if (!order) return res.status(404).json({ ok: false, error: "Order not found" });
     const wasActive = ACTIVE_STATES.has(order.status?.state || "submitted");
-    if (wasActive) {
-      const fees = Number(order.pricingSnapshot?.totalFees || 0);
-      await Run.updateOne(
-        { runKey: order.runKey },
-        { $inc: { bookedOrdersCount: -1, bookedFeesTotal: -fees }, $set: { lastRecalcAt: new Date() } }
-      );
-    }
-
-    await Order.deleteOne({ orderId });
-    res.json({ ok: true });
-  } catch (e) {
-    res.status(500).json({ ok: false, error: String(e) });
-  }
+    if (wasActive) { const fees = Number(order.pricingSnapshot?.totalFees || 0); await Run.updateOne({ runKey: order.runKey }, { $inc: { bookedOrdersCount: -1, bookedFeesTotal: -fees }, $set: { lastRecalcAt: new Date() } }); }
+    await Order.deleteOne({ orderId }); res.json({ ok: true });
+  } catch (e) { res.status(500).json({ ok: false, error: String(e) }); }
 });
 
-// Tracking admin controls
-app.post("/api/admin/tracking/:runKey/start", requireLogin, requireAdmin, async (req, res) => {
-  try {
-    const runKey = String(req.params.runKey || "").trim();
-    const by = adminBy(req);
-    await ensureTrackingDoc(runKey);
-    await Tracking.updateOne(
-      { runKey },
-      { $set: { enabled: true, startedAt: new Date(), stoppedAt: null, updatedBy: by } }
-    );
-    res.json({ ok: true, runKey });
-  } catch (e) {
-    res.status(500).json({ ok: false, error: String(e) });
-  }
-});
-
-app.post("/api/admin/tracking/:runKey/stop", requireLogin, requireAdmin, async (req, res) => {
-  try {
-    const runKey = String(req.params.runKey || "").trim();
-    const by = adminBy(req);
-    await ensureTrackingDoc(runKey);
-    await Tracking.updateOne(
-      { runKey },
-      { $set: { enabled: false, stoppedAt: new Date(), updatedBy: by } }
-    );
-    res.json({ ok: true, runKey });
-  } catch (e) {
-    res.status(500).json({ ok: false, error: String(e) });
-  }
-});
-
+app.post("/api/admin/tracking/:runKey/start", requireLogin, requireAdmin, async (req, res) => { try { const runKey = String(req.params.runKey || "").trim(); const by = adminBy(req); await ensureTrackingDoc(runKey); await Tracking.updateOne({ runKey }, { $set: { enabled: true, startedAt: new Date(), stoppedAt: null, updatedBy: by } }); res.json({ ok: true, runKey }); } catch (e) { res.status(500).json({ ok: false, error: String(e) }); } });
+app.post("/api/admin/tracking/:runKey/stop", requireLogin, requireAdmin, async (req, res) => { try { const runKey = String(req.params.runKey || "").trim(); const by = adminBy(req); await ensureTrackingDoc(runKey); await Tracking.updateOne({ runKey }, { $set: { enabled: false, stoppedAt: new Date(), updatedBy: by } }); res.json({ ok: true, runKey }); } catch (e) { res.status(500).json({ ok: false, error: String(e) }); } });
 app.post("/api/admin/tracking/:runKey/update", requireLogin, requireAdmin, async (req, res) => {
   try {
-    const runKey = String(req.params.runKey || "").trim();
-    const by = adminBy(req);
-
-    const lat = Number(req.body?.lat);
-    const lng = Number(req.body?.lng);
-    const heading = Number(req.body?.heading);
-    const speed = Number(req.body?.speed);
-    const accuracy = Number(req.body?.accuracy);
-
-    if (!Number.isFinite(lat) || !Number.isFinite(lng)) {
-      return res.status(400).json({ ok: false, error: "lat/lng required" });
-    }
-
+    const runKey = String(req.params.runKey || "").trim(); const by = adminBy(req); const lat = Number(req.body?.lat); const lng = Number(req.body?.lng); const heading = Number(req.body?.heading); const speed = Number(req.body?.speed); const accuracy = Number(req.body?.accuracy);
+    if (!Number.isFinite(lat) || !Number.isFinite(lng)) return res.status(400).json({ ok: false, error: "lat/lng required" });
     await ensureTrackingDoc(runKey);
-    await Tracking.updateOne(
-      { runKey },
-      {
-        $set: {
-          lastLat: lat,
-          lastLng: lng,
-          lastHeading: Number.isFinite(heading) ? heading : null,
-          lastSpeed: Number.isFinite(speed) ? speed : null,
-          lastAccuracy: Number.isFinite(accuracy) ? accuracy : null,
-          lastAt: new Date(),
-          updatedBy: by,
-        },
-      }
-    );
-
+    await Tracking.updateOne({ runKey }, { $set: { lastLat: lat, lastLng: lng, lastHeading: Number.isFinite(heading) ? heading : null, lastSpeed: Number.isFinite(speed) ? speed : null, lastAccuracy: Number.isFinite(accuracy) ? accuracy : null, lastAt: new Date(), updatedBy: by } });
     res.json({ ok: true });
-  } catch (e) {
-    res.status(500).json({ ok: false, error: String(e) });
-  }
+  } catch (e) { res.status(500).json({ ok: false, error: String(e) }); }
 });
-
 app.get("/api/admin/orders/:orderId/tracking-link", requireLogin, requireAdmin, async (req, res) => {
   try {
-    const orderId = String(req.params.orderId || "").trim().toUpperCase();
-    const o = await Order.findOne({ orderId }).lean();
-    if (!o) return res.status(404).json({ ok: false, error: "Order not found" });
-
-    const run = await Run.findOne({ runKey: o.runKey }).lean();
-    if (!run) return res.status(404).json({ ok: false, error: "Run not found" });
-
-    const expMs = dayjs(run.cutoffAt).add(1, "day").valueOf();
-    const token = signTrackingToken(o.orderId, run.runKey, expMs);
-
+    const orderId = String(req.params.orderId || "").trim().toUpperCase(); const o = await Order.findOne({ orderId }).lean(); if (!o) return res.status(404).json({ ok: false, error: "Order not found" });
+    const run = await Run.findOne({ runKey: o.runKey }).lean(); if (!run) return res.status(404).json({ ok: false, error: "Run not found" });
+    const expMs = dayjs(run.cutoffAt).add(1, "day").valueOf(); const token = signTrackingToken(o.orderId, run.runKey, expMs);
     const url = `https://api.tobermorygroceryrun.ca/member?trackRunKey=${encodeURIComponent(run.runKey)}&token=${encodeURIComponent(token)}&orderId=${encodeURIComponent(o.orderId)}`;
     res.json({ ok: true, url });
-  } catch (e) {
-    res.status(500).json({ ok: false, error: String(e) });
-  }
+  } catch (e) { res.status(500).json({ ok: false, error: String(e) }); }
 });
 
 // =========================
-// ADMIN PAGE
+// ADMIN PAGE (Includes Catalogue UI)
 // =========================
 app.get("/admin", requireLogin, requireAdmin, async (_req, res) => {
   res.setHeader("Content-Type", "text/html; charset=utf-8");
@@ -2246,41 +1160,18 @@ app.get("/admin", requireLogin, requireAdmin, async (_req, res) => {
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>TGR Admin</title>
 <style>
-  :root{
-    --bg:#0b0b0b; --panel:rgba(255,255,255,.06); --line:rgba(255,255,255,.14);
-    --text:#fff; --muted:rgba(255,255,255,.75);
-    --red:#e3342f; --red2:#ff4a44;
-    --radius:14px;
-  }
+  :root{ --bg:#0b0b0b; --panel:rgba(255,255,255,.06); --line:rgba(255,255,255,.14); --text:#fff; --muted:rgba(255,255,255,.75); --red:#e3342f; --red2:#ff4a44; --radius:14px; }
   body{margin:0;background:var(--bg);color:var(--text);font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;}
   .wrap{max-width:1400px;margin:0 auto;padding:16px;}
   .card{border:1px solid var(--line);background:var(--panel);border-radius:var(--radius);padding:14px;}
   .row{display:flex;gap:10px;flex-wrap:wrap;align-items:center;}
-  .btn{
-    border:1px solid rgba(255,255,255,.18);
-    background:rgba(255,255,255,.06);
-    color:#fff;font-weight:900;
-    border-radius:999px;
-    padding:10px 14px;
-    cursor:pointer;
-    text-decoration:none;
-    white-space:nowrap;
-  }
+  .btn{border:1px solid rgba(255,255,255,.18);background:rgba(255,255,255,.06);color:#fff;font-weight:900;border-radius:999px;padding:10px 14px;cursor:pointer;text-decoration:none;white-space:nowrap;}
   .btn.primary{background:linear-gradient(180deg,var(--red2),var(--red));border-color:rgba(0,0,0,.25);}
   .btn.ghost{background:transparent;}
   .muted{color:var(--muted);}
   .pill{display:inline-block;padding:4px 10px;border-radius:999px;border:1px solid rgba(255,255,255,.18);background:rgba(255,255,255,.06);font-weight:900;font-size:12px;}
   .hr{height:1px;background:rgba(255,255,255,.12);margin:12px 0;}
-  input,select,textarea{
-    width:100%;
-    padding:12px 12px;
-    border-radius:12px;
-    border:1px solid rgba(255,255,255,.18);
-    background:rgba(0,0,0,.22);
-    color:#fff;
-    font-size:15px;
-    outline:none;
-  }
+  input,select,textarea{width:100%;padding:12px 12px;border-radius:12px;border:1px solid rgba(255,255,255,.18);background:rgba(0,0,0,.22);color:#fff;font-size:15px;outline:none;}
   textarea{min-height:90px;resize:vertical;}
   table{width:100%;border-collapse:collapse;}
   th,td{padding:10px 8px;border-bottom:1px solid rgba(255,255,255,.12);vertical-align:top;}
@@ -2289,15 +1180,8 @@ app.get("/admin", requireLogin, requireAdmin, async (_req, res) => {
   @media (max-width: 980px){ .grid{grid-template-columns: 1fr;} }
   .toast{margin-top:10px;padding:10px 12px;border-radius:12px;border:1px solid rgba(255,255,255,.18);background:rgba(0,0,0,.24);display:none;font-weight:900;}
   .toast.show{display:block;}
-  .modalBack{
-    position:fixed; inset:0; background:rgba(0,0,0,.55);
-    display:none; align-items:center; justify-content:center; padding:16px;
-  }
-  .modal{
-    width:min(980px, 100%); max-height:92vh; overflow:auto;
-    border:1px solid rgba(255,255,255,.16); background:#0b0b0b;
-    border-radius:16px; padding:14px;
-  }
+  .modalBack{position:fixed; inset:0; background:rgba(0,0,0,.55); display:none; align-items:center; justify-content:center; padding:16px;}
+  .modal{width:min(980px, 100%); max-height:92vh; overflow:auto; border:1px solid rgba(255,255,255,.16); background:#0b0b0b; border-radius:16px; padding:14px;}
   .k{font-size:12px;color:rgba(255,255,255,.7);text-transform:uppercase;letter-spacing:.08em;}
   .v{font-weight:900;}
   .two{display:grid;grid-template-columns:1fr 1fr; gap:10px;}
@@ -2311,7 +1195,7 @@ app.get("/admin", requireLogin, requireAdmin, async (_req, res) => {
     <div class="row" style="justify-content:space-between;">
       <div>
         <div style="font-weight:1000;font-size:22px;">Admin Command Center</div>
-        <div class="muted">Search, view, status updates, payments, tracking links, export.</div>
+        <div class="muted">Manage orders, tracking, and grocery catalogue.</div>
       </div>
       <div class="row">
         <a class="btn ghost" href="${escapeHtml(PUBLIC_SITE_URL)}/">Back to site</a>
@@ -2319,344 +1203,174 @@ app.get("/admin", requireLogin, requireAdmin, async (_req, res) => {
         <a class="btn ghost" href="/logout?returnTo=${encodeURIComponent(PUBLIC_SITE_URL + "/")}">Log out</a>
       </div>
     </div>
-
     <div class="toast" id="toast"></div>
 
-    <div class="hr"></div>
+    <div class="hr" style="margin-top:16px; margin-bottom:16px;"></div>
 
-    <div class="grid">
-      <div class="card" style="box-shadow:none;">
-        <div style="font-weight:1000;">Search / Filters</div>
-        <div class="hr"></div>
+    <div class="row" style="margin-bottom:14px;">
+      <button class="btn primary" id="tabBtnOrders" onclick="switchTab('orders')">Orders Management</button>
+      <button class="btn" id="tabBtnCatalogue" onclick="switchTab('catalogue')">Catalogue / Inventory</button>
+    </div>
 
-        <div class="row">
-          <div style="flex: 2 1 320px;">
-            <label class="muted" style="font-weight:900;">Search</label>
-            <input id="q" placeholder="orderId, name, email, phone, address" />
+    <div id="tabContentOrders">
+      <div class="grid">
+        <div class="card" style="box-shadow:none;">
+          <div style="font-weight:1000;">Search / Filters</div>
+          <div class="hr"></div>
+          <div class="row">
+            <div style="flex: 2 1 320px;"><label class="muted" style="font-weight:900;">Search</label><input id="q" placeholder="orderId, name, email, phone, address" /></div>
+            <div style="flex: 1 1 180px;"><label class="muted" style="font-weight:900;">State</label><select id="state"><option value="">Any</option><option>submitted</option><option>confirmed</option><option>shopping</option><option>packed</option><option>out_for_delivery</option><option>delivered</option><option>issue</option><option>cancelled</option></select></div>
+            <div style="flex: 1 1 180px;"><label class="muted" style="font-weight:900;">Run Key</label><input id="runKey" placeholder="YYYY-MM-DD-local" /></div>
           </div>
-          <div style="flex: 1 1 180px;">
-            <label class="muted" style="font-weight:900;">State</label>
-            <select id="state">
-              <option value="">Any</option>
-              <option>submitted</option>
-              <option>confirmed</option>
-              <option>shopping</option>
-              <option>packed</option>
-              <option>out_for_delivery</option>
-              <option>delivered</option>
-              <option>issue</option>
-              <option>cancelled</option>
-            </select>
+          <div class="row">
+            <div style="flex: 1 1 160px;"><label class="muted" style="font-weight:900;">Zone</label><select id="zone"><option value="">Any</option><option>A</option><option>B</option><option>C</option><option>D</option></select></div>
+            <div style="flex: 1 1 220px;"><label class="muted" style="font-weight:900;">Town</label><input id="town" placeholder="e.g., Tobermory" /></div>
+            <div style="flex: 1 1 220px;"><label class="muted" style="font-weight:900;">Flag</label><select id="flag"><option value="">Any</option><option value="idRequired">idRequired</option><option value="prescription">prescription</option><option value="alcohol">alcohol</option><option value="bulky">bulky</option><option value="needsContact">needsContact</option><option value="newCustomerDepositRequired">newCustomerDepositRequired</option></select></div>
           </div>
-          <div style="flex: 1 1 180px;">
-            <label class="muted" style="font-weight:900;">Run Key</label>
-            <input id="runKey" placeholder="YYYY-MM-DD-local" />
+          <div class="row">
+            <label class="row" style="gap:8px;"><input id="unpaidFees" type="checkbox" style="width:18px;height:18px;"><span class="muted" style="font-weight:900;">Unpaid fees only</span></label>
+            <label class="row" style="gap:8px;"><input id="hold" type="checkbox" style="width:18px;height:18px;"><span class="muted" style="font-weight:900;">Hold only</span></label>
+          </div>
+          <div class="row" style="margin-top:8px;">
+            <button class="btn primary" id="searchBtn">Search</button>
+            <button class="btn" id="refreshBtn">Refresh</button>
+            <button class="btn ghost" id="clearBtn">Clear</button>
+            <span class="pill" id="countPill">—</span>
           </div>
         </div>
 
-        <div class="row">
-          <div style="flex: 1 1 160px;">
-            <label class="muted" style="font-weight:900;">Zone</label>
-            <select id="zone">
-              <option value="">Any</option>
-              <option>A</option><option>B</option><option>C</option><option>D</option>
-            </select>
+        <div class="card" style="box-shadow:none;">
+          <div style="font-weight:1000;">Quick Tools</div>
+          <div class="hr"></div>
+          <div class="muted">Export active deliveries for Routific by runKey:</div>
+          <div class="row" style="margin-top:10px;">
+            <div style="flex:1 1 260px;"><input id="exportRunKey" placeholder="YYYY-MM-DD-local" /></div>
+            <button class="btn" id="exportBtn">Download CSV</button>
           </div>
-          <div style="flex: 1 1 220px;">
-            <label class="muted" style="font-weight:900;">Town</label>
-            <input id="town" placeholder="e.g., Tobermory" />
-          </div>
-          <div style="flex: 1 1 220px;">
-            <label class="muted" style="font-weight:900;">Flag</label>
-            <select id="flag">
-              <option value="">Any</option>
-              <option value="idRequired">idRequired</option>
-              <option value="prescription">prescription</option>
-              <option value="alcohol">alcohol</option>
-              <option value="bulky">bulky</option>
-              <option value="needsContact">needsContact</option>
-              <option value="newCustomerDepositRequired">newCustomerDepositRequired</option>
-            </select>
-          </div>
-        </div>
-
-        <div class="row">
-          <label class="row" style="gap:8px;">
-            <input id="unpaidFees" type="checkbox" style="width:18px;height:18px;">
-            <span class="muted" style="font-weight:900;">Unpaid fees only</span>
-          </label>
-          <label class="row" style="gap:8px;">
-            <input id="hold" type="checkbox" style="width:18px;height:18px;">
-            <span class="muted" style="font-weight:900;">Hold only</span>
-          </label>
-        </div>
-
-        <div class="row" style="margin-top:8px;">
-          <button class="btn primary" id="searchBtn">Search</button>
-          <button class="btn" id="refreshBtn">Refresh</button>
-          <button class="btn ghost" id="clearBtn">Clear</button>
-          <span class="pill" id="countPill">—</span>
+          <div class="hr"></div>
+          <div class="muted">Tip: click Open on any row to view full order details and controls.</div>
         </div>
       </div>
-
-      <div class="card" style="box-shadow:none;">
-        <div style="font-weight:1000;">Quick Tools</div>
-        <div class="hr"></div>
-
-        <div class="muted">Export active deliveries for Routific by runKey:</div>
-        <div class="row" style="margin-top:10px;">
-          <div style="flex:1 1 260px;">
-            <input id="exportRunKey" placeholder="YYYY-MM-DD-local" />
-          </div>
-          <button class="btn" id="exportBtn">Download CSV</button>
-        </div>
-
-        <div class="hr"></div>
-
-        <div class="muted">Tip: click Open on any row to view full order details and controls.</div>
+      <div class="hr"></div>
+      <div style="overflow:auto;">
+        <table>
+          <thead><tr><th>Order</th><th>Customer</th><th>Address</th><th>Run</th><th>Status</th><th>Fees</th><th>Flags</th><th>Actions</th></tr></thead>
+          <tbody id="rows"><tr><td colspan="8" class="muted">Loading…</td></tr></tbody>
+        </table>
       </div>
     </div>
 
-    <div class="hr"></div>
-
-    <div style="overflow:auto;">
-      <table>
-        <thead>
-          <tr>
-            <th>Order</th>
-            <th>Customer</th>
-            <th>Address</th>
-            <th>Run</th>
-            <th>Status</th>
-            <th>Fees</th>
-            <th>Flags</th>
-            <th>Actions</th>
-          </tr>
-        </thead>
-        <tbody id="rows">
-          <tr><td colspan="8" class="muted">Loading…</td></tr>
-        </tbody>
-      </table>
+    <div id="tabContentCatalogue" style="display:none;">
+      <div class="grid">
+        <div class="card" style="box-shadow:none;">
+          <div style="font-weight:1000;">Add New Item</div>
+          <div class="hr"></div>
+          <div class="row">
+             <div style="flex: 2 1 200px;"><label class="muted" style="font-weight:900;">Item Name (e.g. Milk 2% 4L)</label><input id="catName" placeholder="Item Name" /></div>
+          </div>
+          <div class="row">
+             <div style="flex: 1 1 150px;"><label class="muted" style="font-weight:900;">Category</label><input id="catCategory" placeholder="Dairy, Produce, etc." /></div>
+             <div style="flex: 1 1 100px;"><label class="muted" style="font-weight:900;">Est Price ($)</label><input id="catPrice" type="number" step="0.01" placeholder="5.99" /></div>
+          </div>
+          <div class="row" style="margin-top:12px;">
+             <button class="btn primary" id="addCatBtn">Add Item</button>
+          </div>
+        </div>
+        <div class="card" style="box-shadow:none;">
+          <div style="font-weight:1000;">Catalogue Stats</div>
+          <div class="hr"></div>
+          <div class="muted">These items will auto-complete for customers in the order form.</div>
+          <div class="row" style="margin-top:12px;">
+             <span class="pill" id="catCountPill">Items: 0</span>
+          </div>
+        </div>
+      </div>
+      <div class="hr"></div>
+      <div style="overflow:auto;">
+        <table>
+          <thead><tr><th>Item Name</th><th>Category</th><th>Est Price</th><th>Actions</th></tr></thead>
+          <tbody id="catRows"><tr><td colspan="4" class="muted">Loading…</td></tr></tbody>
+        </table>
+      </div>
     </div>
+
   </div>
 </div>
 
 <div class="modalBack" id="modalBack">
   <div class="modal">
-    <div class="row" style="justify-content:space-between;">
-      <div style="font-weight:1000;font-size:20px;">Order Details</div>
-      <button class="btn ghost" id="closeModal">Close</button>
-    </div>
+    <div class="row" style="justify-content:space-between;"><div style="font-weight:1000;font-size:20px;">Order Details</div><button class="btn ghost" id="closeModal">Close</button></div>
     <div class="hr"></div>
-
     <div class="two">
       <div class="card" style="box-shadow:none;">
-        <div class="k">Order ID</div><div class="v" id="m_orderId">—</div>
-        <div class="hr"></div>
-
+        <div class="k">Order ID</div><div class="v" id="m_orderId">—</div><div class="hr"></div>
         <div class="k">Customer</div><div class="v" id="m_customer">—</div>
         <div class="k">Phone</div><div class="v" id="m_phone">—</div>
         <div class="k">Alt Phone</div><div class="v" id="m_altPhone">—</div>
         <div class="k">Email</div><div class="v" id="m_email">—</div>
-        <div class="k">DOB</div><div class="v" id="m_dob">—</div>
-
-        <div class="hr"></div>
-
+        <div class="k">DOB</div><div class="v" id="m_dob">—</div><div class="hr"></div>
         <div class="k">Address</div><div class="v" id="m_addr">—</div>
         <div class="k">Zone</div><div class="v" id="m_zone">—</div>
         <div class="k">Run</div><div class="v" id="m_run">—</div>
       </div>
-
       <div class="card" style="box-shadow:none;">
         <div class="k">Fees total</div><div class="v" id="m_fees">—</div>
         <div class="k">Fees payment</div><div class="v" id="m_feesCurrent">—</div>
-        <div class="k">Groceries payment</div><div class="v" id="m_groceriesCurrent">—</div>
-
-        <div class="hr"></div>
-
+        <div class="k">Groceries payment</div><div class="v" id="m_groceriesCurrent">—</div><div class="hr"></div>
         <label class="muted" style="font-weight:900;">Status state</label>
-        <select id="m_state">
-          <option>submitted</option>
-          <option>confirmed</option>
-          <option>shopping</option>
-          <option>packed</option>
-          <option>out_for_delivery</option>
-          <option>delivered</option>
-          <option>issue</option>
-          <option>cancelled</option>
-        </select>
-
-        <label class="muted" style="font-weight:900;">Status note (optional)</label>
-        <input id="m_stateNote" placeholder="Short note" />
-
-        <div class="row" style="margin-top:10px;">
-          <button class="btn primary" id="m_saveState">Save status</button>
-          <button class="btn" id="m_trackingLink">Copy tracking link</button>
-        </div>
-
-        <div class="hr"></div>
-
+        <select id="m_state"><option>submitted</option><option>confirmed</option><option>shopping</option><option>packed</option><option>out_for_delivery</option><option>delivered</option><option>issue</option><option>cancelled</option></select>
+        <label class="muted" style="font-weight:900;">Status note (optional)</label><input id="m_stateNote" placeholder="Short note" />
+        <div class="row" style="margin-top:10px;"><button class="btn primary" id="m_saveState">Save status</button><button class="btn" id="m_trackingLink">Copy tracking link</button></div><div class="hr"></div>
         <div class="row">
-          <div style="flex:1 1 200px;">
-            <label class="muted" style="font-weight:900;">Fees status</label>
-            <select id="m_feesStatus">
-              <option value="">(no change)</option>
-              <option value="unpaid">unpaid</option>
-              <option value="paid">paid</option>
-            </select>
-          </div>
-          <div style="flex:1 1 200px;">
-            <label class="muted" style="font-weight:900;">Groceries status</label>
-            <select id="m_groceriesStatus">
-              <option value="">(no change)</option>
-              <option value="unpaid">unpaid</option>
-              <option value="deposit_paid">deposit_paid</option>
-              <option value="paid">paid</option>
-            </select>
-          </div>
+          <div style="flex:1 1 200px;"><label class="muted" style="font-weight:900;">Fees status</label><select id="m_feesStatus"><option value="">(no change)</option><option value="unpaid">unpaid</option><option value="paid">paid</option></select></div>
+          <div style="flex:1 1 200px;"><label class="muted" style="font-weight:900;">Groceries status</label><select id="m_groceriesStatus"><option value="">(no change)</option><option value="unpaid">unpaid</option><option value="deposit_paid">deposit_paid</option><option value="paid">paid</option></select></div>
         </div>
-
-        <label class="muted" style="font-weight:900;">Payment note (optional)</label>
-        <input id="m_payNote" placeholder="e.g., paid cash, e-transfer, Square receipt #" />
-
-        <div class="row" style="margin-top:10px;">
-          <button class="btn" id="m_savePay">Save payments</button>
-          <button class="btn" id="m_cancelAdmin">Cancel order</button>
-          <button class="btn ghost" id="m_deleteOrder">Delete order</button>
-        </div>
+        <label class="muted" style="font-weight:900;">Payment note (optional)</label><input id="m_payNote" placeholder="e.g., paid cash, e-transfer, Square receipt #" />
+        <div class="row" style="margin-top:10px;"><button class="btn" id="m_savePay">Save payments</button><button class="btn" id="m_cancelAdmin">Cancel order</button><button class="btn ghost" id="m_deleteOrder">Delete order</button></div>
       </div>
     </div>
-
     <div class="hr"></div>
-
     <div class="two">
-      <div class="card" style="box-shadow:none;">
-        <div style="font-weight:1000;">Grocery list</div>
-        <div class="hr"></div>
-        <pre id="m_list"></pre>
-      </div>
-
-      <div class="card" style="box-shadow:none;">
-        <div style="font-weight:1000;">Add-ons / notes</div>
-        <div class="hr"></div>
-        <pre id="m_addons"></pre>
-      </div>
+      <div class="card" style="box-shadow:none;"><div style="font-weight:1000;">Grocery list</div><div class="hr"></div><pre id="m_list"></pre></div>
+      <div class="card" style="box-shadow:none;"><div style="font-weight:1000;">Add-ons / notes</div><div class="hr"></div><pre id="m_addons"></pre></div>
     </div>
   </div>
 </div>
 
 <script>
-  const toast = (msg)=>{
-    const el = document.getElementById("toast");
-    el.textContent = msg;
-    el.classList.add("show");
-    setTimeout(()=>el.classList.remove("show"), 3500);
-  };
-
+  const toast = (msg)=>{ const el = document.getElementById("toast"); el.textContent = msg; el.classList.add("show"); setTimeout(()=>el.classList.remove("show"), 3500); };
   const qs = (k)=> document.getElementById(k);
-  const rowsEl = qs("rows");
-  const countPill = qs("countPill");
-
-  let modalOrder = null;
-
-  function buildQuery(){
-    const p = new URLSearchParams();
-    const q = qs("q").value.trim();
-    const state = qs("state").value.trim();
-    const runKey = qs("runKey").value.trim();
-    const zone = qs("zone").value.trim();
-    const town = qs("town").value.trim();
-    const flag = qs("flag").value.trim();
-    const unpaidFees = qs("unpaidFees").checked ? "1" : "";
-    const hold = qs("hold").checked ? "1" : "";
-
-    if(q) p.set("q", q);
-    if(state) p.set("state", state);
-    if(runKey) p.set("runKey", runKey);
-    if(zone) p.set("zone", zone);
-    if(town) p.set("town", town);
-    if(flag) p.set("flag", flag);
-    if(unpaidFees) p.set("unpaidFees", unpaidFees);
-    if(hold) p.set("hold", hold);
-    p.set("limit","200");
-    return p.toString();
+  
+  function switchTab(tab) {
+    qs('tabContentOrders').style.display = tab === 'orders' ? 'block' : 'none';
+    qs('tabContentCatalogue').style.display = tab === 'catalogue' ? 'block' : 'none';
+    qs('tabBtnOrders').className = tab === 'orders' ? 'btn primary' : 'btn';
+    qs('tabBtnCatalogue').className = tab === 'catalogue' ? 'btn primary' : 'btn';
+    if(tab === 'catalogue') loadCatalogue();
   }
 
-  function esc(s){
-    return String(s||"")
-      .replaceAll("&","&amp;")
-      .replaceAll("<","&lt;")
-      .replaceAll(">","&gt;")
-      .replaceAll('"',"&quot;");
-  }
-
-  function money(n){
-    const x = Number(n||0);
-    return x.toFixed(2);
-  }
+  // --- Orders Logic ---
+  const rowsEl = qs("rows"); const countPill = qs("countPill"); let modalOrder = null;
+  function buildQuery(){ const p = new URLSearchParams(); const q = qs("q").value.trim(); const state = qs("state").value.trim(); const runKey = qs("runKey").value.trim(); const zone = qs("zone").value.trim(); const town = qs("town").value.trim(); const flag = qs("flag").value.trim(); const unpaidFees = qs("unpaidFees").checked ? "1" : ""; const hold = qs("hold").checked ? "1" : ""; if(q) p.set("q", q); if(state) p.set("state", state); if(runKey) p.set("runKey", runKey); if(zone) p.set("zone", zone); if(town) p.set("town", town); if(flag) p.set("flag", flag); if(unpaidFees) p.set("unpaidFees", unpaidFees); if(hold) p.set("hold", hold); p.set("limit","200"); return p.toString(); }
+  function esc(s){ return String(s||"").replaceAll("&","&amp;").replaceAll("<","&lt;").replaceAll(">","&gt;").replaceAll('"',"&quot;"); }
+  function money(n){ return Number(n||0).toFixed(2); }
 
   function render(items){
-    const list = items || [];
-    countPill.textContent = "Results: " + list.length;
-
-    if(!list.length){
-      rowsEl.innerHTML = '<tr><td colspan="8" class="muted">No results.</td></tr>';
-      return;
-    }
-
+    const list = items || []; countPill.textContent = "Results: " + list.length;
+    if(!list.length){ rowsEl.innerHTML = '<tr><td colspan="8" class="muted">No results.</td></tr>'; return; }
     rowsEl.innerHTML = list.map(o=>{
-      const id = esc(o.orderId);
-      const cust = esc(o.customer?.fullName || "");
-      const phone = esc(o.customer?.phone || "");
-      const email = esc(o.customer?.email || "");
-      const addr = esc((o.address?.streetAddress||"") + (o.address?.unit ? (" " + o.address.unit) : "") + ", " + (o.address?.town||"") + " " + (o.address?.postalCode||""));
-      const run = esc(o.runKey || "");
-      const rt = esc(o.runType || "");
-      const st = esc(o.status?.state || "");
-      const fees = money(o.pricingSnapshot?.totalFees || 0);
-      const flags = [];
-      const f = o.flags || {};
-      Object.keys(f).forEach(k=>{ if (f[k] === true) flags.push(k); });
-      const flagTxt = esc(flags.join(", "));
-
-      return \`
-        <tr>
-          <td><div style="font-weight:1000;">\${id}</div><div class="muted" style="font-size:12px;">\${email}</div></td>
-          <td><div style="font-weight:900;">\${cust}</div><div class="muted" style="font-size:12px;">\${phone}</div></td>
-          <td>\${addr}</td>
-          <td><span class="pill">\${rt}</span><div class="muted" style="font-size:12px;margin-top:4px;">\${run}</div></td>
-          <td><span class="pill">\${st}</span></td>
-          <td>$\${fees}</td>
-          <td><div class="muted" style="font-size:12px;">\${flagTxt || "—"}</div></td>
-          <td><button class="btn" data-open="\${id}">Open</button></td>
-        </tr>
-      \`;
+      const id = esc(o.orderId); const cust = esc(o.customer?.fullName || ""); const phone = esc(o.customer?.phone || ""); const email = esc(o.customer?.email || ""); const addr = esc((o.address?.streetAddress||"") + (o.address?.unit ? (" " + o.address.unit) : "") + ", " + (o.address?.town||"") + " " + (o.address?.postalCode||"")); const run = esc(o.runKey || ""); const rt = esc(o.runType || ""); const st = esc(o.status?.state || ""); const fees = money(o.pricingSnapshot?.totalFees || 0); const flags = []; const f = o.flags || {}; Object.keys(f).forEach(k=>{ if (f[k] === true) flags.push(k); }); const flagTxt = esc(flags.join(", "));
+      return \`<tr><td><div style="font-weight:1000;">\${id}</div><div class="muted" style="font-size:12px;">\${email}</div></td><td><div style="font-weight:900;">\${cust}</div><div class="muted" style="font-size:12px;">\${phone}</div></td><td>\${addr}</td><td><span class="pill">\${rt}</span><div class="muted" style="font-size:12px;margin-top:4px;">\${run}</div></td><td><span class="pill">\${st}</span></td><td>$\${fees}</td><td><div class="muted" style="font-size:12px;">\${flagTxt || "—"}</div></td><td><button class="btn" data-open="\${id}">Open</button></td></tr>\`;
     }).join("");
-
-    document.querySelectorAll("[data-open]").forEach(btn=>{
-      btn.addEventListener("click", ()=> openOrder(btn.getAttribute("data-open")));
-    });
+    document.querySelectorAll("[data-open]").forEach(btn=>{ btn.addEventListener("click", ()=> openOrder(btn.getAttribute("data-open"))); });
   }
 
-  async function search(){
-    rowsEl.innerHTML = '<tr><td colspan="8" class="muted">Loading…</td></tr>';
-    try{
-      const r = await fetch("/api/admin/orders?" + buildQuery(), { credentials:"include" });
-      const d = await r.json().catch(()=>({}));
-      if(!r.ok || d.ok===false) throw new Error(d.error || "Load failed");
-      render(d.items || []);
-    } catch(e){
-      rowsEl.innerHTML = '<tr><td colspan="8" class="muted">Error: ' + esc(e.message||e) + '</td></tr>';
-    }
-  }
+  async function search(){ rowsEl.innerHTML = '<tr><td colspan="8" class="muted">Loading…</td></tr>'; try{ const r = await fetch("/api/admin/orders?" + buildQuery(), { credentials:"include" }); const d = await r.json().catch(()=>({})); if(!r.ok || d.ok===false) throw new Error(d.error || "Load failed"); render(d.items || []); } catch(e){ rowsEl.innerHTML = '<tr><td colspan="8" class="muted">Error: ' + esc(e.message||e) + '</td></tr>'; } }
 
-  function openModal(show){
-    qs("modalBack").style.display = show ? "flex" : "none";
-  }
+  function openModal(show){ qs("modalBack").style.display = show ? "flex" : "none"; }
 
   function buildAddonsText(o){
-    const lines = [];
-    const a = o.addOns || {};
+    const lines = []; const a = o.addOns || {};
     if (a.prescription?.requested) lines.push("Prescription: YES" + (a.prescription.pharmacyName ? " • " + a.prescription.pharmacyName : "") + (a.prescription.notes ? " • " + a.prescription.notes : ""));
     if (a.liquor?.requested) lines.push("Liquor: YES" + (a.liquor.storeName ? " • " + a.liquor.storeName : "") + (a.liquor.notes ? " • " + a.liquor.notes : ""));
     if (a.printing?.requested) lines.push("Printing: YES" + (a.printing.pages ? " • pages " + a.printing.pages : "") + (a.printing.notes ? " • " + a.printing.notes : ""));
@@ -2676,167 +1390,104 @@ app.get("/admin", requireLogin, requireAdmin, async (_req, res) => {
 
   async function openOrder(orderId){
     try{
-      const r = await fetch("/api/admin/orders/" + encodeURIComponent(orderId), { credentials:"include" });
-      const d = await r.json().catch(()=>({}));
-      if(!r.ok || d.ok===false) throw new Error(d.error || "Order load failed");
-      modalOrder = d.order;
-
-      qs("m_orderId").textContent = modalOrder.orderId || "—";
-      qs("m_customer").textContent = modalOrder.customer?.fullName || "—";
-      qs("m_phone").textContent = modalOrder.customer?.phone || "—";
-      qs("m_altPhone").textContent = modalOrder.customer?.altPhone || "—";
-      qs("m_email").textContent = modalOrder.customer?.email || "—";
-      qs("m_dob").textContent = modalOrder.customer?.dob || "—";
-      qs("m_addr").textContent =
-        (modalOrder.address?.streetAddress || "") +
-        (modalOrder.address?.unit ? (" " + modalOrder.address.unit) : "") +
-        ((modalOrder.address?.town || modalOrder.address?.postalCode) ? ", " : "") +
-        (modalOrder.address?.town || "") +
-        (modalOrder.address?.postalCode ? " " + modalOrder.address.postalCode : "");
-      qs("m_zone").textContent = modalOrder.address?.zone || "—";
-      qs("m_run").textContent = (modalOrder.runKey||"") + " (" + (modalOrder.runType||"") + ")";
-      qs("m_fees").textContent = "$" + money(modalOrder.pricingSnapshot?.totalFees || 0);
-      qs("m_feesCurrent").textContent = modalOrder.payments?.fees?.status || "—";
-      qs("m_groceriesCurrent").textContent = modalOrder.payments?.groceries?.status || "—";
-
-      qs("m_state").value = (modalOrder.status?.state || "submitted");
-      qs("m_stateNote").value = (modalOrder.status?.note || "");
-      qs("m_list").textContent = modalOrder.list?.groceryListText || "—";
-      qs("m_addons").textContent = buildAddonsText(modalOrder);
-
-      qs("m_feesStatus").value = "";
-      qs("m_groceriesStatus").value = "";
-      qs("m_payNote").value = "";
-
+      const r = await fetch("/api/admin/orders/" + encodeURIComponent(orderId), { credentials:"include" }); const d = await r.json().catch(()=>({})); if(!r.ok || d.ok===false) throw new Error(d.error || "Order load failed"); modalOrder = d.order;
+      qs("m_orderId").textContent = modalOrder.orderId || "—"; qs("m_customer").textContent = modalOrder.customer?.fullName || "—"; qs("m_phone").textContent = modalOrder.customer?.phone || "—"; qs("m_altPhone").textContent = modalOrder.customer?.altPhone || "—"; qs("m_email").textContent = modalOrder.customer?.email || "—"; qs("m_dob").textContent = modalOrder.customer?.dob || "—";
+      qs("m_addr").textContent = (modalOrder.address?.streetAddress || "") + (modalOrder.address?.unit ? (" " + modalOrder.address.unit) : "") + ((modalOrder.address?.town || modalOrder.address?.postalCode) ? ", " : "") + (modalOrder.address?.town || "") + (modalOrder.address?.postalCode ? " " + modalOrder.address.postalCode : "");
+      qs("m_zone").textContent = modalOrder.address?.zone || "—"; qs("m_run").textContent = (modalOrder.runKey||"") + " (" + (modalOrder.runType||"") + ")"; qs("m_fees").textContent = "$" + money(modalOrder.pricingSnapshot?.totalFees || 0); qs("m_feesCurrent").textContent = modalOrder.payments?.fees?.status || "—"; qs("m_groceriesCurrent").textContent = modalOrder.payments?.groceries?.status || "—";
+      qs("m_state").value = (modalOrder.status?.state || "submitted"); qs("m_stateNote").value = (modalOrder.status?.note || ""); qs("m_list").textContent = modalOrder.list?.groceryListText || "—"; qs("m_addons").textContent = buildAddonsText(modalOrder);
+      qs("m_feesStatus").value = ""; qs("m_groceriesStatus").value = ""; qs("m_payNote").value = "";
       openModal(true);
-    } catch(e){
-      toast(String(e.message||e));
-    }
+    } catch(e){ toast(String(e.message||e)); }
   }
 
   async function saveStatus(){
-    if(!modalOrder?.orderId) return;
-    const state = qs("m_state").value;
-    const note = qs("m_stateNote").value.trim();
-    try{
-      const r = await fetch("/api/admin/orders/" + encodeURIComponent(modalOrder.orderId) + "/status", {
-        method:"POST",
-        headers:{ "Content-Type":"application/json" },
-        credentials:"include",
-        body: JSON.stringify({ state, note })
-      });
-      const d = await r.json().catch(()=>({}));
-      if(!r.ok || d.ok===false) throw new Error(d.error || "Save failed");
-      toast("Status saved ✅");
-      await openOrder(modalOrder.orderId);
-      await search();
-    } catch(e){
-      toast(String(e.message||e));
-    }
+    if(!modalOrder?.orderId) return; const state = qs("m_state").value; const note = qs("m_stateNote").value.trim();
+    try{ const r = await fetch("/api/admin/orders/" + encodeURIComponent(modalOrder.orderId) + "/status", { method:"POST", headers:{ "Content-Type":"application/json" }, credentials:"include", body: JSON.stringify({ state, note }) }); const d = await r.json().catch(()=>({})); if(!r.ok || d.ok===false) throw new Error(d.error || "Save failed"); toast("Status saved ✅"); await openOrder(modalOrder.orderId); await search(); } catch(e){ toast(String(e.message||e)); }
   }
 
   async function savePayments(){
-    if(!modalOrder?.orderId) return;
-    const feesStatus = qs("m_feesStatus").value;
-    const groceriesStatus = qs("m_groceriesStatus").value;
-    const note = qs("m_payNote").value.trim();
-    try{
-      const r = await fetch("/api/admin/orders/" + encodeURIComponent(modalOrder.orderId) + "/payments", {
-        method:"POST",
-        headers:{ "Content-Type":"application/json" },
-        credentials:"include",
-        body: JSON.stringify({ feesStatus, groceriesStatus, note })
-      });
-      const d = await r.json().catch(()=>({}));
-      if(!r.ok || d.ok===false) throw new Error(d.error || "Save failed");
-      toast("Payments saved ✅");
-      await openOrder(modalOrder.orderId);
-      await search();
-    } catch(e){
-      toast(String(e.message||e));
-    }
+    if(!modalOrder?.orderId) return; const feesStatus = qs("m_feesStatus").value; const groceriesStatus = qs("m_groceriesStatus").value; const note = qs("m_payNote").value.trim();
+    try{ const r = await fetch("/api/admin/orders/" + encodeURIComponent(modalOrder.orderId) + "/payments", { method:"POST", headers:{ "Content-Type":"application/json" }, credentials:"include", body: JSON.stringify({ feesStatus, groceriesStatus, note }) }); const d = await r.json().catch(()=>({})); if(!r.ok || d.ok===false) throw new Error(d.error || "Save failed"); toast("Payments saved ✅"); await openOrder(modalOrder.orderId); await search(); } catch(e){ toast(String(e.message||e)); }
   }
 
   async function cancelAdmin(){
-    if(!modalOrder?.orderId) return;
-    const ok = confirm("Cancel this order as admin?");
-    if(!ok) return;
-    const reason = prompt("Reason (optional):", "Cancelled by admin") || "Cancelled by admin";
-    try{
-      const r = await fetch("/api/admin/orders/" + encodeURIComponent(modalOrder.orderId) + "/cancel", {
-        method:"POST",
-        headers:{ "Content-Type":"application/json" },
-        credentials:"include",
-        body: JSON.stringify({ reason })
-      });
-      const d = await r.json().catch(()=>({}));
-      if(!r.ok || d.ok===false) throw new Error(d.error || "Cancel failed");
-      toast("Order cancelled ✅");
-      openModal(false);
-      await search();
-    } catch(e){
-      toast(String(e.message||e));
-    }
+    if(!modalOrder?.orderId) return; const ok = confirm("Cancel this order as admin?"); if(!ok) return; const reason = prompt("Reason (optional):", "Cancelled by admin") || "Cancelled by admin";
+    try{ const r = await fetch("/api/admin/orders/" + encodeURIComponent(modalOrder.orderId) + "/cancel", { method:"POST", headers:{ "Content-Type":"application/json" }, credentials:"include", body: JSON.stringify({ reason }) }); const d = await r.json().catch(()=>({})); if(!r.ok || d.ok===false) throw new Error(d.error || "Cancel failed"); toast("Order cancelled ✅"); openModal(false); await search(); } catch(e){ toast(String(e.message||e)); }
   }
 
   async function deleteOrder(){
-    if(!modalOrder?.orderId) return;
-    const ok = confirm("Delete this order permanently? This cannot be undone.");
-    if(!ok) return;
-    try{
-      const r = await fetch("/api/admin/orders/" + encodeURIComponent(modalOrder.orderId), {
-        method:"DELETE",
-        credentials:"include"
-      });
-      const d = await r.json().catch(()=>({}));
-      if(!r.ok || d.ok===false) throw new Error(d.error || "Delete failed");
-      toast("Order deleted ✅");
-      openModal(false);
-      await search();
-    } catch(e){
-      toast(String(e.message||e));
-    }
+    if(!modalOrder?.orderId) return; const ok = confirm("Delete this order permanently? This cannot be undone."); if(!ok) return;
+    try{ const r = await fetch("/api/admin/orders/" + encodeURIComponent(modalOrder.orderId), { method:"DELETE", credentials:"include" }); const d = await r.json().catch(()=>({})); if(!r.ok || d.ok===false) throw new Error(d.error || "Delete failed"); toast("Order deleted ✅"); openModal(false); await search(); } catch(e){ toast(String(e.message||e)); }
   }
 
   async function copyTrackingLink(){
     if(!modalOrder?.orderId) return;
-    try{
-      const r = await fetch("/api/admin/orders/" + encodeURIComponent(modalOrder.orderId) + "/tracking-link", { credentials:"include" });
-      const d = await r.json().catch(()=>({}));
-      if(!r.ok || d.ok===false) throw new Error(d.error || "Link failed");
-      await navigator.clipboard.writeText(d.url || "");
-      toast("Tracking link copied ✅");
-    } catch(e){
-      toast(String(e.message||e));
+    try{ const r = await fetch("/api/admin/orders/" + encodeURIComponent(modalOrder.orderId) + "/tracking-link", { credentials:"include" }); const d = await r.json().catch(()=>({})); if(!r.ok || d.ok===false) throw new Error(d.error || "Link failed"); await navigator.clipboard.writeText(d.url || ""); toast("Tracking link copied ✅"); } catch(e){ toast(String(e.message||e)); }
+  }
+
+  function clearFilters(){ qs("q").value=""; qs("state").value=""; qs("runKey").value=""; qs("zone").value=""; qs("town").value=""; qs("flag").value=""; qs("unpaidFees").checked=false; qs("hold").checked=false; }
+  qs("searchBtn").addEventListener("click", search); qs("refreshBtn").addEventListener("click", search); qs("clearBtn").addEventListener("click", ()=>{ clearFilters(); search(); });
+  qs("exportBtn").addEventListener("click", ()=>{ const rk = qs("exportRunKey").value.trim(); if(!rk) return toast("Enter runKey to export"); window.location.href = "/api/admin/routific/export-csv?runKey=" + encodeURIComponent(rk); });
+  qs("closeModal").addEventListener("click", ()=> openModal(false)); qs("modalBack").addEventListener("click", (e)=>{ if(e.target.id==="modalBack") openModal(false); });
+  qs("m_saveState").addEventListener("click", saveStatus); qs("m_savePay").addEventListener("click", savePayments); qs("m_cancelAdmin").addEventListener("click", cancelAdmin); qs("m_deleteOrder").addEventListener("click", deleteOrder); qs("m_trackingLink").addEventListener("click", copyTrackingLink);
+  search();
+
+  // --- Catalogue Logic ---
+  async function loadCatalogue() {
+    qs('catRows').innerHTML = '<tr><td colspan="4" class="muted">Loading...</td></tr>';
+    try {
+      const r = await fetch('/api/admin/catalogue', { credentials: 'include' });
+      const d = await r.json();
+      if(!d.ok) throw new Error("Failed to load");
+      const items = d.items || [];
+      qs('catCountPill').textContent = "Items: " + items.length;
+      if(!items.length) {
+        qs('catRows').innerHTML = '<tr><td colspan="4" class="muted">No items in catalogue.</td></tr>';
+        return;
+      }
+      qs('catRows').innerHTML = items.map(i => {
+        return \`<tr>
+          <td><div style="font-weight:900;">\${esc(i.name)}</div></td>
+          <td>\${esc(i.category)}</td>
+          <td>$\${money(i.estimatedPrice)}</td>
+          <td><button class="btn ghost small" onclick="deleteCatItem('\${i._id}')">Delete</button></td>
+        </tr>\`;
+      }).join('');
+    } catch(e) {
+      qs('catRows').innerHTML = '<tr><td colspan="4" class="muted">Error loading catalogue.</td></tr>';
     }
   }
 
-  function clearFilters(){
-    qs("q").value=""; qs("state").value=""; qs("runKey").value="";
-    qs("zone").value=""; qs("town").value=""; qs("flag").value="";
-    qs("unpaidFees").checked=false; qs("hold").checked=false;
-  }
-
-  qs("searchBtn").addEventListener("click", search);
-  qs("refreshBtn").addEventListener("click", search);
-  qs("clearBtn").addEventListener("click", ()=>{ clearFilters(); search(); });
-
-  qs("exportBtn").addEventListener("click", ()=>{
-    const rk = qs("exportRunKey").value.trim();
-    if(!rk) return toast("Enter runKey to export");
-    window.location.href = "/api/admin/routific/export-csv?runKey=" + encodeURIComponent(rk);
+  qs('addCatBtn').addEventListener('click', async () => {
+    const name = qs('catName').value.trim();
+    const category = qs('catCategory').value.trim();
+    const estimatedPrice = qs('catPrice').value.trim();
+    if(!name) return toast("Name is required");
+    try {
+      const r = await fetch('/api/admin/catalogue', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        credentials: 'include',
+        body: JSON.stringify({ name, category, estimatedPrice })
+      });
+      const d = await r.json();
+      if(!d.ok) throw new Error(d.error || "Add failed");
+      toast("Item added ✅");
+      qs('catName').value = ''; qs('catCategory').value = ''; qs('catPrice').value = '';
+      loadCatalogue();
+    } catch(e) { toast(String(e.message || e)); }
   });
 
-  qs("closeModal").addEventListener("click", ()=> openModal(false));
-  qs("modalBack").addEventListener("click", (e)=>{ if(e.target.id==="modalBack") openModal(false); });
+  async function deleteCatItem(id) {
+    if(!confirm("Delete this item?")) return;
+    try {
+      const r = await fetch('/api/admin/catalogue/' + id, { method: 'DELETE', credentials: 'include' });
+      if(!r.ok) throw new Error("Delete failed");
+      toast("Item deleted ✅");
+      loadCatalogue();
+    } catch(e) { toast(String(e)); }
+  }
 
-  qs("m_saveState").addEventListener("click", saveStatus);
-  qs("m_savePay").addEventListener("click", savePayments);
-  qs("m_cancelAdmin").addEventListener("click", cancelAdmin);
-  qs("m_deleteOrder").addEventListener("click", deleteOrder);
-  qs("m_trackingLink").addEventListener("click", copyTrackingLink);
-
-  search();
 </script>
 </body>
 </html>`);
@@ -2849,45 +1500,17 @@ app.get("/api/admin/routific/export-csv", requireLogin, requireAdmin, async (req
   try {
     const runKey = String(req.query.runKey || "").trim();
     if (!runKey) return res.status(400).send("Missing runKey");
-
-    const orders = await Order.find({
-      runKey,
-      "status.state": { $in: Array.from(ACTIVE_STATES) },
-    }).sort({ createdAt: 1 }).lean();
-
+    const orders = await Order.find({ runKey, "status.state": { $in: Array.from(ACTIVE_STATES) } }).sort({ createdAt: 1 }).lean();
     const header = ["order_id","name","address","phone","email","notes","duration_seconds"];
     const rows = orders.map(o => {
-      const name = o.customer?.fullName || "";
-      const phone = o.customer?.phone || "";
-      const email = o.customer?.email || "";
-      const address =
-        `${o.address?.streetAddress || ""}${o.address?.unit ? (" " + o.address.unit) : ""}, ` +
-        `${o.address?.town || ""}, ON, ${o.address?.postalCode || ""}, Canada`
-          .replace(/\s+/g, " ")
-          .trim();
-
-      const notes = [
-        `TGR ${o.orderId}`,
-        `Zone ${o.address?.zone || ""}`,
-        o.preferences?.dropoffPref ? `Drop-off: ${o.preferences.dropoffPref}` : "",
-        o.preferences?.subsPref ? `Subs: ${o.preferences.subsPref}` : "",
-        o.stores?.primary ? `Store: ${o.stores.primary}` : "",
-        (o.stores?.extra || []).length ? `Extra: ${(o.stores.extra || []).join(", ")}` : "",
-      ].filter(Boolean).join(" | ");
-
-      const duration = 360;
-      return [o.orderId, name, address, phone, email, notes, String(duration)].map(csvEscape).join(",");
+      const name = o.customer?.fullName || ""; const phone = o.customer?.phone || ""; const email = o.customer?.email || "";
+      const address = `${o.address?.streetAddress || ""}${o.address?.unit ? (" " + o.address.unit) : ""}, ${o.address?.town || ""}, ON, ${o.address?.postalCode || ""}, Canada`.replace(/\s+/g, " ").trim();
+      const notes = [`TGR ${o.orderId}`, `Zone ${o.address?.zone || ""}`, o.preferences?.dropoffPref ? `Drop-off: ${o.preferences.dropoffPref}` : "", o.preferences?.subsPref ? `Subs: ${o.preferences.subsPref}` : "", o.stores?.primary ? `Store: ${o.stores.primary}` : "", (o.stores?.extra || []).length ? `Extra: ${(o.stores.extra || []).join(", ")}` : ""].filter(Boolean).join(" | ");
+      return [o.orderId, name, address, phone, email, notes, "360"].map(csvEscape).join(",");
     });
-
     const csv = header.join(",") + "\n" + rows.join("\n") + "\n";
-    const filename = `routific_${runKey}_deliveries.csv`;
-
-    res.setHeader("Content-Type", "text/csv; charset=utf-8");
-    res.setHeader("Content-Disposition", `attachment; filename="${filename}"`);
-    res.send(csv);
-  } catch (e) {
-    res.status(500).send(String(e));
-  }
+    res.setHeader("Content-Type", "text/csv; charset=utf-8"); res.setHeader("Content-Disposition", `attachment; filename="routific_${runKey}_deliveries.csv"`); res.send(csv);
+  } catch (e) { res.status(500).send(String(e)); }
 });
 
 // =========================
@@ -2895,226 +1518,7 @@ app.get("/api/admin/routific/export-csv", requireLogin, requireAdmin, async (req
 // =========================
 app.get("/admin/tracking-control", requireLogin, requireAdmin, async (req, res) => {
   res.setHeader("Content-Type", "text/html; charset=utf-8");
-  res.send(`<!doctype html>
-<html lang="en-CA">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>TGR Tracking Control</title>
-<style>
-  :root{--bg:#0b0b0b; --panel:rgba(255,255,255,.06); --line:rgba(255,255,255,.14); --text:#fff; --muted:rgba(255,255,255,.75); --red:#e3342f; --red2:#ff4a44; --radius:14px;}
-  body{margin:0;background:var(--bg);color:var(--text);font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;}
-  .wrap{max-width:900px;margin:0 auto;padding:16px;}
-  .card{border:1px solid var(--line);background:var(--panel);border-radius:var(--radius);padding:14px;}
-  .row{display:flex;gap:10px;flex-wrap:wrap;align-items:center;}
-  .btn{border:1px solid rgba(255,255,255,.18);background:rgba(255,255,255,.06);color:#fff;font-weight:900;border-radius:999px;padding:10px 14px;cursor:pointer;text-decoration:none;white-space:nowrap;}
-  .btn.primary{background:linear-gradient(180deg,var(--red2),var(--red));border-color:rgba(0,0,0,.25);}
-  .btn.ghost{background:transparent;}
-  .muted{color:var(--muted);}
-  select,input{width:100%;padding:12px 12px;border-radius:12px;border:1px solid rgba(255,255,255,.18);background:rgba(0,0,0,.25);color:#fff;font-size:16px;}
-  .pill{display:inline-block;padding:4px 10px;border-radius:999px;border:1px solid rgba(255,255,255,.18);background:rgba(255,255,255,.06);font-weight:900;font-size:12px;}
-  .toast{margin-top:10px;padding:10px 12px;border-radius:12px;border:1px solid rgba(255,255,255,.18);background:rgba(0,0,0,.24);display:none;font-weight:900;}
-  .toast.show{display:block;}
-  .hr{height:1px;background:rgba(255,255,255,.12);margin:12px 0;}
-</style>
-</head>
-<body>
-<div class="wrap">
-  <div class="card">
-    <div class="row" style="justify-content:space-between;">
-      <div>
-        <div style="font-weight:1000;font-size:22px;">Tracking Control</div>
-        <div class="muted">Use this page on your phone while signed into admin.</div>
-      </div>
-      <div class="row">
-        <a class="btn ghost" href="/admin">Admin</a>
-        <a class="btn ghost" href="${escapeHtml(PUBLIC_SITE_URL)}/">Back to site</a>
-      </div>
-    </div>
-
-    <div class="toast" id="toast"></div>
-    <div class="hr"></div>
-
-    <div class="row">
-      <div style="flex:1 1 380px;">
-        <label class="muted" style="font-weight:900;">Select run</label>
-        <select id="runSel">
-          <option value="">Loading…</option>
-        </select>
-        <div class="muted" id="runInfo" style="margin-top:8px;font-size:13px;"></div>
-      </div>
-
-      <div style="flex:1 1 240px;">
-        <label class="muted" style="font-weight:900;">GPS send interval (ms)</label>
-        <input id="interval" type="number" min="500" step="100" value="1500"/>
-      </div>
-    </div>
-
-    <div class="hr"></div>
-
-    <div class="row">
-      <button class="btn" id="enableBtn">Start tracking (enable run)</button>
-      <button class="btn" id="disableBtn">Stop tracking (disable run)</button>
-      <span class="pill" id="enabledState">—</span>
-    </div>
-
-    <div class="hr"></div>
-
-    <div class="row">
-      <button class="btn primary" id="startGps">Start GPS broadcast</button>
-      <button class="btn" id="stopGps">Stop GPS broadcast</button>
-      <span class="pill" id="gpsState">GPS: idle</span>
-    </div>
-
-    <div class="muted" id="lastSend" style="margin-top:10px;font-size:13px;">Last send: —</div>
-    <div class="muted" id="err" style="margin-top:6px;font-size:13px;"></div>
-  </div>
-</div>
-
-<script>
-  const toast = (msg)=>{
-    const el = document.getElementById("toast");
-    el.textContent = msg;
-    el.classList.add("show");
-    setTimeout(()=>el.classList.remove("show"), 3500);
-  };
-
-  const runSel = document.getElementById("runSel");
-  const runInfo = document.getElementById("runInfo");
-  const enabledState = document.getElementById("enabledState");
-  const gpsState = document.getElementById("gpsState");
-  const lastSend = document.getElementById("lastSend");
-  const err = document.getElementById("err");
-  const intervalEl = document.getElementById("interval");
-
-  let runs = null;
-  let watchId = null;
-  let lastPostAt = 0;
-
-  async function loadRuns(){
-    const r = await fetch("/api/runs/active", { credentials:"include" });
-    const d = await r.json().catch(()=>({}));
-    if(!r.ok || d.ok===false) throw new Error(d.error || "Runs unavailable");
-    runs = d.runs || null;
-
-    runSel.innerHTML = '<option value="">Select…</option>';
-    const L = runs.local;
-    const O = runs.owen;
-    if (L?.runKey){
-      const o = document.createElement("option");
-      o.value = L.runKey; o.textContent = "Local: " + L.runKey;
-      runSel.appendChild(o);
-    }
-    if (O?.runKey){
-      const o = document.createElement("option");
-      o.value = O.runKey; o.textContent = "Owen: " + O.runKey;
-      runSel.appendChild(o);
-    }
-  }
-
-  function getRunByKey(k){
-    if (!runs) return null;
-    if (runs.local?.runKey === k) return runs.local;
-    if (runs.owen?.runKey === k) return runs.owen;
-    return null;
-  }
-
-  function updateRunInfo(){
-    const k = runSel.value;
-    const r = getRunByKey(k);
-    if(!r){ runInfo.textContent = ""; enabledState.textContent = "—"; return; }
-    runInfo.textContent = "Opens: " + r.opensAtLocal + " • Cutoff: " + r.cutoffAtLocal + " • Slots: " + r.slotsRemaining;
-    enabledState.textContent = r.isOpen ? "Orders open" : "Orders closed";
-  }
-
-  runSel.addEventListener("change", updateRunInfo);
-
-  async function enableTracking(){
-    const k = runSel.value;
-    if(!k) return toast("Select a runKey");
-    const r = await fetch("/api/admin/tracking/" + encodeURIComponent(k) + "/start", { method:"POST", credentials:"include" });
-    const d = await r.json().catch(()=>({}));
-    if(!r.ok || d.ok===false) return toast(d.error || "Enable failed");
-    toast("Tracking enabled for " + k);
-  }
-
-  async function disableTracking(){
-    const k = runSel.value;
-    if(!k) return toast("Select a runKey");
-    const r = await fetch("/api/admin/tracking/" + encodeURIComponent(k) + "/stop", { method:"POST", credentials:"include" });
-    const d = await r.json().catch(()=>({}));
-    if(!r.ok || d.ok===false) return toast(d.error || "Disable failed");
-    toast("Tracking disabled for " + k);
-  }
-
-  async function postFix(pos){
-    const k = runSel.value;
-    if(!k) return;
-
-    const ms = Math.max(500, Number(intervalEl.value || 1500));
-    const now = Date.now();
-    if ((now - lastPostAt) < ms) return;
-    lastPostAt = now;
-
-    const c = pos.coords || {};
-    const body = {
-      lat: c.latitude,
-      lng: c.longitude,
-      heading: Number.isFinite(c.heading) ? c.heading : null,
-      speed: Number.isFinite(c.speed) ? c.speed : null,
-      accuracy: Number.isFinite(c.accuracy) ? c.accuracy : null,
-    };
-
-    try{
-      const r = await fetch("/api/admin/tracking/" + encodeURIComponent(k) + "/update", {
-        method:"POST",
-        headers:{ "Content-Type":"application/json" },
-        credentials:"include",
-        body: JSON.stringify(body),
-      });
-      const d = await r.json().catch(()=>({}));
-      if(!r.ok || d.ok===false) throw new Error(d.error || "Update failed");
-      gpsState.textContent = "GPS: sending ✅";
-      lastSend.textContent = "Last send: " + new Date().toLocaleString() + " • acc " + Math.round(Number(body.accuracy||0)) + "m";
-      err.textContent = "";
-    } catch(e){
-      gpsState.textContent = "GPS: error";
-      err.textContent = String(e.message || e);
-    }
-  }
-
-  function startGps(){
-    if(!navigator.geolocation) return toast("Geolocation not supported on this device");
-    const k = runSel.value;
-    if(!k) return toast("Select a runKey first");
-
-    if (watchId) navigator.geolocation.clearWatch(watchId);
-    watchId = navigator.geolocation.watchPosition(
-      postFix,
-      (e)=>{ gpsState.textContent = "GPS: error"; err.textContent = e.message || "GPS error"; },
-      { enableHighAccuracy:true, maximumAge:1000, timeout:10000 }
-    );
-    toast("GPS broadcast started");
-    gpsState.textContent = "GPS: starting…";
-  }
-
-  function stopGps(){
-    if (watchId) navigator.geolocation.clearWatch(watchId);
-    watchId = null;
-    gpsState.textContent = "GPS: idle";
-    toast("GPS broadcast stopped");
-  }
-
-  document.getElementById("enableBtn").addEventListener("click", enableTracking);
-  document.getElementById("disableBtn").addEventListener("click", disableTracking);
-  document.getElementById("startGps").addEventListener("click", startGps);
-  document.getElementById("stopGps").addEventListener("click", stopGps);
-
-  loadRuns().then(updateRunInfo).catch(e=>toast(String(e.message||e)));
-</script>
-
-</body>
-</html>`);
+  res.send(`<!doctype html><html lang="en-CA"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>TGR Tracking</title><style>:root{--bg:#0b0b0b; --panel:rgba(255,255,255,.06); --line:rgba(255,255,255,.14); --text:#fff; --muted:rgba(255,255,255,.75); --red:#e3342f; --red2:#ff4a44; --radius:14px;} body{margin:0;background:var(--bg);color:var(--text);font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;} .wrap{max-width:900px;margin:0 auto;padding:16px;} .card{border:1px solid var(--line);background:var(--panel);border-radius:var(--radius);padding:14px;} .row{display:flex;gap:10px;flex-wrap:wrap;align-items:center;} .btn{border:1px solid rgba(255,255,255,.18);background:rgba(255,255,255,.06);color:#fff;font-weight:900;border-radius:999px;padding:10px 14px;cursor:pointer;text-decoration:none;white-space:nowrap;} .btn.primary{background:linear-gradient(180deg,var(--red2),var(--red));border-color:rgba(0,0,0,.25);} .btn.ghost{background:transparent;} .muted{color:var(--muted);} select,input{width:100%;padding:12px 12px;border-radius:12px;border:1px solid rgba(255,255,255,.18);background:rgba(0,0,0,.25);color:#fff;font-size:16px;} .pill{display:inline-block;padding:4px 10px;border-radius:999px;border:1px solid rgba(255,255,255,.18);background:rgba(255,255,255,.06);font-weight:900;font-size:12px;} .toast{margin-top:10px;padding:10px 12px;border-radius:12px;border:1px solid rgba(255,255,255,.18);background:rgba(0,0,0,.24);display:none;font-weight:900;} .toast.show{display:block;} .hr{height:1px;background:rgba(255,255,255,.12);margin:12px 0;}</style></head><body><div class="wrap"><div class="card"><div class="row" style="justify-content:space-between;"><div><div style="font-weight:1000;font-size:22px;">Tracking Control</div></div><div class="row"><a class="btn ghost" href="/admin">Admin</a></div></div><div class="toast" id="toast"></div><div class="hr"></div><div class="row"><div style="flex:1 1 380px;"><label class="muted" style="font-weight:900;">Select run</label><select id="runSel"><option value="">Loading…</option></select><div class="muted" id="runInfo" style="margin-top:8px;font-size:13px;"></div></div><div style="flex:1 1 240px;"><label class="muted" style="font-weight:900;">GPS interval</label><input id="interval" type="number" min="500" step="100" value="1500"/></div></div><div class="hr"></div><div class="row"><button class="btn" id="enableBtn">Start tracking (enable run)</button><button class="btn" id="disableBtn">Stop tracking (disable run)</button><span class="pill" id="enabledState">—</span></div><div class="hr"></div><div class="row"><button class="btn primary" id="startGps">Start GPS broadcast</button><button class="btn" id="stopGps">Stop GPS broadcast</button><span class="pill" id="gpsState">GPS: idle</span></div><div class="muted" id="lastSend" style="margin-top:10px;font-size:13px;">Last send: —</div><div class="muted" id="err" style="margin-top:6px;font-size:13px;"></div></div></div><script>const toast = (msg)=>{const el = document.getElementById("toast"); el.textContent = msg; el.classList.add("show"); setTimeout(()=>el.classList.remove("show"), 3500);}; const runSel = document.getElementById("runSel"); const runInfo = document.getElementById("runInfo"); const enabledState = document.getElementById("enabledState"); const gpsState = document.getElementById("gpsState"); const lastSend = document.getElementById("lastSend"); const err = document.getElementById("err"); const intervalEl = document.getElementById("interval"); let runs = null; let watchId = null; let lastPostAt = 0; async function loadRuns(){const r = await fetch("/api/runs/active", { credentials:"include" }); const d = await r.json().catch(()=>({})); if(!r.ok || d.ok===false) throw new Error(d.error || "Runs unavailable"); runs = d.runs || null; runSel.innerHTML = '<option value="">Select…</option>'; const L = runs.local; const O = runs.owen; if (L?.runKey){const o = document.createElement("option"); o.value = L.runKey; o.textContent = "Local: " + L.runKey; runSel.appendChild(o);} if (O?.runKey){const o = document.createElement("option"); o.value = O.runKey; o.textContent = "Owen: " + O.runKey; runSel.appendChild(o);}} function getRunByKey(k){if (!runs) return null; if (runs.local?.runKey === k) return runs.local; if (runs.owen?.runKey === k) return runs.owen; return null;} function updateRunInfo(){const k = runSel.value; const r = getRunByKey(k); if(!r){ runInfo.textContent = ""; enabledState.textContent = "—"; return; } runInfo.textContent = "Opens: " + r.opensAtLocal + " • Cutoff: " + r.cutoffAtLocal + " • Slots: " + r.slotsRemaining; enabledState.textContent = r.isOpen ? "Orders open" : "Orders closed";} runSel.addEventListener("change", updateRunInfo); async function enableTracking(){const k = runSel.value; if(!k) return toast("Select a runKey"); const r = await fetch("/api/admin/tracking/" + encodeURIComponent(k) + "/start", { method:"POST", credentials:"include" }); const d = await r.json().catch(()=>({})); if(!r.ok || d.ok===false) return toast(d.error || "Enable failed"); toast("Tracking enabled for " + k);} async function disableTracking(){const k = runSel.value; if(!k) return toast("Select a runKey"); const r = await fetch("/api/admin/tracking/" + encodeURIComponent(k) + "/stop", { method:"POST", credentials:"include" }); const d = await r.json().catch(()=>({})); if(!r.ok || d.ok===false) return toast(d.error || "Disable failed"); toast("Tracking disabled for " + k);} async function postFix(pos){const k = runSel.value; if(!k) return; const ms = Math.max(500, Number(intervalEl.value || 1500)); const now = Date.now(); if ((now - lastPostAt) < ms) return; lastPostAt = now; const c = pos.coords || {}; const body = {lat: c.latitude, lng: c.longitude, heading: Number.isFinite(c.heading) ? c.heading : null, speed: Number.isFinite(c.speed) ? c.speed : null, accuracy: Number.isFinite(c.accuracy) ? c.accuracy : null,}; try{const r = await fetch("/api/admin/tracking/" + encodeURIComponent(k) + "/update", {method:"POST", headers:{ "Content-Type":"application/json" }, credentials:"include", body: JSON.stringify(body),}); const d = await r.json().catch(()=>({})); if(!r.ok || d.ok===false) throw new Error(d.error || "Update failed"); gpsState.textContent = "GPS: sending ✅"; lastSend.textContent = "Last send: " + new Date().toLocaleString() + " • acc " + Math.round(Number(body.accuracy||0)) + "m"; err.textContent = "";} catch(e){gpsState.textContent = "GPS: error"; err.textContent = String(e.message || e);}} function startGps(){if(!navigator.geolocation) return toast("Geolocation not supported on this device"); const k = runSel.value; if(!k) return toast("Select a runKey first"); if (watchId) navigator.geolocation.clearWatch(watchId); watchId = navigator.geolocation.watchPosition(postFix, (e)=>{ gpsState.textContent = "GPS: error"; err.textContent = e.message || "GPS error"; }, { enableHighAccuracy:true, maximumAge:1000, timeout:10000 }); toast("GPS broadcast started"); gpsState.textContent = "GPS: starting…";} function stopGps(){if (watchId) navigator.geolocation.clearWatch(watchId); watchId = null; gpsState.textContent = "GPS: idle"; toast("GPS broadcast stopped");} document.getElementById("enableBtn").addEventListener("click", enableTracking); document.getElementById("disableBtn").addEventListener("click", disableTracking); document.getElementById("startGps").addEventListener("click", startGps); document.getElementById("stopGps").addEventListener("click", stopGps); loadRuns().then(updateRunInfo).catch(e=>toast(String(e.message||e)));</script></body></html>`);
 });
 
 // =========================
