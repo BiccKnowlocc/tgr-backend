@@ -1,8 +1,8 @@
 // ======= MY NOTES =======
-// 1) Master List functionality updated inside the /admin HTML payload.
-// 2) Added client-side JS to generate and download a CSV of the Master List.
-// 3) Added @media print CSS to ensure the list prints cleanly without the dark admin UI.
-// 4) Twilio SMS integration is pending for the next step.
+// 1) Added Twilio package requirement and environment variables.
+// 2) Added `sendSms` helper function with automatic North American phone formatting.
+// 3) Updated `POST /api/admin/orders/:orderId/status` to trigger automatic texts on status changes.
+// 4) All other logic remains fully intact.
 
 // ======= server.js (FULL FILE) — TGR backend =======
 const express = require("express");
@@ -21,6 +21,7 @@ const passport = require("passport");
 const GoogleStrategy = require("passport-google-oauth20").Strategy;
 
 const postmark = require("postmark");
+const twilio = require("twilio");
 
 const dayjs = require("dayjs");
 const utc = require("dayjs/plugin/utc");
@@ -73,6 +74,15 @@ const POSTMARK_MESSAGE_STREAM = process.env.POSTMARK_MESSAGE_STREAM || "outbound
 
 const pmClient = POSTMARK_SERVER_TOKEN
   ? new postmark.ServerClient(POSTMARK_SERVER_TOKEN)
+  : null;
+
+// Twilio SMS Integration (optional)
+const TWILIO_ACCOUNT_SID = process.env.TWILIO_ACCOUNT_SID || "";
+const TWILIO_AUTH_TOKEN = process.env.TWILIO_AUTH_TOKEN || "";
+const TWILIO_PHONE_NUMBER = process.env.TWILIO_PHONE_NUMBER || "";
+
+const twilioClient = (TWILIO_ACCOUNT_SID && TWILIO_AUTH_TOKEN) 
+  ? twilio(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN) 
   : null;
 
 // Square pay links (member portal quick buttons)
@@ -584,6 +594,29 @@ async function pmSend(to, subject, htmlBody, textBody) {
   }
 }
 
+// Twilio SMS Helper
+async function sendSms(toPhone, message) {
+  if (!twilioClient || !TWILIO_PHONE_NUMBER || !toPhone) return;
+  try {
+    // Basic formatting to clean up user input (e.g. 519-555-1234 becomes +15195551234)
+    let formattedPhone = String(toPhone).replace(/\D/g, "");
+    if (formattedPhone.length === 10) {
+      formattedPhone = "+1" + formattedPhone;
+    } else if (formattedPhone.length === 11 && formattedPhone.startsWith("1")) {
+      formattedPhone = "+" + formattedPhone;
+    }
+    
+    await twilioClient.messages.create({
+      body: message,
+      from: TWILIO_PHONE_NUMBER,
+      to: formattedPhone
+    });
+    console.log("SMS sent to", formattedPhone);
+  } catch (error) {
+    console.error("Twilio SMS failed:", String(error));
+  }
+}
+
 function money(n) {
   const x = Number(n || 0);
   return x.toFixed(2);
@@ -761,7 +794,6 @@ app.get("/api/public/catalogue/search", async (req, res) => {
     const q = String(req.query.q || "").trim().toLowerCase();
     if (!q || q.length < 2) return res.json({ ok: true, items: [] });
     
-    // Simple regex search on name and category
     const safeQ = q.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
     const re = new RegExp(safeQ, "i");
     
@@ -805,22 +837,18 @@ app.post("/api/admin/catalogue", requireLogin, requireAdmin, async (req, res) =>
   }
 });
 
-// Seed defaults
 app.post("/api/admin/catalogue/seed", requireLogin, requireAdmin, async (req, res) => {
   try {
     const defaults = [
-      // Dairy
       { name: "Milk (2%, 4L)", category: "Dairy", estimatedPrice: 6.49 },
       { name: "Milk (Skim, 2L)", category: "Dairy", estimatedPrice: 4.59 },
       { name: "Eggs (Large, 12)", category: "Dairy", estimatedPrice: 4.29 },
       { name: "Butter (Salted, 454g)", category: "Dairy", estimatedPrice: 6.99 },
       { name: "Cheddar Cheese (Block, 400g)", category: "Dairy", estimatedPrice: 7.99 },
       { name: "Yogurt (Vanilla, 650g tub)", category: "Dairy", estimatedPrice: 4.49 },
-      // Bakery
       { name: "Bread (White)", category: "Bakery", estimatedPrice: 3.49 },
       { name: "Bread (Whole Wheat)", category: "Bakery", estimatedPrice: 3.99 },
       { name: "Hot Dog Buns (12-pack)", category: "Bakery", estimatedPrice: 3.99 },
-      // Produce
       { name: "Bananas (Bunch)", category: "Produce", estimatedPrice: 2.50 },
       { name: "Apples (Bag)", category: "Produce", estimatedPrice: 5.99 },
       { name: "Onions (Yellow, 3lb)", category: "Produce", estimatedPrice: 3.99 },
@@ -829,14 +857,12 @@ app.post("/api/admin/catalogue/seed", requireLogin, requireAdmin, async (req, re
       { name: "Romaine Lettuce (Head)", category: "Produce", estimatedPrice: 3.49 },
       { name: "Tomatoes (Vine, 4-pack)", category: "Produce", estimatedPrice: 4.99 },
       { name: "Oranges (Bag, 3lb)", category: "Produce", estimatedPrice: 6.99 },
-      // Meat & Deli
       { name: "Ground Beef (Lean, 1lb)", category: "Meat", estimatedPrice: 7.99 },
       { name: "Chicken Breasts (Boneless, 3-pack)", category: "Meat", estimatedPrice: 12.99 },
       { name: "Bacon (500g)", category: "Meat", estimatedPrice: 7.49 },
       { name: "Hot Dogs (Wieners, 12-pack)", category: "Meat", estimatedPrice: 5.99 },
       { name: "Sliced Ham (Deli, 175g)", category: "Deli", estimatedPrice: 6.49 },
       { name: "Sliced Turkey (Deli, 175g)", category: "Deli", estimatedPrice: 6.99 },
-      // Pantry
       { name: "Cereal (Cheerios)", category: "Pantry", estimatedPrice: 5.49 },
       { name: "Peanut Butter (Smooth, 500g)", category: "Pantry", estimatedPrice: 6.49 },
       { name: "Pasta (Spaghetti, 500g)", category: "Pantry", estimatedPrice: 2.49 },
@@ -853,13 +879,11 @@ app.post("/api/admin/catalogue/seed", requireLogin, requireAdmin, async (req, re
       { name: "Canned Tuna (Flaked, 170g)", category: "Pantry", estimatedPrice: 2.29 },
       { name: "Tea Bags (Orange Pekoe, 72-pack)", category: "Pantry", estimatedPrice: 5.99 },
       { name: "Oatmeal (Instant, 10-pack)", category: "Pantry", estimatedPrice: 4.49 },
-      // Household
       { name: "Toilet Paper (12 Rolls)", category: "Household", estimatedPrice: 10.99 },
       { name: "Paper Towels (6 Rolls)", category: "Household", estimatedPrice: 8.99 },
       { name: "Dish Soap (800ml)", category: "Household", estimatedPrice: 3.99 },
       { name: "Laundry Detergent (Liquid, 1.36L)", category: "Household", estimatedPrice: 7.99 },
       { name: "Garbage Bags (Tall, 40-pack)", category: "Household", estimatedPrice: 8.99 },
-      // Health, Pharmacy & Frozen
       { name: "Meal Replacement Shakes (Vanilla, 6-pack)", category: "Pharmacy & Health", estimatedPrice: 14.99 },
       { name: "Meal Replacement Shakes (Chocolate, 6-pack)", category: "Pharmacy & Health", estimatedPrice: 14.99 },
       { name: "Acetaminophen / Pain Reliever (Reg. Strength, 100 tabs)", category: "Pharmacy & Health", estimatedPrice: 9.99 },
@@ -867,11 +891,9 @@ app.post("/api/admin/catalogue/seed", requireLogin, requireAdmin, async (req, re
       { name: "Frozen Dinner (Meat & Potatoes)", category: "Frozen", estimatedPrice: 5.49 },
       { name: "Frozen Vegetables (Mixed, 750g)", category: "Frozen", estimatedPrice: 4.99 },
       { name: "Crackers (Saltines, Box)", category: "Snacks", estimatedPrice: 3.99 },
-      // Pets
       { name: "Dog Food (Dry, 2kg bag)", category: "Pets", estimatedPrice: 11.99 },
       { name: "Cat Food (Canned, 156g)", category: "Pets", estimatedPrice: 1.29 },
       { name: "Cat Litter (Clumping, 7kg)", category: "Pets", estimatedPrice: 12.99 },
-      // Seasonal/Outdoor
       { name: "Firewood (Bag)", category: "Outdoor", estimatedPrice: 10.00 },
       { name: "Insect Repellent (Aerosol)", category: "Outdoor", estimatedPrice: 8.99 },
       { name: "Marshmallows (Bag)", category: "Snacks", estimatedPrice: 3.49 }
@@ -907,7 +929,6 @@ app.get("/api/admin/runs/:runKey/master-list", requireLogin, requireAdmin, async
     const runKey = String(req.params.runKey || "").trim();
     if (!runKey) return res.status(400).json({ok: false, error: "Run key required"});
 
-    // Find all active orders for this run (excluding delivered or cancelled)
     const orders = await Order.find({
       runKey,
       "status.state": { $in: ["submitted", "confirmed", "shopping", "packed"] }
@@ -917,7 +938,6 @@ app.get("/api/admin/runs/:runKey/master-list", requireLogin, requireAdmin, async
     const extraStops = [];
 
     for (const o of orders) {
-      // 1. Tally groceries
       if (o.list && o.list.groceryListText) {
         const lines = o.list.groceryListText.split(/\r?\n/);
         for (const line of lines) {
@@ -925,26 +945,19 @@ app.get("/api/admin/runs/:runKey/master-list", requireLogin, requireAdmin, async
           if (!text) continue;
           
           const key = text.toLowerCase();
-          if (!tally[key]) {
-            tally[key] = { name: text, count: 0 };
-          }
+          if (!tally[key]) tally[key] = { name: text, count: 0 };
           tally[key].count += 1;
         }
       }
       
-      // 2. Tally extra store stops
       if (o.stores && Array.isArray(o.stores.extra)) {
         for (const stop of o.stores.extra) {
-          if (stop.trim()) {
-            extraStops.push(`${stop.trim()} (Order: ${o.orderId})`);
-          }
+          if (stop.trim()) extraStops.push(`${stop.trim()} (Order: ${o.orderId})`);
         }
       }
     }
 
-    // Sort alphabetically by item name
     const sortedItems = Object.values(tally).sort((a, b) => a.name.localeCompare(b.name));
-
     res.json({ ok: true, runKey, items: sortedItems, extraStops });
   } catch(e) {
     res.status(500).json({ ok: false, error: String(e) });
@@ -1226,15 +1239,68 @@ function buildOrderFilterFromQuery(qs) {
 
 app.get("/api/admin/orders", requireLogin, requireAdmin, async (req, res) => { try { const limit = Math.min(500, Math.max(1, Number(req.query.limit || 120))); const filter = buildOrderFilterFromQuery(req.query); const items = await Order.find(filter).sort({ createdAt: -1 }).limit(limit).lean(); res.json({ ok: true, items }); } catch (e) { res.status(500).json({ ok: false, error: String(e) }); } });
 app.get("/api/admin/orders/:orderId", requireLogin, requireAdmin, async (req, res) => { try { const orderId = String(req.params.orderId || "").trim().toUpperCase(); const o = await Order.findOne({ orderId }).lean(); if (!o) return res.status(404).json({ ok: false, error: "Order not found" }); res.json({ ok: true, order: o }); } catch (e) { res.status(500).json({ ok: false, error: String(e) }); } });
+
+// STATUS UPDATE ENDPOINT (WITH TWILIO SMS INTEGRATION)
 app.post("/api/admin/orders/:orderId/status", requireLogin, requireAdmin, async (req, res) => {
   try {
-    const orderId = String(req.params.orderId || "").trim().toUpperCase(); const state = String(req.body?.state || "").trim(); const note = String(req.body?.note || "").trim(); const by = adminBy(req);
+    const orderId = String(req.params.orderId || "").trim().toUpperCase(); 
+    const state = String(req.body?.state || "").trim(); 
+    const note = String(req.body?.note || "").trim(); 
+    const by = adminBy(req);
+
     if (!AllowedStates.includes(state)) return res.status(400).json({ ok: false, error: "Invalid state" });
-    const order = await Order.findOne({ orderId }); if (!order) return res.status(404).json({ ok: false, error: "Order not found" });
-    order.status.state = state; order.status.note = note; order.status.updatedAt = new Date(); order.status.updatedBy = by; order.statusHistory.push({ state, note, at: new Date(), by });
-    await order.save(); res.json({ ok: true });
-  } catch (e) { res.status(500).json({ ok: false, error: String(e) }); }
+    
+    const order = await Order.findOne({ orderId }); 
+    if (!order) return res.status(404).json({ ok: false, error: "Order not found" });
+    
+    const oldState = order.status.state;
+
+    order.status.state = state; 
+    order.status.note = note; 
+    order.status.updatedAt = new Date(); 
+    order.status.updatedBy = by; 
+    order.statusHistory.push({ state, note, at: new Date(), by });
+    
+    await order.save(); 
+
+    // Trigger SMS if state changed to a key customer milestone
+    if (oldState !== state) {
+      const phone = order.customer?.phone;
+      const firstName = order.customer?.fullName?.split(' ')[0] || 'there';
+
+      if (phone) {
+        let smsMessage = "";
+        
+        if (state === "shopping") {
+          smsMessage = `Hi ${firstName}, Tobermory Grocery Run has started shopping your order!`;
+        } 
+        else if (state === "out_for_delivery") {
+          // Generate tracking link
+          const run = await Run.findOne({ runKey: order.runKey }).lean();
+          let trackingLink = "";
+          if (run) {
+            const expMs = dayjs(run.cutoffAt).add(1, "day").valueOf();
+            const token = signTrackingToken(order.orderId, run.runKey, expMs);
+            trackingLink = `${PUBLIC_SITE_URL}/member?trackRunKey=${encodeURIComponent(run.runKey)}&token=${encodeURIComponent(token)}&orderId=${encodeURIComponent(order.orderId)}`;
+          }
+          smsMessage = `Your TGR driver is heading your way! Track them live here: ${trackingLink}`;
+        } 
+        else if (state === "delivered") {
+          smsMessage = `Your Tobermory Grocery Run order has been delivered! Thank you for choosing us!`;
+        }
+
+        if (smsMessage) {
+          await sendSms(phone, smsMessage);
+        }
+      }
+    }
+
+    res.json({ ok: true });
+  } catch (e) { 
+    res.status(500).json({ ok: false, error: String(e) }); 
+  }
 });
+
 app.post("/api/admin/orders/:orderId/payments", requireLogin, requireAdmin, async (req, res) => {
   try {
     const orderId = String(req.params.orderId || "").trim().toUpperCase(); const feesStatus = String(req.body?.feesStatus || "").trim(); const groceriesStatus = String(req.body?.groceriesStatus || "").trim(); const note = String(req.body?.note || "").trim();
