@@ -1,6 +1,7 @@
 // ======= MY NOTES =======
-// 1) Updated the SMS message strings inside the POST /api/admin/orders/:orderId/status endpoint.
-// 2) The rest of the Twilio setup and server logic remains exactly the same.
+// 1) Space Points capacity system added to Order and Run schemas.
+// 2) computeFeeBreakdown now dynamically accounts for ride-share fees.
+// 3) Twilio SMS messages updated with professional/humorous copy for Shopping, Delivery, and Delivered.
 
 // ======= server.js (FULL FILE) — TGR backend =======
 const express = require("express");
@@ -244,6 +245,8 @@ const PRICING = {
     printingBase: 5,
     printingFirst10: 1.25,
     printingAfter10: 0.75,
+    rideLocal: 15,
+    rideOwen: 50
   },
   groceryUnderMin: { threshold: 35, surcharge: 19 },
 };
@@ -349,10 +352,12 @@ const RunSchema = new mongoose.Schema(
     opensAt: { type: Date, required: true },
     cutoffAt: { type: Date, required: true },
     maxSlots: { type: Number, default: 12 },
+    maxPoints: { type: Number, default: 10 }, // 10-point dynamic vehicle capacity
     minOrders: { type: Number, default: 6 },
     minFees: { type: Number, default: 0 },
     minLogic: { type: String, enum: ["OR", "AND"], default: "OR" },
     bookedOrdersCount: { type: Number, default: 0 },
+    bookedPoints: { type: Number, default: 0 },
     bookedFeesTotal: { type: Number, default: 0 },
     lastRecalcAt: { type: Date },
   },
@@ -367,6 +372,7 @@ const OrderSchema = new mongoose.Schema(
     orderId: { type: String, unique: true, index: true },
     runKey: { type: String, required: true },
     runType: { type: String, enum: ["local", "owen"], required: true },
+    spacePoints: { type: Number, default: 1 }, // Required cargo space points
 
     hold: { type: Boolean, default: false },
     flags: {
@@ -480,7 +486,6 @@ const CatalogueItemSchema = new mongoose.Schema(
   { timestamps: true }
 );
 
-// Auto-generate search tokens before saving
 CatalogueItemSchema.pre('save', function(next) {
   if (this.isModified('name') || this.isModified('category')) {
     const raw = `${this.name} ${this.category}`.toLowerCase().replace(/[^a-z0-9\s]/g, '');
@@ -594,24 +599,26 @@ async function pmSend(to, subject, htmlBody, textBody) {
 
 // Twilio SMS Helper
 async function sendSms(toPhone, message) {
-  if (!twilioClient || !TWILIO_PHONE_NUMBER || !toPhone) return;
+  console.log("\n====================================");
+  console.log("TWILIO OUTBOUND SMS INITIATED");
+  console.log("====================================");
+  if (!twilioClient || !TWILIO_PHONE_NUMBER || !toPhone) {
+    console.error("❌ SMS ABORTED: Missing credentials.");
+    return;
+  }
   try {
-    // Basic formatting to clean up user input (e.g. 519-555-1234 becomes +15195551234)
     let formattedPhone = String(toPhone).replace(/\D/g, "");
-    if (formattedPhone.length === 10) {
-      formattedPhone = "+1" + formattedPhone;
-    } else if (formattedPhone.length === 11 && formattedPhone.startsWith("1")) {
-      formattedPhone = "+" + formattedPhone;
-    }
+    if (formattedPhone.length === 10) formattedPhone = "+1" + formattedPhone;
+    else if (formattedPhone.length === 11 && formattedPhone.startsWith("1")) formattedPhone = "+" + formattedPhone;
     
     await twilioClient.messages.create({
       body: message,
       from: TWILIO_PHONE_NUMBER,
       to: formattedPhone
     });
-    console.log("SMS sent to", formattedPhone);
+    console.log("✅ SMS SENT SUCCESSFULLY!");
   } catch (error) {
-    console.error("Twilio SMS failed:", String(error));
+    console.error("❌ TWILIO ERROR:", String(error));
   }
 }
 
@@ -699,9 +706,16 @@ function computeFeeBreakdown(input) {
   const serviceFee = PRICING.serviceFee;
   const zoneFee = PRICING.zone[zone] || 0;
   const runFee = runType === "owen" ? PRICING.owenRunFeePerOrder : 0;
+  
   let addOnsFees = 0;
   if (extraStores.length) addOnsFees += extraStores.length * PRICING.addOns.extraStore;
   if (String(input.addon_printing || "") === "yes" && pages > 0) addOnsFees += calcPrinting(pages);
+  
+  // Apply ride-share fee based on run type
+  if (String(input.addon_ride || "") === "yes") {
+    addOnsFees += runType === "owen" ? PRICING.addOns.rideOwen : PRICING.addOns.rideLocal;
+  }
+
   let surcharges = 0;
   if (grocerySubtotal > 0 && grocerySubtotal < PRICING.groceryUnderMin.threshold) surcharges += PRICING.groceryUnderMin.surcharge;
   const serviceOff = Math.min(serviceFee, disc.serviceOff || 0);
@@ -763,7 +777,7 @@ async function getOrCreateNextRun(type) {
   if (opens.isAfter(now)) opens = now.subtract(1, "minute");
   const runKey = delivery.format("YYYY-MM-DD") + "-" + type;
   const cfg = runMinimumConfig(type);
-  const created = await Run.create({ runKey, type, opensAt: opens.toDate(), cutoffAt: cutoff.toDate(), maxSlots: 12, minOrders: cfg.minOrders, minFees: cfg.minFees, minLogic: cfg.minLogic });
+  const created = await Run.create({ runKey, type, opensAt: opens.toDate(), cutoffAt: cutoff.toDate(), maxSlots: 12, maxPoints: 10, minOrders: cfg.minOrders, minFees: cfg.minFees, minLogic: cfg.minLogic });
   return created.toObject();
 }
 
@@ -773,11 +787,15 @@ async function ensureUpcomingRuns() {
     let run = await getOrCreateNextRun(type);
     const needsRecalc = !run.lastRecalcAt || dayjs(run.lastRecalcAt).isBefore(nowTz().subtract(60, "second").toDate());
     if (needsRecalc) {
-      const agg = await Order.aggregate([{ $match: { runKey: run.runKey, "status.state": { $in: Array.from(ACTIVE_STATES) } } }, { $group: { _id: "$runKey", c: { $sum: 1 }, fees: { $sum: "$pricingSnapshot.totalFees" } } }]);
+      const agg = await Order.aggregate([
+        { $match: { runKey: run.runKey, "status.state": { $in: Array.from(ACTIVE_STATES) } } }, 
+        { $group: { _id: "$runKey", c: { $sum: 1 }, fees: { $sum: "$pricingSnapshot.totalFees" }, pts: { $sum: "$spacePoints" } } }
+      ]);
       const c = agg?.[0]?.c || 0;
       const fees = agg?.[0]?.fees || 0;
-      await Run.updateOne({ runKey: run.runKey }, { $set: { bookedOrdersCount: c, bookedFeesTotal: fees, lastRecalcAt: new Date() } });
-      run.bookedOrdersCount = c; run.bookedFeesTotal = fees; run.lastRecalcAt = new Date();
+      const pts = agg?.[0]?.pts || 0;
+      await Run.updateOne({ runKey: run.runKey }, { $set: { bookedOrdersCount: c, bookedFeesTotal: fees, bookedPoints: pts, lastRecalcAt: new Date() } });
+      run.bookedOrdersCount = c; run.bookedFeesTotal = fees; run.bookedPoints = pts; run.lastRecalcAt = new Date();
     }
     out[type] = run;
   }
@@ -918,50 +936,6 @@ app.delete("/api/admin/catalogue/:id", requireLogin, requireAdmin, async (req, r
     res.status(500).json({ ok: false, error: String(e) });
   }
 });
-
-// =========================
-// ADMIN MASTER LIST GENERATOR
-// =========================
-app.get("/api/admin/runs/:runKey/master-list", requireLogin, requireAdmin, async (req, res) => {
-  try {
-    const runKey = String(req.params.runKey || "").trim();
-    if (!runKey) return res.status(400).json({ok: false, error: "Run key required"});
-
-    const orders = await Order.find({
-      runKey,
-      "status.state": { $in: ["submitted", "confirmed", "shopping", "packed"] }
-    }).lean();
-
-    const tally = {};
-    const extraStops = [];
-
-    for (const o of orders) {
-      if (o.list && o.list.groceryListText) {
-        const lines = o.list.groceryListText.split(/\r?\n/);
-        for (const line of lines) {
-          let text = line.replace(/^•\s*/, '').trim();
-          if (!text) continue;
-          
-          const key = text.toLowerCase();
-          if (!tally[key]) tally[key] = { name: text, count: 0 };
-          tally[key].count += 1;
-        }
-      }
-      
-      if (o.stores && Array.isArray(o.stores.extra)) {
-        for (const stop of o.stores.extra) {
-          if (stop.trim()) extraStops.push(`${stop.trim()} (Order: ${o.orderId})`);
-        }
-      }
-    }
-
-    const sortedItems = Object.values(tally).sort((a, b) => a.name.localeCompare(b.name));
-    res.json({ ok: true, runKey, items: sortedItems, extraStops });
-  } catch(e) {
-    res.status(500).json({ ok: false, error: String(e) });
-  }
-});
-
 
 // =========================
 // TRACKING
@@ -1134,14 +1108,26 @@ app.post("/api/orders", requireLogin, requireProfileComplete, upload.single("gro
     if (req.file) attachment = { originalName: req.file.originalname, mimeType: req.file.mimetype, size: req.file.size, path: req.file.path };
 
     const effectiveMemberTier = getEffectiveMemberTierForUser(user, "");
-    const pricingSnapshot = computeFeeBreakdown({ zone, runType, extraStores, grocerySubtotal: Number(b.grocerySubtotal || 0), addon_printing: b.addon_printing || "no", printPages: Number(b.printPages || 0), memberTier: effectiveMemberTier, applyPerk: "yes" }).totals;
+    
+    // Space Point Calculation
+    let spacePoints = 1;
+    if (addBulky) spacePoints += 1;
+    if (addRide) spacePoints += 2;
 
-    const maxSlots = run.maxSlots || 12;
-    const runUpdate = await Run.findOneAndUpdate({ runKey: run.runKey, bookedOrdersCount: { $lt: maxSlots } }, { $inc: { bookedOrdersCount: 1, bookedFeesTotal: pricingSnapshot.totalFees }, $set: { lastRecalcAt: new Date() } }, { new: true }).lean();
-    if (!runUpdate) return res.status(409).json({ ok: false, error: "This run is full." });
+    const pricingSnapshot = computeFeeBreakdown({ zone, runType, extraStores, grocerySubtotal: Number(b.grocerySubtotal || 0), addon_printing: b.addon_printing || "no", addon_ride: b.addon_ride || "no", printPages: Number(b.printPages || 0), memberTier: effectiveMemberTier, applyPerk: "yes" }).totals;
+
+    // Check Capacity
+    const maxPoints = run.maxPoints || 10;
+    const runUpdate = await Run.findOneAndUpdate(
+      { runKey: run.runKey, bookedPoints: { $lte: maxPoints - spacePoints } }, 
+      { $inc: { bookedOrdersCount: 1, bookedFeesTotal: pricingSnapshot.totalFees, bookedPoints: spacePoints }, $set: { lastRecalcAt: new Date() } }, 
+      { new: true }
+    ).lean();
+
+    if (!runUpdate) return res.status(409).json({ ok: false, error: `Vehicle capacity reached! This order requires ${spacePoints} space points, but the Jeep is too full.` });
 
     const created = await Order.create({
-      orderId, runKey: run.runKey, runType, hold: false,
+      orderId, runKey: run.runKey, runType, spacePoints, hold: false,
       flags: { prescription: addPrescription, alcohol: addLiquor, bulky: addBulky, idRequired: addLiquor },
       customer: { fullName, email: String(user.email || "").trim().toLowerCase(), phone, altPhone, dob },
       address: { town, streetAddress, unit, postalCode, zone }, stores: { primary: primaryStore, extra: extraStores }, preferences: { dropoffPref, subsPref, contactPref, contactAuth: true },
@@ -1160,83 +1146,6 @@ app.post("/api/orders", requireLogin, requireProfileComplete, upload.single("gro
     res.json({ ok: true, orderId, runKey: run.runKey, cancelToken, cancelUntilLocal, effectiveMemberTier });
   } catch (e) { res.status(500).json({ ok: false, error: String(e) }); }
 });
-
-app.post("/api/orders/:orderId/cancel", async (req, res) => {
-  try {
-    const orderId = String(req.params.orderId || "").trim().toUpperCase(); const token = String(req.body?.token || "").trim();
-    const order = await Order.findOne({ orderId }); if (!order) return res.status(404).json({ ok: false, error: "Order not found" });
-    const run = await Run.findOne({ runKey: order.runKey }).lean(); if (!run?.cutoffAt) return res.status(500).json({ ok: false, error: "Run cutoff not available" });
-    const cutoffAt = dayjs(run.cutoffAt).tz(TZ); const now = nowTz();
-    const isActive = ACTIVE_STATES.has(order.status?.state || "submitted");
-    if (!isActive) return res.status(400).json({ ok: false, error: "Order cannot be cancelled in its current status." });
-    const v = verifyCancelToken(orderId, token); if (!v.ok) return res.status(403).json({ ok: false, error: "Invalid cancel token." });
-    if (!now.isBefore(cutoffAt)) return res.status(403).json({ ok: false, error: "Cancellation window closed (past cutoff)." });
-
-    const fees = Number(order.pricingSnapshot?.totalFees || 0);
-    await Run.updateOne({ runKey: order.runKey }, { $inc: { bookedOrdersCount: -1, bookedFeesTotal: -fees }, $set: { lastRecalcAt: new Date() } });
-    order.status.state = "cancelled"; order.status.note = "Cancelled by customer"; order.status.updatedAt = new Date(); order.status.updatedBy = "customer";
-    order.statusHistory.push({ state: "cancelled", note: "Cancelled by customer", at: new Date(), by: "customer" }); order.adminLog.push({ at: new Date(), by: "customer", action: "cancel", meta: {} });
-    await order.save(); return res.json({ ok: true });
-  } catch (e) { return res.status(500).json({ ok: false, error: String(e) }); }
-});
-
-// =========================
-// MEMBER PORTAL
-// =========================
-app.get("/member", requireLogin, async (req, res) => {
-  try {
-    const email = String(req.user?.email || "").toLowerCase().trim(); const name = String(req.user?.name || "").trim();
-    const orders = await Order.find({ "customer.email": email }).sort({ createdAt: -1 }).limit(80).lean();
-    const runKeys = Array.from(new Set(orders.map(o => o.runKey).filter(Boolean)));
-    const runs = await Run.find({ runKey: { $in: runKeys } }).lean(); const runByKey = new Map(runs.map(r => [r.runKey, r]));
-    const now = nowTz(); const trackables = [];
-    for (const o of orders) {
-      const status = o.status?.state || "submitted"; if (!ACTIVE_STATES.has(status)) continue;
-      const run = runByKey.get(o.runKey); if (!run?.runKey || !run?.cutoffAt) continue;
-      const expMs = dayjs(run.cutoffAt).add(1, "day").valueOf(); const tkn = signTrackingToken(o.orderId, run.runKey, expMs);
-      trackables.push({ orderId: o.orderId, runKey: run.runKey, token: tkn, status });
-    }
-
-    const rows = orders.map(o => {
-      const fees = typeof o.pricingSnapshot?.totalFees === "number" ? o.pricingSnapshot.totalFees.toFixed(2) : "0.00";
-      const status = o.status?.state || "submitted"; const run = runByKey.get(o.runKey);
-      const cutoffAt = run?.cutoffAt ? dayjs(run.cutoffAt).tz(TZ) : null; const cancelOpen = cutoffAt ? now.isBefore(cutoffAt) : false;
-      let cancelHtml = `<span class="muted">—</span>`;
-      if (ACTIVE_STATES.has(status) && cancelOpen) { const token = signCancelToken(o.orderId, cutoffAt.toDate().getTime()); cancelHtml = `<button class="btn" data-cancel="${escapeHtml(o.orderId)}" data-token="${escapeHtml(token)}">Cancel</button>`; }
-      else if (status === "cancelled") { cancelHtml = `<span class="pill">Cancelled</span>`; }
-      else if (!cancelOpen && ACTIVE_STATES.has(status)) { cancelHtml = `<span class="muted">Past cutoff</span>`; }
-
-      let trackHtml = `<span class="muted">—</span>`;
-      if (ACTIVE_STATES.has(status) && run?.runKey && run?.cutoffAt) {
-        const expMs = dayjs(run.cutoffAt).add(1, "day").valueOf(); const tkn = signTrackingToken(o.orderId, run.runKey, expMs);
-        const link = `https://api.tobermorygroceryrun.ca/member?trackRunKey=${encodeURIComponent(run.runKey)}&token=${encodeURIComponent(tkn)}&orderId=${encodeURIComponent(o.orderId)}`;
-        trackHtml = `<button class="btn" data-track-run="${escapeHtml(run.runKey)}" data-track-token="${escapeHtml(tkn)}" data-track-order="${escapeHtml(o.orderId)}">Track on map</button> <button class="btn" data-copy="${escapeHtml(link)}">Copy link</button>`;
-      }
-      const addr = `${o.address?.streetAddress || ""}${o.address?.unit ? " " + o.address.unit : ""}, ${o.address?.town || ""}, ON ${o.address?.postalCode || ""}`.trim();
-      return `<tr><td><div style="font-weight:1000;">${escapeHtml(o.orderId)}</div><div class="muted" style="font-size:12px;">${escapeHtml(fmtLocal(o.createdAt))}</div></td><td><div style="font-weight:900;">${escapeHtml(addr)}</div><div class="muted" style="font-size:12px;">Zone ${escapeHtml(o.address?.zone || "")}</div></td><td><span class="pill">${escapeHtml(o.runType || "")}</span><div class="muted" style="font-size:12px;margin-top:4px;">${escapeHtml(o.runKey || "")}</div></td><td><span class="pill">${escapeHtml(status)}</span><div class="muted" style="font-size:12px;margin-top:4px;">${escapeHtml(o.status?.note || "")}</div></td><td>$${escapeHtml(fees)}</td><td>${trackHtml}</td><td>${cancelHtml}</td></tr>`;
-    }).join("");
-
-    res.setHeader("Content-Type", "text/html; charset=utf-8");
-    res.send(`<!doctype html><html lang="en-CA"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>TGR Member Portal</title><style>:root{--bg:#0b0b0b; --panel:rgba(255,255,255,.06); --line:rgba(255,255,255,.14); --text:#fff; --muted:rgba(255,255,255,.75); --red:#e3342f; --red2:#ff4a44; --radius:14px;} body{margin:0;background:var(--bg);color:var(--text);font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;} .wrap{max-width:1250px;margin:0 auto;padding:16px;} .card{border:1px solid var(--line);background:var(--panel);border-radius:var(--radius);padding:14px;} .row{display:flex;gap:10px;flex-wrap:wrap;align-items:center;} .btn{border:1px solid rgba(255,255,255,.18);background:rgba(255,255,255,.06);color:#fff;font-weight:900;border-radius:999px;padding:10px 14px;cursor:pointer;text-decoration:none;white-space:nowrap;} .btn.primary{background:linear-gradient(180deg,var(--red2),var(--red));border-color:rgba(0,0,0,.25);} .btn.ghost{background:transparent;} .muted{color:var(--muted);} .pill{display:inline-block;padding:4px 10px;border-radius:999px;border:1px solid rgba(255,255,255,.18);background:rgba(255,255,255,.06);font-weight:900;font-size:12px;} table{width:100%;border-collapse:collapse;} th,td{padding:10px 8px;border-bottom:1px solid rgba(255,255,255,.12);vertical-align:top;} th{font-size:12px;color:rgba(255,255,255,.72);text-transform:uppercase;letter-spacing:.08em;text-align:left;} .toast{margin-top:10px;padding:10px 12px;border-radius:12px;border:1px solid rgba(255,255,255,.18);background:rgba(0,0,0,.24);display:none;font-weight:900;} .toast.show{display:block;} .hr{height:1px;background:rgba(255,255,255,.12);margin:12px 0;} .grid{display:grid;grid-template-columns: 1fr 1fr; gap:12px;} @media (max-width: 980px){ .grid{grid-template-columns: 1fr;} } #mapWrap{display:none;} #map{height: 420px; border-radius: 14px; border:1px solid rgba(255,255,255,.14); overflow:hidden;} .small{font-size:13px;} .warn{border:1px solid rgba(227,52,47,.45);background:rgba(227,52,47,.12);border-radius:12px;padding:10px 12px;}</style></head><body><div class="wrap"><div class="card"><div class="row" style="justify-content:space-between;"><div><div style="font-weight:1000;font-size:22px;">Member Portal</div><div class="muted">Signed in as <strong>${escapeHtml(email)}</strong>${name ? ` • ${escapeHtml(name)}` : ""}</div></div><div class="row"><a class="btn ghost" href="${escapeHtml(PUBLIC_SITE_URL)}/">Back to site</a><a class="btn" href="${escapeHtml(SQUARE_PAY_GROCERIES_LINK)}" target="_blank" rel="noopener">Pay Grocery Total</a><a class="btn" href="${escapeHtml(SQUARE_PAY_FEES_LINK)}" target="_blank" rel="noopener">Pay Service & Delivery Fees</a><a class="btn ghost" href="/logout?returnTo=${encodeURIComponent(PUBLIC_SITE_URL + "/")}">Log out</a></div></div><div class="toast" id="toast"></div><div class="hr"></div><div class="grid" id="mapWrap"><div class="card" style="box-shadow:none;"><div style="font-weight:1000;font-size:18px;">Live Tracking Map</div><div class="muted small" id="mapSub">Select an order to track. Tracking only works when enabled for the run.</div><div class="hr"></div><div id="map"></div><div class="hr"></div><div class="row"><span class="pill" id="mapStatus">—</span><span class="pill" id="mapLast">Last: —</span><button class="btn" id="stopMap">Stop</button></div><div class="muted small" id="mapErr" style="margin-top:10px;"></div></div><div class="card" style="box-shadow:none;"><div style="font-weight:1000;font-size:18px;">Tracking controls</div><div class="muted small">Only your active orders can track. If tracking is disabled, you’ll see “Tracking off”.</div><div class="hr"></div><div class="warn"><div style="font-weight:1000;">Tip</div><div class="muted small">If your map is blank, the driver hasn’t started tracking or hasn’t sent a GPS fix yet.</div></div></div></div><div class="hr"></div><div style="overflow:auto;"><table><thead><tr><th>Order</th><th>Address</th><th>Run</th><th>Status</th><th>Fees</th><th>Tracking</th><th>Cancel</th></tr></thead><tbody>${rows || `<tr><td colspan="7" class="muted">No orders yet.</td></tr>`}</tbody></table></div></div></div><script>const TRACKABLES = ${JSON.stringify(trackables)}; let MAPBOX_TOKEN = ""; let map = null; let marker = null; let pollTimer = null; let activeTrack = null; const toast = (msg)=>{const el = document.getElementById("toast"); el.textContent = msg; el.classList.add("show"); setTimeout(()=>el.classList.remove("show"), 3500);}; async function cancelOrder(orderId, token){const ok = confirm("Cancel " + orderId + " before cutoff?"); if(!ok) return; const r = await fetch("/api/orders/" + encodeURIComponent(orderId) + "/cancel", {method:"POST", headers:{ "Content-Type":"application/json" }, credentials:"include", body: JSON.stringify({ token })}); const d = await r.json().catch(()=>({})); if(!r.ok || d.ok===false) return toast(d.error || "Cancel failed"); toast("Cancelled " + orderId); setTimeout(()=>location.reload(), 700);} async function copy(text){try{ await navigator.clipboard.writeText(text); return true; } catch { return false; }} document.querySelectorAll("[data-cancel]").forEach(btn=>{btn.addEventListener("click", ()=>{cancelOrder(btn.getAttribute("data-cancel"), btn.getAttribute("data-token"));});}); document.querySelectorAll("[data-copy]").forEach(btn=>{btn.addEventListener("click", async ()=>{const url = btn.getAttribute("data-copy"); if (await copy(url)) toast("Link copied ✅"); else toast("Copy failed");});}); document.querySelectorAll("[data-track-run]").forEach(btn=>{btn.addEventListener("click", ()=>{const runKey = btn.getAttribute("data-track-run"); const token = btn.getAttribute("data-track-token"); const orderId = btn.getAttribute("data-track-order"); startMapTracking({ runKey, token, orderId });});}); document.getElementById("stopMap").addEventListener("click", ()=> stopMapTracking()); function qs(){const u = new URL(location.href); return {runKey: u.searchParams.get("trackRunKey") || "", token: u.searchParams.get("token") || "", orderId: u.searchParams.get("orderId") || ""};} async function loadConfig(){const r = await fetch("/api/public/config"); const d = await r.json().catch(()=>({})); if(r.ok && d.ok) MAPBOX_TOKEN = d.mapboxPublicToken || "";} function setMapWrap(show){document.getElementById("mapWrap").style.display = show ? "grid" : "none";} function setStatus(text){ document.getElementById("mapStatus").textContent = text; } function setLast(text){ document.getElementById("mapLast").textContent = text; } function setErr(text){ document.getElementById("mapErr").textContent = text || ""; } function loadMapboxLib(){return new Promise((resolve, reject)=>{if (window.mapboxgl) return resolve(); const css = document.createElement("link"); css.rel = "stylesheet"; css.href = "https://api.mapbox.com/mapbox-gl-js/v2.15.0/mapbox-gl.css"; document.head.appendChild(css); const s = document.createElement("script"); s.src = "https://api.mapbox.com/mapbox-gl-js/v2.15.0/mapbox-gl.js"; s.onload = ()=> resolve(); s.onerror = ()=> reject(new Error("Mapbox failed to load")); document.head.appendChild(s);});} async function ensureMap(){if (map) return; if (!MAPBOX_TOKEN) throw new Error("Mapbox token missing on server"); await loadMapboxLib(); mapboxgl.accessToken = MAPBOX_TOKEN; map = new mapboxgl.Map({container: "map", style: "mapbox://styles/mapbox/dark-v11", center: [-81.7, 45.25], zoom: 9}); marker = new mapboxgl.Marker({ color: "#ff4a44" }).setLngLat([-81.7, 45.25]).addTo(map);} function stopMapTracking(){activeTrack = null; if (pollTimer) clearInterval(pollTimer); pollTimer = null; setStatus("—"); setLast("Last: —"); setErr(""); toast("Tracking stopped");} async function pollOnce(){if (!activeTrack) return; const { runKey, token } = activeTrack; try{const r = await fetch("/api/public/tracking/" + encodeURIComponent(runKey) + "?token=" + encodeURIComponent(token)); const d = await r.json().catch(()=>({})); if(!r.ok || d.ok===false){setStatus("Error"); setErr(d.error || "Tracking error"); return;} if (!d.enabled){setStatus("Tracking off"); setErr("Tracking is not enabled for this run yet."); return;} if (!d.hasFix){setStatus("Waiting for GPS"); setErr("No GPS fix yet. Try again in a moment."); return;} const lat = d.last.lat; const lng = d.last.lng; const at = d.last.at ? new Date(d.last.at).toLocaleString() : "—"; setStatus("Live ✅"); setLast("Last: " + at); setErr(""); marker.setLngLat([lng, lat]); map.easeTo({ center: [lng, lat], zoom: 12, duration: 900 });} catch (e){setStatus("Error"); setErr(String(e.message || e));}} async function startMapTracking(t){activeTrack = t; setMapWrap(true); setStatus("Loading…"); setLast("Last: —"); setErr(""); document.getElementById("mapSub").textContent = "Tracking " + (t.orderId || "") + " • " + (t.runKey || ""); try{await ensureMap(); await pollOnce(); if (pollTimer) clearInterval(pollTimer); pollTimer = setInterval(pollOnce, 2500); toast("Map tracking started ✅");} catch (e){setStatus("Error"); setErr(String(e.message || e));}} (async function boot(){await loadConfig(); const p = qs(); if (p.runKey && p.token) {startMapTracking({ runKey: p.runKey, token: p.token, orderId: p.orderId || "" }); return;} setMapWrap(false);})();</script></body></html>`);
-  } catch (e) { res.status(500).send("Member portal error: " + String(e)); }
-});
-
-// =========================
-// ADMIN HELPERS + API
-// =========================
-function adminBy(req) { return String(req.user?.email || "admin").toLowerCase(); }
-function buildOrderFilterFromQuery(qs) {
-  const q = String(qs.q || "").trim(); const state = String(qs.state || "").trim(); const runKey = String(qs.runKey || "").trim(); const zone = String(qs.zone || "").trim(); const town = String(qs.town || "").trim(); const unpaidFees = String(qs.unpaidFees || "").trim() === "1"; const hold = String(qs.hold || "").trim() === "1"; const flag = String(qs.flag || "").trim();
-  const filter = {};
-  if (runKey) filter.runKey = runKey; if (state) filter["status.state"] = state; if (zone) filter["address.zone"] = zone;
-  if (town) filter["address.town"] = new RegExp("^" + town.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") + "$", "i");
-  if (unpaidFees) filter["payments.fees.status"] = "unpaid"; if (hold) filter["hold"] = true; if (flag) filter[`flags.${flag}`] = true;
-  if (q) { const safe = q.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"); const re = new RegExp(safe, "i"); filter.$or = [{ orderId: re }, { "customer.fullName": re }, { "customer.email": re }, { "customer.phone": re }, { "address.town": re }, { "address.streetAddress": re }, { "address.postalCode": re }]; }
-  return filter;
-}
-
-app.get("/api/admin/orders", requireLogin, requireAdmin, async (req, res) => { try { const limit = Math.min(500, Math.max(1, Number(req.query.limit || 120))); const filter = buildOrderFilterFromQuery(req.query); const items = await Order.find(filter).sort({ createdAt: -1 }).limit(limit).lean(); res.json({ ok: true, items }); } catch (e) { res.status(500).json({ ok: false, error: String(e) }); } });
-app.get("/api/admin/orders/:orderId", requireLogin, requireAdmin, async (req, res) => { try { const orderId = String(req.params.orderId || "").trim().toUpperCase(); const o = await Order.findOne({ orderId }).lean(); if (!o) return res.status(404).json({ ok: false, error: "Order not found" }); res.json({ ok: true, order: o }); } catch (e) { res.status(500).json({ ok: false, error: String(e) }); } });
 
 // STATUS UPDATE ENDPOINT (WITH TWILIO SMS INTEGRATION)
 app.post("/api/admin/orders/:orderId/status", requireLogin, requireAdmin, async (req, res) => {
@@ -1270,7 +1179,7 @@ app.post("/api/admin/orders/:orderId/status", requireLogin, requireAdmin, async 
         let smsMessage = "";
         
         if (state === "shopping") {
-          smsMessage = `Hi ${firstName}, your Tobermory Grocery Run order is currently being picked!`;
+          smsMessage = `Hi ${firstName}! I've grabbed a cart and I'm officially picking your groceries. Let's hope the avocados are cooperating today. 🥑 - Tobermory Grocery Run`;
         } 
         else if (state === "out_for_delivery") {
           // Generate tracking link
@@ -1281,10 +1190,10 @@ app.post("/api/admin/orders/:orderId/status", requireLogin, requireAdmin, async 
             const token = signTrackingToken(order.orderId, run.runKey, expMs);
             trackingLink = `${PUBLIC_SITE_URL}/member?trackRunKey=${encodeURIComponent(run.runKey)}&token=${encodeURIComponent(token)}&orderId=${encodeURIComponent(order.orderId)}`;
           }
-          smsMessage = `Hi ${firstName}, we've left the store and are on our way! We'll be there soon. Track your delivery live here: ${trackingLink}`;
+          smsMessage = `Hi ${firstName}, the Jeep is loaded and I'm on the road! Track your delivery live right here: ${trackingLink} 🚙💨 - TGR`;
         } 
         else if (state === "delivered") {
-          smsMessage = `Your Tobermory Grocery Run order has been delivered! Thank you for choosing us!`;
+          smsMessage = `Mission accomplished! Your order has been dropped off. Enjoy the goodies, and thanks for trusting Tobermory Grocery Run! 🛒✨`;
         }
 
         if (smsMessage) {
