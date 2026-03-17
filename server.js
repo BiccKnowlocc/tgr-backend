@@ -1,7 +1,8 @@
 // ======= MY NOTES =======
-// 1) Added GET /api/admin/runs/:runKey/master-list endpoint.
-// 2) Updated the /admin HTML payload to include the Master List button, modal, and fetching logic.
-// 3) Renamed the 'exportRunKey' input to 'toolRunKey' so it can be shared by both the CSV export and the Master List.
+// 1) Master List functionality updated inside the /admin HTML payload.
+// 2) Added client-side JS to generate and download a CSV of the Master List.
+// 3) Added @media print CSS to ensure the list prints cleanly without the dark admin UI.
+// 4) Twilio SMS integration is pending for the next step.
 
 // ======= server.js (FULL FILE) — TGR backend =======
 const express = require("express");
@@ -1368,6 +1369,17 @@ app.get("/admin", requireLogin, requireAdmin, async (_req, res) => {
   .two{display:grid;grid-template-columns:1fr 1fr; gap:10px;}
   @media(max-width:800px){.two{grid-template-columns:1fr;}}
   pre{white-space:pre-wrap; word-break:break-word;}
+  
+  /* Print styling specifically for the Master List Modal */
+  @media print {
+    body * { visibility: hidden; }
+    #masterListModalBack, #masterListModalBack * { visibility: visible; }
+    #masterListModalBack { position: absolute; left: 0; top: 0; background: white; color: black; align-items: flex-start; }
+    .modal { border: none; background: white; box-shadow: none; overflow: visible; max-height: none; }
+    .btn, .toast { display: none !important; }
+    .card { background: white !important; border: none !important; color: black !important; }
+    pre { color: black !important; font-family: monospace; font-size: 14pt; }
+  }
 </style>
 </head>
 <body>
@@ -1521,10 +1533,11 @@ app.get("/admin", requireLogin, requireAdmin, async (_req, res) => {
 </div>
 
 <div class="modalBack" id="masterListModalBack">
-  <div class="modal">
+  <div class="modal" style="max-width: 800px;">
     <div class="row" style="justify-content:space-between;">
       <div style="font-weight:1000;font-size:20px;">Master Shopping List</div>
       <div class="row">
+        <button class="btn" id="exportMasterCsvBtn">Download CSV</button>
         <button class="btn primary" onclick="window.print()">Print</button>
         <button class="btn ghost" id="closeMasterListModal">Close</button>
       </div>
@@ -1629,7 +1642,9 @@ app.get("/admin", requireLogin, requireAdmin, async (_req, res) => {
   
   qs("exportBtn").addEventListener("click", ()=>{ const rk = qs("toolRunKey").value.trim(); if(!rk) return toast("Enter runKey to export"); window.location.href = "/api/admin/routific/export-csv?runKey=" + encodeURIComponent(rk); });
   
-  // Master Shopping List UI Binding
+  // Master Shopping List logic
+  let cachedMasterListData = null;
+
   qs("masterListBtn").addEventListener("click", async () => {
     const rk = qs("toolRunKey").value.trim();
     if(!rk) return toast("Enter runKey to generate Master List");
@@ -1638,6 +1653,8 @@ app.get("/admin", requireLogin, requireAdmin, async (_req, res) => {
       const r = await fetch("/api/admin/runs/" + encodeURIComponent(rk) + "/master-list", { credentials:"include" });
       const d = await r.json();
       if (!r.ok || d.ok === false) throw new Error(d.error || "Master List failed");
+      
+      cachedMasterListData = d; // Save data globally so the CSV button can use it
       
       let out = "MASTER SHOPPING LIST: " + rk + "\\n";
       out += "==============================================\\n\\n";
@@ -1663,6 +1680,37 @@ app.get("/admin", requireLogin, requireAdmin, async (_req, res) => {
     } catch(e) {
       toast(String(e.message||e));
     }
+  });
+
+  qs("exportMasterCsvBtn").addEventListener("click", () => {
+    if (!cachedMasterListData) return;
+    
+    let csv = "Quantity,Item\\n";
+    
+    // Add grocery items
+    cachedMasterListData.items.forEach(i => {
+      const safeName = i.name.replace(/"/g, '""');
+      csv += \`"\${i.count}","\${safeName}"\\n\`;
+    });
+    
+    // Add extra stops
+    if (cachedMasterListData.extraStops && cachedMasterListData.extraStops.length > 0) {
+      csv += "\\nExtra Stops\\n";
+      cachedMasterListData.extraStops.forEach(s => {
+        const safeStop = s.replace(/"/g, '""');
+        csv += \`"","\${safeStop}"\\n\`;
+      });
+    }
+    
+    // Trigger download
+    const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.setAttribute("href", url);
+    link.setAttribute("download", "master_list_" + cachedMasterListData.runKey + ".csv");
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
   });
 
   qs("closeMasterListModal").addEventListener("click", () => { qs("masterListModalBack").style.display = "none"; });
