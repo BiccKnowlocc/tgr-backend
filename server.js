@@ -1,8 +1,6 @@
 // ======= MY NOTES =======
-// 1) Added Twilio package requirement and environment variables.
-// 2) Added `sendSms` helper function with automatic North American phone formatting.
-// 3) Updated `POST /api/admin/orders/:orderId/status` to trigger automatic texts on status changes.
-// 4) All other logic remains fully intact.
+// 1) Updated the SMS message strings inside the POST /api/admin/orders/:orderId/status endpoint.
+// 2) The rest of the Twilio setup and server logic remains exactly the same.
 
 // ======= server.js (FULL FILE) — TGR backend =======
 const express = require("express");
@@ -1272,7 +1270,7 @@ app.post("/api/admin/orders/:orderId/status", requireLogin, requireAdmin, async 
         let smsMessage = "";
         
         if (state === "shopping") {
-          smsMessage = `Hi ${firstName}, Tobermory Grocery Run has started shopping your order!`;
+          smsMessage = `Hi ${firstName}, your Tobermory Grocery Run order is currently being picked!`;
         } 
         else if (state === "out_for_delivery") {
           // Generate tracking link
@@ -1283,7 +1281,7 @@ app.post("/api/admin/orders/:orderId/status", requireLogin, requireAdmin, async 
             const token = signTrackingToken(order.orderId, run.runKey, expMs);
             trackingLink = `${PUBLIC_SITE_URL}/member?trackRunKey=${encodeURIComponent(run.runKey)}&token=${encodeURIComponent(token)}&orderId=${encodeURIComponent(order.orderId)}`;
           }
-          smsMessage = `Your TGR driver is heading your way! Track them live here: ${trackingLink}`;
+          smsMessage = `Hi ${firstName}, we've left the store and are on our way! We'll be there soon. Track your delivery live here: ${trackingLink}`;
         } 
         else if (state === "delivered") {
           smsMessage = `Your Tobermory Grocery Run order has been delivered! Thank you for choosing us!`;
