@@ -17,8 +17,8 @@ const GoogleStrategy = require("passport-google-oauth20").Strategy;
 const postmark = require("postmark");
 const twilio = require("twilio");
 
-// SQUARE SDK IMPORT
-const { Client, Environment } = require("square");
+// SQUARE SDK IMPORT (Fixed: Removed Environment enum dependency)
+const { Client } = require("square");
 
 const dayjs = require("dayjs");
 const utc = require("dayjs/plugin/utc");
@@ -61,8 +61,8 @@ const TWILIO_AUTH_TOKEN = process.env.TWILIO_AUTH_TOKEN || "";
 const TWILIO_PHONE_NUMBER = process.env.TWILIO_PHONE_NUMBER || "";
 const twilioClient = (TWILIO_ACCOUNT_SID && TWILIO_AUTH_TOKEN) ? twilio(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN) : null;
 
-// SQUARE API CONFIG
-const SQUARE_ENVIRONMENT = String(process.env.SQUARE_ENVIRONMENT || "sandbox").toLowerCase() === "production" ? Environment.Production : Environment.Sandbox;
+// SQUARE API CONFIG (Fixed: Using raw strings to bypass versioning bugs)
+const SQUARE_ENVIRONMENT = String(process.env.SQUARE_ENVIRONMENT || "sandbox").toLowerCase() === "production" ? "production" : "sandbox";
 const SQUARE_APP_ID = process.env.SQUARE_APP_ID || "";
 const SQUARE_ACCESS_TOKEN = process.env.SQUARE_ACCESS_TOKEN || "";
 const SQUARE_LOCATION_ID = process.env.SQUARE_LOCATION_ID || "";
