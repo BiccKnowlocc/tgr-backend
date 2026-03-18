@@ -18,7 +18,7 @@ const postmark = require("postmark");
 const twilio = require("twilio");
 
 // BULLETPROOF SQUARE SDK IMPORT
-const squarePkg = require("square");
+const squarePkg = require("square/legacy");
 const Client = squarePkg.Client || squarePkg.default?.Client;
 const Environment = squarePkg.Environment || squarePkg.default?.Environment || { Production: "production", Sandbox: "sandbox" };
 
