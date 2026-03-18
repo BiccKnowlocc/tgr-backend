@@ -17,8 +17,10 @@ const GoogleStrategy = require("passport-google-oauth20").Strategy;
 const postmark = require("postmark");
 const twilio = require("twilio");
 
-// SQUARE SDK IMPORT (Fixed: Removed Environment enum dependency)
-const { Client } = require("square");
+// BULLETPROOF SQUARE SDK IMPORT
+const squarePkg = require("square");
+const Client = squarePkg.Client || squarePkg.default?.Client;
+const Environment = squarePkg.Environment || squarePkg.default?.Environment || { Production: "production", Sandbox: "sandbox" };
 
 const dayjs = require("dayjs");
 const utc = require("dayjs/plugin/utc");
@@ -61,13 +63,23 @@ const TWILIO_AUTH_TOKEN = process.env.TWILIO_AUTH_TOKEN || "";
 const TWILIO_PHONE_NUMBER = process.env.TWILIO_PHONE_NUMBER || "";
 const twilioClient = (TWILIO_ACCOUNT_SID && TWILIO_AUTH_TOKEN) ? twilio(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN) : null;
 
-// SQUARE API CONFIG (Fixed: Using raw strings to bypass versioning bugs)
-const SQUARE_ENVIRONMENT = String(process.env.SQUARE_ENVIRONMENT || "sandbox").toLowerCase() === "production" ? "production" : "sandbox";
+// SQUARE API CONFIG (Wrapped in safety net to prevent server crashes)
+const SQUARE_ENVIRONMENT = String(process.env.SQUARE_ENVIRONMENT || "sandbox").toLowerCase() === "production" ? Environment.Production : Environment.Sandbox;
 const SQUARE_APP_ID = process.env.SQUARE_APP_ID || "";
 const SQUARE_ACCESS_TOKEN = process.env.SQUARE_ACCESS_TOKEN || "";
 const SQUARE_LOCATION_ID = process.env.SQUARE_LOCATION_ID || "";
 
-const squareClient = (SQUARE_ACCESS_TOKEN) ? new Client({ accessToken: SQUARE_ACCESS_TOKEN, environment: SQUARE_ENVIRONMENT }) : null;
+let squareClient = null;
+try {
+  if (SQUARE_ACCESS_TOKEN && Client) {
+    squareClient = new Client({ accessToken: SQUARE_ACCESS_TOKEN, environment: SQUARE_ENVIRONMENT });
+    console.log("Square SDK initialized successfully.");
+  } else {
+    console.warn("⚠️ Square Client not initialized: Missing Token or Client Constructor.");
+  }
+} catch (err) {
+  console.error("⚠️ Square SDK Initialization Error:", err.message);
+}
 
 // Membership purchase links
 const SQUARE_LINK_STANDARD = process.env.SQUARE_LINK_STANDARD || "https://square.link/u/iaziCZjG";
@@ -535,7 +547,9 @@ app.get("/member", requireLogin, async (req, res) => {
     }).join("");
 
     res.setHeader("Content-Type", "text/html; charset=utf-8");
-    res.send(`<!doctype html><html lang="en-CA"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>TGR Member Portal</title><style>:root{--bg:#0b0b0b; --panel:rgba(255,255,255,.06); --line:rgba(255,255,255,.14); --text:#fff; --muted:rgba(255,255,255,.75); --red:#e3342f; --red2:#ff4a44; --radius:14px;} body{margin:0;background:var(--bg);color:var(--text);font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;} .wrap{max-width:1250px;margin:0 auto;padding:16px;} .card{border:1px solid var(--line);background:var(--panel);border-radius:var(--radius);padding:14px;} .row{display:flex;gap:10px;flex-wrap:wrap;align-items:center;} .btn{border:1px solid rgba(255,255,255,.18);background:rgba(255,255,255,.06);color:#fff;font-weight:900;border-radius:999px;padding:10px 14px;cursor:pointer;text-decoration:none;white-space:nowrap;} .btn.primary{background:linear-gradient(180deg,var(--red2),var(--red));border-color:rgba(0,0,0,.25);} .btn.ghost{background:transparent;} .muted{color:var(--muted);} .pill{display:inline-block;padding:4px 10px;border-radius:999px;border:1px solid rgba(255,255,255,.18);background:rgba(255,255,255,.06);font-weight:900;font-size:12px;} table{width:100%;border-collapse:collapse;} th,td{padding:10px 8px;border-bottom:1px solid rgba(255,255,255,.12);vertical-align:top;} th{font-size:12px;color:rgba(255,255,255,.72);text-transform:uppercase;letter-spacing:.08em;text-align:left;} .toast{margin-top:10px;padding:10px 12px;border-radius:12px;border:1px solid rgba(255,255,255,.18);background:rgba(0,0,0,.24);display:none;font-weight:900;} .toast.show{display:block;} .hr{height:1px;background:rgba(255,255,255,.12);margin:12px 0;} .grid{display:grid;grid-template-columns: 1fr 1fr; gap:12px;} @media (max-width: 980px){ .grid{grid-template-columns: 1fr;} } #mapWrap{display:none;} #map{height: 420px; border-radius: 14px; border:1px solid rgba(255,255,255,.14); overflow:hidden;} .small{font-size:13px;} .warn{border:1px solid rgba(227,52,47,.45);background:rgba(227,52,47,.12);border-radius:12px;padding:10px 12px;}</style></head><body><div class="wrap"><div class="card"><div class="row" style="justify-content:space-between;"><div><div style="font-weight:1000;font-size:22px;">Member Portal</div><div class="muted">Signed in as <strong>${escapeHtml(email)}</strong>${name ? ` • ${escapeHtml(name)}` : ""}</div></div><div class="row"><a class="btn ghost" href="${escapeHtml(PUBLIC_SITE_URL)}/">Back to site</a><a class="btn" href="${escapeHtml(SQUARE_PAY_GROCERIES_LINK)}" target="_blank" rel="noopener">Pay Grocery Total</a><a class="btn" href="${escapeHtml(SQUARE_PAY_FEES_LINK)}" target="_blank" rel="noopener">Pay Service & Delivery Fees</a><a class="btn ghost" href="/logout?returnTo=${encodeURIComponent(PUBLIC_SITE_URL + "/")}">Log out</a></div></div><div class="toast" id="toast"></div><div class="hr"></div>
+    res.send(`<!doctype html><html lang="en-CA"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>TGR Member Portal</title><style>:root{--bg:#0b0b0b; --panel:rgba(255,255,255,.06); --line:rgba(255,255,255,.14); --text:#fff; --muted:rgba(255,255,255,.75); --red:#e3342f; --red2:#ff4a44; --radius:14px;} body{margin:0;background:var(--bg);color:var(--text);font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;} .wrap{max-width:1250px;margin:0 auto;padding:16px;} .card{border:1px solid var(--line);background:var(--panel);border-radius:var(--radius);padding:14px;} .row{display:flex;gap:10px;flex-wrap:wrap;align-items:center;} .btn{border:1px solid rgba(255,255,255,.18);background:rgba(255,255,255,.06);color:#fff;font-weight:900;border-radius:999px;padding:10px 14px;cursor:pointer;text-decoration:none;white-space:nowrap;} .btn.primary{background:linear-gradient(180deg,var(--red2),var(--red));border-color:rgba(0,0,0,.25);} .btn.ghost{background:transparent;} .muted{color:var(--muted);} .pill{display:inline-block;padding:4px 10px;border-radius:999px;border:1px solid rgba(255,255,255,.18);background:rgba(255,255,255,.06);font-weight:900;font-size:12px;} table{width:100%;border-collapse:collapse;} th,td{padding:10px 8px;border-bottom:1px solid rgba(255,255,255,.12);vertical-align:top;} th{font-size:12px;color:rgba(255,255,255,.72);text-transform:uppercase;letter-spacing:.08em;text-align:left;} .toast{margin-top:10px;padding:10px 12px;border-radius:12px;border:1px solid rgba(255,255,255,.18);background:rgba(0,0,0,.24);display:none;font-weight:900;} .toast.show{display:block;} .hr{height:1px;background:rgba(255,255,255,.12);margin:12px 0;} .grid{display:grid;grid-template-columns: 1fr 1fr; gap:12px;} @media (max-width: 980px){ .grid{grid-template-columns: 1fr;} } #mapWrap{display:none;} #map{height: 420px; border-radius: 14px; border:1px solid rgba(255,255,255,.14); overflow:hidden;} .small{font-size:13px;} .warn{border:1px solid rgba(227,52,47,.45);background:rgba(227,52,47,.12);border-radius:12px;padding:10px 12px;}</style></head><body><div class="wrap"><div class="card"><div class="row" style="justify-content:space-between;"><div><div style="font-weight:1000;font-size:22px;">Member Portal</div><div class="muted">Signed in as <strong>${escapeHtml(email)}</strong>${name ? ` • ${escapeHtml(name)}` : ""}</div></div><div class="row"><a class="btn ghost" href="${escapeHtml(PUBLIC_SITE_URL)}/">Back to site</a><a class="btn" href="${escapeHtml(SQUARE_PAY_GROCERIES_LINK)}" target="_blank" rel="noopener">Pay Grocery Total</a><a class="btn" href="${escapeHtml(SQUARE_PAY_FEES_LINK)}" target="_blank" rel="noopener">Pay Service & Delivery Fees</a><a class="btn ghost" href="/logout?returnTo=${encodeURIComponent(PUBLIC_SITE_URL + "/")}">Log out</a></div></div><div class="toast" id="toast"></div>
+
+<div class="hr"></div>
 
 <div class="card" style="box-shadow:none; border: 1px solid rgba(227,52,47,.45); background: rgba(227,52,47,.08); margin-bottom:14px;">
   <div style="font-weight:1000;font-size:18px;">My Membership</div>
@@ -543,15 +557,15 @@ app.get("/member", requireLogin, async (req, res) => {
   <div class="row">
     <div style="flex:1 1 150px;">
        <div class="muted small">Current Tier</div>
-       <div style="font-size:22px; font-weight:900; text-transform:capitalize;">\${escapeHtml(req.user?.membershipLevel && req.user.membershipLevel !== 'none' ? req.user.membershipLevel : 'No active plan')}</div>
+       <div style="font-size:22px; font-weight:900; text-transform:capitalize;">${escapeHtml(req.user?.membershipLevel && req.user.membershipLevel !== 'none' ? req.user.membershipLevel : 'No active plan')}</div>
     </div>
     <div style="flex:1 1 150px;">
        <div class="muted small">Status</div>
-       <div style="font-size:22px; font-weight:900; text-transform:capitalize;">\${escapeHtml(req.user?.membershipStatus || 'Inactive')}</div>
+       <div style="font-size:22px; font-weight:900; text-transform:capitalize;">${escapeHtml(req.user?.membershipStatus || 'Inactive')}</div>
     </div>
     <div style="flex:1 1 200px;">
        <div class="muted small">Renews On</div>
-       <div style="font-size:22px; font-weight:900;">\${req.user?.renewalDate ? new Date(req.user.renewalDate).toLocaleDateString() : '—'}</div>
+       <div style="font-size:22px; font-weight:900;">${req.user?.renewalDate ? new Date(req.user.renewalDate).toLocaleDateString() : '—'}</div>
     </div>
   </div>
   <div class="row" style="margin-top:14px;">
