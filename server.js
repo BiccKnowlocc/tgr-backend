@@ -710,6 +710,30 @@ app.get("/admin", requireLogin, requireAdmin, async (_req, res) => {
   async function saveStatus(){ if(!modalOrder?.orderId) return; try{ await fetch("/api/admin/orders/" + encodeURIComponent(modalOrder.orderId) + "/status", { method:"POST", headers:{ "Content-Type":"application/json" }, credentials:"include", body: JSON.stringify({ state: qs("m_state").value }) }); toast("Status saved ✅"); await search(); } catch(e){ toast(String(e)); } }
   qs("closeModal").addEventListener("click", ()=> openModal(false)); qs("searchBtn").addEventListener("click", search); qs("clearBtn").addEventListener("click", ()=>{ qs("q").value=""; qs("runKey").value=""; search(); }); qs("m_saveState").addEventListener("click", saveStatus);
   search();
+</script>
+</body>
+</html>`);
+});
+
+// =========================
+// EXPORT CSV 
+// =========================
+app.get("/api/admin/routific/export-csv", requireLogin, requireAdmin, async (req, res) => {
+  try {
+    const runKey = String(req.query.runKey || "").trim();
+    if (!runKey) return res.status(400).send("Missing runKey");
+    const orders = await Order.find({ runKey, "status.state": { $in: Array.from(ACTIVE_STATES) } }).sort({ createdAt: 1 }).lean();
+    const header = ["order_id","name","address","phone","email","notes","duration_seconds"];
+    const rows = orders.map(o => {
+      const name = o.customer?.fullName || ""; const phone = o.customer?.phone || ""; const email = o.customer?.email || "";
+      const address = `${o.address?.streetAddress || ""}${o.address?.unit ? (" " + o.address.unit) : ""}, ${o.address?.town || ""}, ON, ${o.address?.postalCode || ""}, Canada`.replace(/\s+/g, " ").trim();
+      const notes = [`TGR ${o.orderId}`, `Zone ${o.address?.zone || ""}`, o.preferences?.dropoffPref ? `Drop-off: ${o.preferences.dropoffPref}` : "", o.preferences?.subsPref ? `Subs: ${o.preferences.subsPref}` : "", o.stores?.primary ? `Store: ${o.stores.primary}` : "", (o.stores?.extra || []).length ? `Extra: ${(o.stores.extra || []).join(", ")}` : ""].filter(Boolean).join(" | ");
+      return [o.orderId, name, address, phone, email, notes, "360"].map(csvEscape).join(",");
+    });
+    const csv = header.join(",") + "\n" + rows.join("\n") + "\n";
+    res.setHeader("Content-Type", "text/csv; charset=utf-8"); res.setHeader("Content-Disposition", `attachment; filename="routific_${runKey}_deliveries.csv"`); res.send(csv);
+  } catch (e) { res.status(500).send(String(e)); }
+});
 
 // =========================
 // ROOT + BOOT
@@ -726,6 +750,3 @@ main().catch((err) => {
   console.error(err);
   process.exit(1);
 });
-</script>
-</body>
-</html>
