@@ -1,1542 +1,731 @@
-<!doctype html>
+// ======= server.js (FULL FILE) — TGR backend =======
+const express = require("express");
+const mongoose = require("mongoose");
+const multer = require("multer");
+const cookieParser = require("cookie-parser");
+const session = require("express-session");
+const cors = require("cors");
+const crypto = require("crypto");
+const https = require("https");
+
+const MongoStorePkg = require("connect-mongo");
+const MongoStore = MongoStorePkg.default || MongoStorePkg;
+
+const passport = require("passport");
+const GoogleStrategy = require("passport-google-oauth20").Strategy;
+
+const postmark = require("postmark");
+const twilio = require("twilio");
+
+// SQUARE SDK IMPORT
+const { Client, Environment } = require("square");
+
+const dayjs = require("dayjs");
+const utc = require("dayjs/plugin/utc");
+const timezone = require("dayjs/plugin/timezone");
+dayjs.extend(utc);
+dayjs.extend(timezone);
+
+const User = require("./models/User");
+
+// =========================
+// ENV / CONFIG
+// =========================
+const PORT = process.env.PORT || 10000;
+
+const MONGODB_URI = process.env.MONGODB_URI || process.env.MONGO_URI || "mongodb://127.0.0.1:27017/tgr";
+const SESSION_SECRET = process.env.SESSION_SECRET || "dev-secret";
+const CANCEL_TOKEN_SECRET = process.env.CANCEL_TOKEN_SECRET || SESSION_SECRET;
+const TRACKING_TOKEN_SECRET = process.env.TRACKING_TOKEN_SECRET || SESSION_SECRET;
+
+const SESSION_COOKIE_SECURE = String(process.env.SESSION_COOKIE_SECURE || "").toLowerCase() === "true" ? true : process.env.NODE_ENV === "production";
+const TZ = process.env.TZ || "America/Toronto";
+
+const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID || "";
+const GOOGLE_CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET || "";
+const GOOGLE_CALLBACK_URL = process.env.GOOGLE_CALLBACK_URL || "";
+
+const ADMIN_EMAILS = String(process.env.ADMIN_EMAILS || "").split(",").map((s) => s.trim().toLowerCase()).filter(Boolean);
+const PUBLIC_SITE_URL = process.env.PUBLIC_SITE_URL || "https://tobermorygroceryrun.ca";
+const MAPBOX_PUBLIC_TOKEN = process.env.MAPBOX_PUBLIC_TOKEN || "";
+
+// Postmark outbound
+const POSTMARK_SERVER_TOKEN = process.env.POSTMARK_SERVER_TOKEN || "";
+const POSTMARK_FROM_EMAIL = process.env.POSTMARK_FROM_EMAIL || "orders@tobermorygroceryrun.ca";
+const POSTMARK_MESSAGE_STREAM = process.env.POSTMARK_MESSAGE_STREAM || "outbound";
+const pmClient = POSTMARK_SERVER_TOKEN ? new postmark.ServerClient(POSTMARK_SERVER_TOKEN) : null;
+
+// Twilio SMS
+const TWILIO_ACCOUNT_SID = process.env.TWILIO_ACCOUNT_SID || "";
+const TWILIO_AUTH_TOKEN = process.env.TWILIO_AUTH_TOKEN || "";
+const TWILIO_PHONE_NUMBER = process.env.TWILIO_PHONE_NUMBER || "";
+const twilioClient = (TWILIO_ACCOUNT_SID && TWILIO_AUTH_TOKEN) ? twilio(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN) : null;
+
+// SQUARE API CONFIG
+const SQUARE_ENVIRONMENT = String(process.env.SQUARE_ENVIRONMENT || "sandbox").toLowerCase() === "production" ? Environment.Production : Environment.Sandbox;
+const SQUARE_APP_ID = process.env.SQUARE_APP_ID || "";
+const SQUARE_ACCESS_TOKEN = process.env.SQUARE_ACCESS_TOKEN || "";
+const SQUARE_LOCATION_ID = process.env.SQUARE_LOCATION_ID || "";
+
+const squareClient = (SQUARE_ACCESS_TOKEN) ? new Client({ accessToken: SQUARE_ACCESS_TOKEN, environment: SQUARE_ENVIRONMENT }) : null;
+
+// Membership purchase links
+const SQUARE_LINK_STANDARD = process.env.SQUARE_LINK_STANDARD || "https://square.link/u/iaziCZjG";
+const SQUARE_LINK_ROUTE = process.env.SQUARE_LINK_ROUTE || "https://square.link/u/P5ROgqyp";
+const SQUARE_LINK_ACCESS = process.env.SQUARE_LINK_ACCESS || "https://square.link/u/lHtHtvqG";
+const SQUARE_LINK_ACCESSPRO = process.env.SQUARE_LINK_ACCESSPRO || "https://square.link/u/S0Y5Fysa";
+
+const ALLOWED_ORIGINS = ["https://tobermorygroceryrun.ca", "https://www.tobermorygroceryrun.ca", "http://localhost:3000", "http://localhost:8888"];
+const CANADAPOST_KEY = process.env.CANADAPOST_KEY || "mn86-az16-ku32-hj78";
+
+// =========================
+// APP + MIDDLEWARE
+// =========================
+const app = express();
+app.use(cors({ origin: function (origin, cb) { if (!origin) return cb(null, true); return cb(null, ALLOWED_ORIGINS.includes(origin)); }, credentials: true }));
+app.use(express.json({ limit: "6mb" }));
+app.use(express.urlencoded({ extended: true }));
+app.use(cookieParser());
+app.set("trust proxy", 1);
+app.use(session({ name: "tgr.sid", secret: SESSION_SECRET, resave: false, saveUninitialized: false, rolling: true, proxy: true, store: MongoStore.create({ mongoUrl: MONGODB_URI, ttl: 60 * 60 * 24 * 14 }), cookie: { httpOnly: true, secure: SESSION_COOKIE_SECURE, sameSite: "lax", maxAge: 1000 * 60 * 60 * 24 * 14 } }));
+app.get("/favicon.ico", (_req, res) => res.status(204).end());
+const upload = multer({ dest: "uploads/", limits: { fileSize: 15 * 1024 * 1024 } });
+
+// =========================
+// PASSPORT
+// =========================
+passport.serializeUser((user, done) => done(null, user._id.toString()));
+passport.deserializeUser(async (id, done) => { try { const u = await User.findById(id).lean(); done(null, u || null); } catch (e) { done(e); } });
+
+if (GOOGLE_CLIENT_ID && GOOGLE_CLIENT_SECRET && GOOGLE_CALLBACK_URL) {
+  passport.use(new GoogleStrategy({ clientID: GOOGLE_CLIENT_ID, clientSecret: GOOGLE_CLIENT_SECRET, callbackURL: GOOGLE_CALLBACK_URL }, async (_accessToken, _refreshToken, profile, done) => {
+    try {
+      const email = (profile.emails && profile.emails[0] && profile.emails[0].value) || ""; const normalized = String(email).toLowerCase().trim(); if (!normalized) return done(null, false);
+      const update = { googleId: profile.id, email: normalized, name: profile.displayName || "", photo: (profile.photos && profile.photos[0] && profile.photos[0].value) || "" };
+      const u = await User.findOneAndUpdate({ email: normalized }, { $set: update, $setOnInsert: { membershipLevel: "none", membershipStatus: "inactive", renewalDate: null, discounts: [], perks: [], profile: { version: 1, complete: false, defaultId: "", addresses: [] } } }, { upsert: true, new: true });
+      return done(null, u);
+    } catch (e) { return done(e); }
+  }));
+}
+app.use(passport.initialize());
+app.use(passport.session());
+
+// =========================
+// PRICING BASELINE
+// =========================
+const PRICING = {
+  serviceFee: 25, zone: { A: 20, B: 15, C: 10, D: 25 }, owenRunFeePerOrder: 20,
+  addOns: { extraStore: 8, printingBase: 5, printingFirst10: 1.25, printingAfter10: 0.75, rideLocal: 15, rideOwen: 50 },
+  groceryUnderMin: { threshold: 35, surcharge: 19 },
+};
+const MEMBERSHIP_PLANS = {
+  standard: { id: "standard", name: "Standard", monthlyPrice: 15, link: SQUARE_LINK_STANDARD, eligibility: "", perks: ["1 free add-on up to $10 OR $10 off zone fee monthly"] },
+  route: { id: "route", name: "Route", monthlyPrice: 25, link: SQUARE_LINK_ROUTE, eligibility: "", perks: ["1 free add-on up to $10 OR $10 off zone fee monthly", "$5 off service fee on 1 order per run day"] },
+  access: { id: "access", name: "Access", monthlyPrice: 12, link: SQUARE_LINK_ACCESS, eligibility: "Seniors 60+ or disabled / mobility-limited / low income", perks: ["1 free add-on up to $10 OR $10 off zone fee per run cycle", "$8 off service fee on 1 order per run day", "Free phone/text ordering"] },
+  accesspro: { id: "accesspro", name: "Access Pro", monthlyPrice: 20, link: SQUARE_LINK_ACCESSPRO, eligibility: "Enhanced support tier", perks: ["$10 off service fee on 1 order per run day", "1 prescription pickup/delivery included monthly", "Document services included up to 10 pages/month in Tobermory area"] },
+};
+const MEMBERSHIP_ORDER = ["standard", "route", "access", "accesspro"];
+function getPublicMembershipPlans() { return MEMBERSHIP_ORDER.map((id) => { const p = MEMBERSHIP_PLANS[id]; return { id: p.id, name: p.name, monthlyPrice: p.monthlyPrice, priceLabel: `$${p.monthlyPrice} / month`, link: p.link, eligibility: p.eligibility, perks: p.perks }; }); }
+function getEffectiveMemberTierForUser(user, requestedTier = "") { const activeTier = user && user.membershipStatus === "active" && user.membershipLevel && user.membershipLevel !== "none" ? String(user.membershipLevel).trim().toLowerCase() : ""; if (activeTier && MEMBERSHIP_PLANS[activeTier]) return activeTier; const reqTier = String(requestedTier || "").trim().toLowerCase(); if (reqTier && MEMBERSHIP_PLANS[reqTier]) return reqTier; return ""; }
+function calcPrinting(pages) { const p = Number(pages || 0); if (p <= 0) return 0; const first = Math.min(p, 10); const rest = Math.max(0, p - 10); return PRICING.addOns.printingBase + first * PRICING.addOns.printingFirst10 + rest * PRICING.addOns.printingAfter10; }
+function membershipDiscounts(tier, applyPerkYes) { if (!tier || !applyPerkYes) return { serviceOff: 0, zoneOff: 0, freeAddonUpTo: 0, waitWaived: false }; if (tier === "standard") return { serviceOff: 0, zoneOff: 10, freeAddonUpTo: 10, waitWaived: false }; if (tier === "route") return { serviceOff: 5, zoneOff: 10, freeAddonUpTo: 10, waitWaived: false }; if (tier === "access") return { serviceOff: 8, zoneOff: 10, freeAddonUpTo: 10, waitWaived: true }; if (tier === "accesspro") return { serviceOff: 10, zoneOff: 0, freeAddonUpTo: 0, waitWaived: true }; return { serviceOff: 0, zoneOff: 0, freeAddonUpTo: 0, waitWaived: false }; }
+
+// =========================
+// MODELS
+// =========================
+const RunSchema = new mongoose.Schema({ runKey: { type: String, unique: true }, type: { type: String, enum: ["local", "owen"], required: true }, opensAt: { type: Date, required: true }, cutoffAt: { type: Date, required: true }, maxSlots: { type: Number, default: 12 }, maxPoints: { type: Number, default: 10 }, minOrders: { type: Number, default: 0 }, minFees: { type: Number, default: 0 }, minLogic: { type: String, enum: ["OR", "AND", "FEES_ONLY"], default: "FEES_ONLY" }, bookedOrdersCount: { type: Number, default: 0 }, bookedPoints: { type: Number, default: 0 }, bookedFeesTotal: { type: Number, default: 0 }, lastRecalcAt: { type: Date } }, { timestamps: true });
+const AllowedStates = ["submitted", "confirmed", "shopping", "packed", "out_for_delivery", "delivered", "issue", "cancelled"];
+const ACTIVE_STATES = new Set(["submitted", "confirmed", "shopping", "packed", "out_for_delivery"]);
+
+const OrderSchema = new mongoose.Schema(
+  {
+    orderId: { type: String, unique: true, index: true }, orderClass: { type: String, enum: ["grocery", "ride"], default: "grocery" }, runKey: { type: String, required: true }, runType: { type: String, enum: ["local", "owen"], required: true }, spacePoints: { type: Number, default: 1 }, hold: { type: Boolean, default: false },
+    flags: { type: { idRequired: { type: Boolean, default: false }, prescription: { type: Boolean, default: false }, alcohol: { type: Boolean, default: false }, bulky: { type: Boolean, default: false }, newCustomerDepositRequired: { type: Boolean, default: false }, needsContact: { type: Boolean, default: false } }, default: {} },
+    customer: { fullName: String, email: String, phone: String, altPhone: { type: String, default: "" }, dob: { type: String, default: "" } }, address: { town: String, streetAddress: String, unit: { type: String, default: "" }, postalCode: { type: String, default: "" }, zone: { type: String, enum: ["A", "B", "C", "D"] } }, stores: { primary: String, extra: [String] }, preferences: { dropoffPref: String, subsPref: String, contactPref: String, contactAuth: Boolean },
+    addOns: { prescription: { requested: { type: Boolean, default: false }, pharmacyName: { type: String, default: "" }, notes: { type: String, default: "" } }, liquor: { requested: { type: Boolean, default: false }, storeName: { type: String, default: "" }, notes: { type: String, default: "" }, idRequired: { type: Boolean, default: true } }, printing: { requested: { type: Boolean, default: false }, pages: { type: Number, default: 0 }, notes: { type: String, default: "" } }, fastFood: { requested: { type: Boolean, default: false }, restaurant: { type: String, default: "" }, orderDetails: { type: String, default: "" } }, parcel: { requested: { type: Boolean, default: false }, carrier: { type: String, default: "" }, details: { type: String, default: "" } }, bulky: { requested: { type: Boolean, default: false }, details: { type: String, default: "" } }, ride: { requested: { type: Boolean, default: false }, pickupAddress: { type: String, default: "" }, destination: { type: String, default: "" }, preferredWindow: { type: String, default: "" }, notes: { type: String, default: "" } }, generalNotes: { type: String, default: "" } },
+    deliveryMeta: { gateCode: { type: String, default: "" }, buildingAccessNotes: { type: String, default: "" }, parkingNotes: { type: String, default: "" }, budgetCap: { type: Number, default: 0 }, receiptPreference: { type: String, default: "" }, photoProofOk: { type: Boolean, default: false } },
+    list: { groceryListText: String, attachment: { originalName: String, mimeType: String, size: Number, path: String } }, consents: { terms: Boolean, accuracy: Boolean, dropoff: Boolean }, pricingSnapshot: { serviceFee: Number, zoneFee: Number, runFee: Number, addOnsFees: Number, surcharges: Number, discount: Number, totalFees: Number },
+    payments: { fees: { status: { type: String, default: "unpaid" }, note: { type: String, default: "" }, paidAt: { type: Date, default: null } }, groceries: { status: { type: String, default: "unpaid" }, note: { type: String, default: "" }, paidAt: { type: Date, default: null }, squarePaymentId: { type: String, default: "" } } },
+    status: { state: { type: String, enum: AllowedStates, default: "submitted" }, note: { type: String, default: "" }, updatedAt: { type: Date, default: Date.now }, updatedBy: { type: String, default: "system" } }, statusHistory: { type: [{ state: { type: String, enum: AllowedStates }, note: String, at: Date, by: String }], default: [] }, adminLog: { type: [{ at: Date, by: String, action: String, meta: Object }], default: [] },
+  },
+  { timestamps: true }
+);
+
+const TrackingSchema = new mongoose.Schema({ runKey: { type: String, unique: true, index: true }, enabled: { type: Boolean, default: false }, startedAt: { type: Date, default: null }, stoppedAt: { type: Date, default: null }, lastLat: { type: Number, default: null }, lastLng: { type: Number, default: null }, lastHeading: { type: Number, default: null }, lastSpeed: { type: Number, default: null }, lastAccuracy: { type: Number, default: null }, lastAt: { type: Date, default: null }, updatedBy: { type: String, default: "system" } }, { timestamps: true });
+const CatalogueItemSchema = new mongoose.Schema({ name: { type: String, required: true, unique: true, trim: true }, category: { type: String, default: "General", trim: true }, estimatedPrice: { type: Number, default: 0 }, searchTokens: { type: [String], default: [] } }, { timestamps: true });
+CatalogueItemSchema.pre('save', function(next) { if (this.isModified('name') || this.isModified('category')) { const raw = `${this.name} ${this.category}`.toLowerCase().replace(/[^a-z0-9\s]/g, ''); this.searchTokens = Array.from(new Set(raw.split(/\s+/).filter(t => t.length > 1))); } next(); });
+
+const Run = mongoose.model("Run", RunSchema); const Order = mongoose.model("Order", OrderSchema); const Tracking = mongoose.model("Tracking", TrackingSchema); const CatalogueItem = mongoose.model("CatalogueItem", CatalogueItemSchema);
+
+// =========================
+// HELPERS
+// =========================
+function escapeHtml(s) { return String(s || "").replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;").replaceAll('"', "&quot;").replaceAll("'", "&#039;"); }
+function csvEscape(val) { const s = String(val ?? ""); if (s.includes('"') || s.includes(",") || s.includes("\n") || s.includes("\r")) { return `"${s.replaceAll('"', '""')}"`; } return s; }
+function nowTz() { return dayjs().tz(TZ); }
+function fmtLocal(d) { return !d ? "" : dayjs(d).tz(TZ).format("ddd MMM D, h:mma"); }
+function yn(v) { return v === true || String(v || "").toLowerCase() === "yes"; }
+function isProfileComplete(profile) { const p = profile || {}; if (p.complete === true) return true; const fullName = String(p.fullName || "").trim(); const phone = String(p.phone || "").trim(); const contactPref = String(p.contactPref || "").trim(); const contactAuth = p.contactAuth === true; const addresses = Array.isArray(p.addresses) ? p.addresses : []; const hasAddress = addresses.some((a) => !!String(a.streetAddress || "").trim() && !!String(a.town || "").trim() && !!String(a.zone || "").trim() && !!String(a.postalCode || "").trim()); return !!fullName && !!phone && !!contactPref && contactAuth && hasAddress && p.consentTerms === true && p.consentPrivacy === true; }
+function requireLogin(req, res, next) { if (!req.user) return res.status(401).json({ ok: false, error: "Sign-in required." }); next(); }
+function requireProfileComplete(req, res, next) { if (!isProfileComplete(req.user?.profile || {})) return res.status(403).json({ ok: false, error: "Account setup required. Please complete your profile." }); next(); }
+function isAdminEmail(email) { const e = String(email || "").toLowerCase().trim(); return !e ? false : (!ADMIN_EMAILS.length ? true : ADMIN_EMAILS.includes(e)); }
+function requireAdmin(req, res, next) { const email = String(req.user?.email || "").toLowerCase().trim(); if (!email || !isAdminEmail(email)) return res.status(403).send("Admin access required."); next(); }
+
+async function pmSend(to, subject, htmlBody, textBody) { try { const rcpt = String(to || "").trim(); if (!pmClient || !POSTMARK_FROM_EMAIL || !rcpt) return; await pmClient.sendEmail({ From: POSTMARK_FROM_EMAIL, To: rcpt, Subject: subject, HtmlBody: htmlBody, TextBody: textBody || "", MessageStream: POSTMARK_MESSAGE_STREAM }); } catch (e) { console.error("Postmark send failed:", String(e)); } }
+async function sendSms(toPhone, message) {
+  if (!twilioClient || !TWILIO_PHONE_NUMBER || !toPhone) return;
+  try {
+    let formattedPhone = String(toPhone).replace(/\D/g, "");
+    if (formattedPhone.length === 10) formattedPhone = "+1" + formattedPhone;
+    else if (formattedPhone.length === 11 && formattedPhone.startsWith("1")) formattedPhone = "+" + formattedPhone;
+    await twilioClient.messages.create({ body: message, from: TWILIO_PHONE_NUMBER, to: formattedPhone });
+  } catch (error) { console.error("Twilio error:", String(error)); }
+}
+
+function money(n) { return Number(n || 0).toFixed(2); }
+function base64urlEncode(buf) { return Buffer.from(buf).toString("base64").replaceAll("+", "-").replaceAll("/", "_").replaceAll("=", ""); }
+function base64urlDecodeToString(b64url) { const pad = b64url.length % 4 ? "=".repeat(4 - (b64url.length % 4)) : ""; const b64 = b64url.replaceAll("-", "+").replaceAll("_", "/") + pad; return Buffer.from(b64, "base64").toString("utf8"); }
+function signCancelToken(orderId, expMs) { const payload = `${orderId}.${String(expMs)}`; const sig = crypto.createHmac("sha256", CANCEL_TOKEN_SECRET).update(payload).digest(); return `${base64urlEncode(payload)}.${base64urlEncode(sig)}`; }
+function verifyCancelToken(orderId, token) { try { const parts = String(token || "").trim().split("."); if (parts.length !== 2) return { ok: false }; const payloadStr = base64urlDecodeToString(parts[0]); const [oid, expStr] = payloadStr.split("."); const expMs = Number(expStr); if (oid !== orderId || !Number.isFinite(expMs)) return { ok: false }; const expectedSig = crypto.createHmac("sha256", CANCEL_TOKEN_SECRET).update(payloadStr).digest(); const a = Buffer.from(parts[1], "base64"); const b = Buffer.from(base64urlEncode(expectedSig), "base64"); if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) return { ok: false }; return { ok: true, expMs }; } catch { return { ok: false }; } }
+function signTrackingToken(orderId, runKey, expMs) { const payload = `${orderId}.${runKey}.${String(expMs)}`; const sig = crypto.createHmac("sha256", TRACKING_TOKEN_SECRET).update(payload).digest(); return `${base64urlEncode(payload)}.${base64urlEncode(sig)}`; }
+function verifyTrackingToken(token) { try { const parts = String(token || "").trim().split("."); if (parts.length !== 2) return { ok: false }; const payloadStr = base64urlDecodeToString(parts[0]); const segs = payloadStr.split("."); if (segs.length < 3) return { ok: false }; const orderId = segs[0]; const expStr = segs[segs.length - 1]; const runKey = segs.slice(1, -1).join("."); const expMs = Number(expStr); if (!orderId || !runKey || !Number.isFinite(expMs)) return { ok: false }; const expectedSig = crypto.createHmac("sha256", TRACKING_TOKEN_SECRET).update(payloadStr).digest(); const a = Buffer.from(parts[1], "base64"); const b = Buffer.from(base64urlEncode(expectedSig), "base64"); if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) return { ok: false }; if (Date.now() > expMs) return { ok: false, error: "expired" }; return { ok: true, orderId, runKey, expMs }; } catch { return { ok: false }; } }
+
+async function nextOrderId(runType, runKey) {
+  const type = String(runType || "").toLowerCase(); const prefix = type === "owen" ? "OWEN" : "LOC"; const datePart = String(runKey || "").slice(0, 10).replaceAll("-", ""); const runDate = /^\d{8}$/.test(datePart) ? datePart : dayjs().tz(TZ).format("YYYYMMDD");
+  for (let i = 0; i < 24; i++) { const candidate = `TGR-${prefix}-${runDate}-${String(crypto.randomInt(0, 1000000)).padStart(6, "0")}`; if (!(await Order.exists({ orderId: candidate }))) return candidate; }
+  return `TGR-${prefix}-${runDate}-${String(crypto.randomInt(0, 100000000)).padStart(8, "0")}`;
+}
+
+function safeJsonArray(str) { try { const v = JSON.parse(str || "[]"); return Array.isArray(v) ? v.map((x) => String(x || "").trim()).filter(Boolean) : []; } catch { return []; } }
+
+function computeFeeBreakdown(input) {
+  if (input.orderClass === "ride") { const f = input.runType === "owen" ? PRICING.addOns.rideOwen : PRICING.addOns.rideLocal; return { totals: { serviceFee: 0, zoneFee: 0, runFee: 0, addOnsFees: f, surcharges: 0, discount: 0, totalFees: f } }; }
+  const zone = String(input.zone || ""); const runType = String(input.runType || "local"); const extraStores = Array.isArray(input.extraStores) ? input.extraStores.map(String).map((s) => s.trim()).filter(Boolean) : safeJsonArray(input.extraStoresJson); const pages = Math.max(0, Number(input.printPages || 0)); const grocerySubtotal = Math.max(0, Number(input.grocerySubtotal || 0)); const memberTier = String(input.memberTier || ""); const applyPerk = String(input.applyPerk || "yes") === "yes"; const disc = membershipDiscounts(memberTier, applyPerk);
+  const serviceFee = PRICING.serviceFee; const zoneFee = PRICING.zone[zone] || 0; const runFee = runType === "owen" ? PRICING.owenRunFeePerOrder : 0;
+  let addOnsFees = 0; if (extraStores.length) addOnsFees += extraStores.length * PRICING.addOns.extraStore; if (String(input.addon_printing || "") === "yes" && pages > 0) addOnsFees += calcPrinting(pages);
+  let surcharges = 0; if (grocerySubtotal > 0 && grocerySubtotal < PRICING.groceryUnderMin.threshold) surcharges += PRICING.groceryUnderMin.surcharge;
+  const discount = Math.min(serviceFee, disc.serviceOff || 0) + Math.max(Math.min(zoneFee, disc.zoneOff || 0), Math.min(addOnsFees + runFee, disc.freeAddonUpTo || 0));
+  const totalFees = Math.max(0, serviceFee + zoneFee + runFee + addOnsFees + surcharges - discount);
+  return { totals: { serviceFee, zoneFee, runFee, addOnsFees, surcharges, discount, totalFees } };
+}
+
+function runKeyToDayjs(runKey) { try { const d = dayjs(String(runKey || "").slice(0, 10)).tz(TZ); return d.isValid() ? d : null; } catch { return null; } }
+function nextDow(targetDow, from) { let d = dayjs(from).tz(TZ); let diff = (targetDow - d.day() + 7) % 7; return d.add(diff === 0 ? 7 : diff, "day"); }
+function computeTimesForDelivery(deliveryDayjs, type) { const delivery = dayjs(deliveryDayjs).tz(TZ); if (type === "local") return { delivery, cutoff: delivery.subtract(2, "day").hour(18).minute(0).second(0).millisecond(0), opens: delivery.subtract(5, "day").hour(0).minute(0).second(0).millisecond(0) }; return { delivery, cutoff: delivery.subtract(2, "day").hour(18).minute(0).second(0).millisecond(0), opens: delivery.subtract(6, "day").hour(0).minute(0).second(0).millisecond(0) }; }
+function runMinimumConfig(type) { if (type === "local") return { minOrders: 0, minFees: 200, minLogic: "FEES_ONLY", minimumText: "Goal: $200 minimum booked fees" }; return { minOrders: 0, minFees: 300, minLogic: "FEES_ONLY", minimumText: "Goal: $300 minimum booked fees" }; }
+function meetsMinimums(run) { return run.bookedFeesTotal >= run.minFees; }
+
+async function getOrCreateNextRun(type) {
+  const now = nowTz(); let existing = await Run.findOne({ type, cutoffAt: { $gt: now.toDate() } }).sort({ opensAt: 1 }).lean();
+  if (existing) { if (now.isBefore(dayjs(existing.cutoffAt).tz(TZ)) && now.isBefore(dayjs(existing.opensAt).tz(TZ))) { const forced = now.subtract(1, "minute").toDate(); await Run.updateOne({ runKey: existing.runKey }, { $set: { opensAt: forced } }); existing.opensAt = forced; } return existing; }
+  const latest = await Run.findOne({ type }).sort({ opensAt: -1 }).lean();
+  let delivery = latest?.runKey ? (runKeyToDayjs(latest.runKey) || now).add(14, "day") : nextDow(type === "local" ? 6 : 0, now);
+  let { cutoff, opens } = computeTimesForDelivery(delivery, type); if (opens.isAfter(now)) opens = now.subtract(1, "minute");
+  const cfg = runMinimumConfig(type);
+  const created = await Run.create({ runKey: delivery.format("YYYY-MM-DD") + "-" + type, type, opensAt: opens.toDate(), cutoffAt: cutoff.toDate(), maxSlots: 12, maxPoints: 10, minOrders: cfg.minOrders, minFees: cfg.minFees, minLogic: cfg.minLogic });
+  return created.toObject();
+}
+
+async function ensureUpcomingRuns() {
+  const out = {};
+  for (const type of ["local", "owen"]) {
+    let run = await getOrCreateNextRun(type);
+    if (!run.lastRecalcAt || dayjs(run.lastRecalcAt).isBefore(nowTz().subtract(60, "second").toDate())) {
+      const agg = await Order.aggregate([{ $match: { runKey: run.runKey, "status.state": { $in: Array.from(ACTIVE_STATES) } } }, { $group: { _id: "$runKey", c: { $sum: 1 }, fees: { $sum: "$pricingSnapshot.totalFees" }, pts: { $sum: "$spacePoints" } } }]);
+      const c = agg?.[0]?.c || 0; const fees = agg?.[0]?.fees || 0; const pts = agg?.[0]?.pts || 0;
+      await Run.updateOne({ runKey: run.runKey }, { $set: { bookedOrdersCount: c, bookedFeesTotal: fees, bookedPoints: pts, lastRecalcAt: new Date() } });
+      run.bookedOrdersCount = c; run.bookedFeesTotal = fees; run.bookedPoints = pts; run.lastRecalcAt = new Date();
+    }
+    out[type] = run;
+  }
+  return out;
+}
+
+// =========================
+// CATALOGUE API
+// =========================
+app.get("/api/public/catalogue/search", async (req, res) => { try { const q = String(req.query.q || "").trim().toLowerCase(); if (!q || q.length < 2) return res.json({ ok: true, items: [] }); const re = new RegExp(q.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i"); res.json({ ok: true, items: await CatalogueItem.find({ $or: [{ name: re }, { category: re }] }).limit(15).lean() }); } catch (e) { res.status(500).json({ ok: false, error: String(e) }); } });
+app.get("/api/admin/catalogue", requireLogin, requireAdmin, async (req, res) => { res.json({ ok: true, items: await CatalogueItem.find().sort({ category: 1, name: 1 }).lean() }); });
+app.post("/api/admin/catalogue", requireLogin, requireAdmin, async (req, res) => { try { const { name, category, estimatedPrice } = req.body; if (!name) return res.status(400).json({ ok: false, error: "Name is required" }); res.json({ ok: true, item: await CatalogueItem.findOneAndUpdate({ name: String(name).trim() }, { $set: { category: String(category || "General").trim(), estimatedPrice: Number(estimatedPrice || 0) } }, { upsert: true, new: true }) }); } catch (e) { res.status(500).json({ ok: false, error: String(e) }); } });
+app.delete("/api/admin/catalogue/:id", requireLogin, requireAdmin, async (req, res) => { await CatalogueItem.findByIdAndDelete(req.params.id); res.json({ ok: true }); });
+
+// =========================
+// PUBLIC CONFIG & TRACKING
+// =========================
+app.get("/api/public/tracking/:runKey", async (req, res) => {
+  try {
+    const runKey = String(req.params.runKey || "").trim(); const vt = verifyTrackingToken(String(req.query.token || "").trim()); if (!vt.ok || vt.runKey !== runKey) return res.status(403).json({ ok: false, error: "Invalid token." });
+    const order = await Order.findOne({ orderId: vt.orderId, runKey }).lean(); if (!order || !ACTIVE_STATES.has(order?.status?.state || "submitted")) return res.status(403).json({ ok: false, error: "Tracking unavailable." });
+    const t = await Tracking.findOneAndUpdate({ runKey }, { $setOnInsert: { runKey, enabled: false, updatedBy: "system" } }, { upsert: true, new: true }).lean();
+    if (!t.enabled || !t.lastAt) return res.json({ ok: true, enabled: t.enabled, hasFix: false });
+    res.json({ ok: true, enabled: true, hasFix: true, last: { lat: t.lastLat, lng: t.lastLng, heading: t.lastHeading, speed: t.lastSpeed, accuracy: t.lastAccuracy, at: t.lastAt } });
+  } catch (e) { res.status(500).json({ ok: false, error: String(e) }); }
+});
+
+app.get("/api/public/config", (_req, res) => { 
+  res.json({ ok: true, mapboxPublicToken: MAPBOX_PUBLIC_TOKEN || "", canadaPostKey: CANADAPOST_KEY || "", 
+  squareAppId: SQUARE_APP_ID, squareLocationId: SQUARE_LOCATION_ID, squareEnv: process.env.SQUARE_ENVIRONMENT || "sandbox",
+  squareMembershipLinks: { standard: SQUARE_LINK_STANDARD, route: SQUARE_LINK_ROUTE, access: SQUARE_LINK_ACCESS, accesspro: SQUARE_LINK_ACCESSPRO } }); 
+});
+app.get("/api/public/memberships", (_req, res) => { res.json({ ok: true, plans: getPublicMembershipPlans() }); });
+
+// =========================
+// AUTH ROUTES
+// =========================
+app.get("/auth/google", (req, res, next) => {
+  if (!GOOGLE_CLIENT_ID || !GOOGLE_CLIENT_SECRET || !GOOGLE_CALLBACK_URL) return res.status(500).send("Google auth is not configured on this server.");
+  const state = String(req.query.returnTo || "").trim() === "popup" ? "popup" : "home";
+  return passport.authenticate("google", { scope: ["profile", "email"], state })(req, res, next);
+});
+app.get("/auth/google/callback", passport.authenticate("google", { failureRedirect: PUBLIC_SITE_URL + "/?login=failed" }), async (req, res) => {
+  if (String(req.query.state || "") === "popup") return res.send("<script>window.close();</script>");
+  try { if (!isProfileComplete((await User.findById(req.user._id).lean())?.profile || {})) return res.redirect(PUBLIC_SITE_URL + "/?tab=account&onboarding=1"); } catch {}
+  res.redirect(PUBLIC_SITE_URL + "/");
+});
+app.get("/logout", (req, res) => { req.session.destroy(() => res.redirect(String(req.query.returnTo || (PUBLIC_SITE_URL + "/")).trim())); });
+
+// =========================
+// API: ME + PROFILE
+// =========================
+app.get("/api/me", (req, res) => { const u = req.user; res.json({ ok: true, loggedIn: !!u, email: u?.email || null, name: u?.name || "", photo: u?.photo || "", membershipLevel: u?.membershipLevel || "none", membershipStatus: u?.membershipStatus || "inactive", effectiveMembershipTier: getEffectiveMemberTierForUser(u) || "", renewalDate: u?.renewalDate || null, profileComplete: isProfileComplete(u?.profile || {}), isAdmin: !!u?.email && isAdminEmail(u.email) }); });
+app.get("/api/profile", requireLogin, async (req, res) => { const u = await User.findById(req.user._id).lean(); res.json({ ok: true, profile: u?.profile || {}, profileComplete: isProfileComplete(u?.profile || {}), email: u?.email || "", name: u?.name || "", photo: u?.photo || "" }); });
+app.post("/api/profile", requireLogin, async (req, res) => {
+  try {
+    const b = req.body || {}; const u = await User.findById(req.user._id); if (!u) return res.status(404).json({ ok: false, error: "User not found" });
+    const addresses = Array.isArray(b.addresses) ? b.addresses : [];
+    const newProfile = {
+      version: 1, fullName: String(b.fullName || "").trim(), preferredName: String(b.preferredName || "").trim(), phone: String(b.phone || "").trim(), altPhone: String(b.altPhone || "").trim(), contactPref: String(b.contactPref || "").trim(), contactAuth: yn(b.contactAuth),
+      subsDefault: String(b.subsDefault || "").trim(), dropoffDefault: String(b.dropoffDefault || "").trim(), customerType: "", accessibility: "", dietary: "", notes: String(b.notes || "").trim(),
+      addresses: addresses.map((a) => ({ id: String(a.id || "").trim() || String(Math.random()).slice(2), label: String(a.label || "").trim(), town: String(a.town || "").trim(), zone: String(a.zone || "").trim(), streetAddress: String(a.streetAddress || "").trim(), unit: String(a.unit || "").trim(), postalCode: String(a.postalCode || "").trim(), instructions: String(a.instructions || "").trim(), gateCode: String(a.gateCode || "").trim() })),
+      defaultId: String(b.defaultId || "").trim(), consentTerms: yn(b.consentTerms), consentPrivacy: yn(b.consentPrivacy), consentMarketing: yn(b.consentMarketing),
+    };
+    if (!newProfile.defaultId && newProfile.addresses.length) newProfile.defaultId = newProfile.addresses[0].id;
+    newProfile.complete = isProfileComplete(newProfile); newProfile.completedAt = newProfile.complete ? new Date().toISOString() : null;
+    u.profile = newProfile; u.markModified("profile"); await u.save(); res.json({ ok: true, profileComplete: newProfile.complete === true, profile: newProfile });
+  } catch (e) { res.status(500).json({ ok: false, error: String(e) }); }
+});
+
+// =========================
+// RUNS + ESTIMATOR
+// =========================
+app.get("/api/runs/active", async (_req, res) => {
+  try {
+    const runs = await ensureUpcomingRuns(); const now = nowTz(); const out = {};
+    for (const type of ["local", "owen"]) {
+      const run = runs[type]; const opensAt = dayjs(run.opensAt).tz(TZ); const cutoffAt = dayjs(run.cutoffAt).tz(TZ); const windowOpen = now.isAfter(opensAt) && now.isBefore(cutoffAt); const pointsRemaining = Math.max(0, (run.maxPoints || 10) - (run.bookedPoints || 0));
+      out[type] = { runKey: run.runKey, type: run.type, maxPoints: run.maxPoints || 10, bookedPoints: run.bookedPoints || 0, bookedOrdersCount: run.bookedOrdersCount || 0, bookedFeesTotal: run.bookedFeesTotal || 0, pointsRemaining, isOpen: windowOpen && pointsRemaining > 0, opensAtLocal: fmtLocal(run.opensAt), cutoffAtLocal: fmtLocal(run.cutoffAt), meetsMinimums: meetsMinimums(run), minimumText: runMinimumConfig(type).minimumText, cutoffAtISO: run.cutoffAt, opensAtISO: run.opensAt };
+    }
+    res.json({ ok: true, runs: out });
+  } catch (e) { res.status(500).json({ ok: false, error: String(e) }); }
+});
+app.post("/api/estimator", (req, res) => { try { const effectiveMemberTier = getEffectiveMemberTierForUser(req.user, req.body?.memberTier || ""); res.json({ ok: true, effectiveMemberTier, breakdown: computeFeeBreakdown({ ...(req.body || {}), memberTier: effectiveMemberTier, applyPerk: "yes" }) }); } catch (e) { res.status(500).json({ ok: false, error: String(e) }); } });
+
+// =========================
+// ORDERS WITH SQUARE SDK
+// =========================
+app.post("/api/orders", requireLogin, requireProfileComplete, upload.single("groceryFile"), async (req, res) => {
+  try {
+    const b = req.body || {}; const user = await User.findById(req.user._id).lean(); const profile = user?.profile || {}; const orderClass = String(b.orderClass || "grocery");
+    if (!yn(b.consent_terms) || !yn(b.consent_accuracy) || (orderClass === "grocery" && !yn(b.consent_dropoff))) return res.status(400).json({ ok: false, error: "All required consents must be accepted." });
+
+    const runs = await ensureUpcomingRuns(); const runType = String(b.runType || ""); const run = runs[runType]; if (!run) return res.status(400).json({ ok: false, error: "Invalid runType." });
+    const now = nowTz(); const opensAt = dayjs(run.opensAt).tz(TZ); const cutoffAt = dayjs(run.cutoffAt).tz(TZ);
+    if (!(now.isAfter(opensAt) && now.isBefore(cutoffAt))) return res.status(403).json({ ok: false, error: "Ordering is closed for this run." });
+
+    const fullName = String(b.fullName || profile.fullName || user.name || "").trim(); const phone = String(b.phone || profile.phone || "").trim();
+    let spacePoints = 1; let required = [["fullName", fullName], ["phone", phone], ["runType", runType]];
+    
+    if (orderClass === "ride") {
+      spacePoints = 3; required.push(["ridePickup", b.ridePickup], ["rideDestination", b.rideDestination]);
+    } else {
+      if (yn(b.addon_bulky)) spacePoints += 1;
+      required.push(["town", b.town], ["streetAddress", b.streetAddress], ["postalCode", b.postalCode], ["zone", b.zone], ["primaryStore", b.primaryStore], ["groceryList", b.groceryList], ["dropoffPref", b.dropoffPref], ["subsPref", b.subsPref], ["contactPref", b.contactPref]);
+    }
+    for (const [k, v] of required) { if (!String(v || "").trim()) return res.status(400).json({ ok: false, error: "Missing required field: " + k }); }
+
+    if ((run.bookedPoints || 0) + spacePoints > (run.maxPoints || 10)) return res.status(409).json({ ok: false, error: `Vehicle capacity reached! This order requires ${spacePoints} space points, but the Jeep is too full.` });
+
+    const orderId = await nextOrderId(runType, run.runKey); const effectiveMemberTier = getEffectiveMemberTierForUser(user, "");
+    const pricingSnapshot = computeFeeBreakdown({ orderClass, zone: b.zone, runType, extraStores: safeJsonArray(b.extraStores), grocerySubtotal: Number(b.grocerySubtotal || 0), addon_printing: b.addon_printing || "no", printPages: Number(b.printPages || 0), memberTier: effectiveMemberTier, applyPerk: "yes" }).totals;
+
+    let squarePaymentId = "";
+    let paymentStatus = "unpaid";
+    if (b.paymentSourceId && squareClient) {
+      let holdAmount = pricingSnapshot.totalFees;
+      if (orderClass === "grocery") {
+         const grocSub = Number(b.grocerySubtotal || 0);
+         holdAmount += (grocSub * 1.15); // 15% buffer
+      }
+      const holdCents = Math.round(holdAmount * 100);
+      try {
+        const sqRes = await squareClient.paymentsApi.createPayment({
+          sourceId: b.paymentSourceId,
+          idempotencyKey: crypto.randomBytes(12).toString('hex'),
+          amountMoney: { amount: holdCents, currency: "CAD" },
+          autocomplete: false, 
+          locationId: SQUARE_LOCATION_ID
+        });
+        squarePaymentId = sqRes.result.payment.id;
+        paymentStatus = "authorized";
+      } catch (err) {
+        return res.status(400).json({ ok: false, error: "Credit card authorization failed. Please try another card." });
+      }
+    }
+
+    await Run.updateOne({ runKey: run.runKey }, { $inc: { bookedOrdersCount: 1, bookedFeesTotal: pricingSnapshot.totalFees, bookedPoints: spacePoints }, $set: { lastRecalcAt: new Date() } });
+
+    const created = await Order.create({
+      orderId, orderClass, runKey: run.runKey, runType, spacePoints, hold: false,
+      flags: { prescription: yn(b.addon_prescription), alcohol: yn(b.addon_liquor), bulky: yn(b.addon_bulky), idRequired: yn(b.addon_liquor) },
+      customer: { fullName, email: String(user.email || "").trim().toLowerCase(), phone, altPhone: String(b.altPhone || "").trim(), dob: String(b.dob || "").trim() },
+      address: { town: String(b.town || ""), streetAddress: String(b.streetAddress || ""), unit: String(b.unit || ""), postalCode: String(b.postalCode || ""), zone: String(b.zone || "") }, 
+      stores: { primary: String(b.primaryStore || ""), extra: safeJsonArray(b.extraStores) }, preferences: { dropoffPref: String(b.dropoffPref || ""), subsPref: String(b.subsPref || ""), contactPref: String(b.contactPref || ""), contactAuth: true },
+      addOns: { prescription: { requested: yn(b.addon_prescription), pharmacyName: String(b.prescriptionPharmacy || ""), notes: String(b.prescriptionNotes || "") }, liquor: { requested: yn(b.addon_liquor), storeName: String(b.liquorStore || ""), notes: String(b.liquorNotes || ""), idRequired: true }, printing: { requested: yn(b.addon_printing), pages: Math.max(0, Number(b.printPages || 0)), notes: String(b.printingNotes || "") }, fastFood: { requested: yn(b.addon_fastfood), restaurant: String(b.fastFoodRestaurant || ""), orderDetails: String(b.fastFoodOrder || "") }, parcel: { requested: yn(b.addon_parcel), carrier: String(b.parcelCarrier || ""), details: String(b.parcelDetails || "") }, bulky: { requested: yn(b.addon_bulky), details: String(b.bulkyDetails || "") }, ride: { requested: orderClass === "ride", pickupAddress: String(b.ridePickup || ""), destination: String(b.rideDestination || ""), preferredWindow: String(b.rideWindow || ""), notes: String(b.rideNotes || "") }, generalNotes: String(b.optionalNotes || "") },
+      deliveryMeta: { gateCode: String(b.gateCode || ""), buildingAccessNotes: String(b.buildingAccessNotes || ""), parkingNotes: String(b.parkingNotes || ""), budgetCap: Math.max(0, Number(b.budgetCap || 0)), receiptPreference: String(b.receiptPreference || ""), photoProofOk: yn(b.photoProofOk) },
+      list: { groceryListText: String(b.groceryList || ""), attachment: req.file ? { originalName: req.file.originalname, mimeType: req.file.mimetype, size: req.file.size, path: req.file.path } : null }, 
+      consents: { terms: true, accuracy: true, dropoff: yn(b.consent_dropoff) }, pricingSnapshot,
+      payments: { fees: { status: "unpaid" }, groceries: { status: paymentStatus, squarePaymentId } }, 
+      status: { state: "submitted", note: "", updatedAt: new Date(), updatedBy: "customer" }, statusHistory: [{ state: "submitted", note: "", at: new Date(), by: "customer" }],
+      adminLog: [{ at: new Date(), by: "system", action: "order_created", meta: { runKey: run.runKey, effectiveMemberTier, orderClass } }],
+    });
+
+    res.json({ ok: true, orderId, runKey: run.runKey, cancelToken: signCancelToken(orderId, cutoffAt.toDate().getTime()), cancelUntilLocal: fmtLocal(cutoffAt.toDate()), effectiveMemberTier });
+  } catch (e) { res.status(500).json({ ok: false, error: String(e) }); }
+});
+
+app.post("/api/orders/:orderId/cancel", async (req, res) => {
+  try {
+    const orderId = String(req.params.orderId || "").trim().toUpperCase(); const order = await Order.findOne({ orderId }); if (!order) return res.status(404).json({ ok: false, error: "Order not found" });
+    const run = await Run.findOne({ runKey: order.runKey }).lean(); if (!run?.cutoffAt) return res.status(500).json({ ok: false, error: "Run cutoff not available" });
+    if (!ACTIVE_STATES.has(order.status?.state || "submitted")) return res.status(400).json({ ok: false, error: "Order cannot be cancelled in its current status." });
+    if (!verifyCancelToken(orderId, String(req.body?.token || "").trim()).ok) return res.status(403).json({ ok: false, error: "Invalid cancel token." });
+    if (!nowTz().isBefore(dayjs(run.cutoffAt).tz(TZ))) return res.status(403).json({ ok: false, error: "Cancellation window closed." });
+
+    if (order.payments.groceries.squarePaymentId && order.payments.groceries.status === "authorized" && squareClient) {
+      try { await squareClient.paymentsApi.cancelPayment(order.payments.groceries.squarePaymentId); } catch(err) { console.error("Square void failed on cancel:", err); }
+      order.payments.groceries.status = "voided";
+    }
+
+    await Run.updateOne({ runKey: order.runKey }, { $inc: { bookedOrdersCount: -1, bookedFeesTotal: -Number(order.pricingSnapshot?.totalFees || 0), bookedPoints: -Number(order.spacePoints || 1) }, $set: { lastRecalcAt: new Date() } });
+    order.status.state = "cancelled"; order.status.note = "Cancelled by customer"; order.status.updatedAt = new Date(); order.status.updatedBy = "customer";
+    order.statusHistory.push({ state: "cancelled", note: "Cancelled by customer", at: new Date(), by: "customer" }); 
+    await order.save(); return res.json({ ok: true });
+  } catch (e) { return res.status(500).json({ ok: false, error: String(e) }); }
+});
+
+// SQUARE FINAL CAPTURE (ADMIN ONLY)
+app.post("/api/admin/orders/:orderId/capture", requireLogin, requireAdmin, async (req, res) => {
+  try {
+    const orderId = String(req.params.orderId || "").trim().toUpperCase();
+    const finalGroceryTotal = Number(req.body.finalGroceryTotal || 0);
+    const order = await Order.findOne({ orderId });
+    if (!order) return res.status(404).json({ ok: false, error: "Order not found" });
+
+    const finalAmount = finalGroceryTotal + Number(order.pricingSnapshot.totalFees || 0);
+    const finalCents = Math.round(finalAmount * 100);
+
+    if (order.payments.groceries.squarePaymentId && order.payments.groceries.status === "authorized") {
+       if (!squareClient) throw new Error("Square client not configured on server.");
+       await squareClient.paymentsApi.completePayment(order.payments.groceries.squarePaymentId, {
+         amountMoney: { amount: finalCents, currency: "CAD" }
+       });
+    }
+
+    order.payments.groceries.status = "paid"; order.payments.fees.status = "paid";
+    order.payments.groceries.note = "Exact grocery total: $" + finalGroceryTotal.toFixed(2);
+    order.status.state = "out_for_delivery"; order.status.updatedAt = new Date(); order.status.updatedBy = adminBy(req);
+    order.statusHistory.push({ state: "out_for_delivery", note: "Payment finalized, driver dispatched", at: new Date(), by: adminBy(req) });
+    await order.save();
+
+    const phone = order.customer?.phone; const firstName = order.customer?.fullName?.split(' ')[0] || 'there';
+    if (phone) {
+       const run = await Run.findOne({ runKey: order.runKey }).lean(); let trackingLink = "";
+       if (run) trackingLink = `${PUBLIC_SITE_URL}/member?trackRunKey=${encodeURIComponent(run.runKey)}&token=${encodeURIComponent(signTrackingToken(order.orderId, run.runKey, dayjs(run.cutoffAt).add(1, "day").valueOf()))}&orderId=${encodeURIComponent(order.orderId)}`;
+       const smsMessage = `Hi ${firstName}, your groceries are packed! The exact receipt total was $${finalGroceryTotal.toFixed(2)}. We have finalized your payment and released the remaining hold. I'm on my way to drop off your order! 🚙💨 Track live: ${trackingLink}`;
+       await sendSms(phone, smsMessage);
+    }
+    res.json({ ok: true });
+  } catch(e) { res.status(500).json({ ok: false, error: String(e) }); }
+});
+
+app.post("/api/admin/orders/:orderId/status", requireLogin, requireAdmin, async (req, res) => {
+  try {
+    const orderId = String(req.params.orderId || "").trim().toUpperCase(); const state = String(req.body?.state || "").trim(); const note = String(req.body?.note || "").trim(); const by = adminBy(req);
+    if (!AllowedStates.includes(state)) return res.status(400).json({ ok: false, error: "Invalid state" });
+    const order = await Order.findOne({ orderId }); if (!order) return res.status(404).json({ ok: false, error: "Order not found" });
+    const oldState = order.status.state; order.status.state = state; order.status.note = note; order.status.updatedAt = new Date(); order.status.updatedBy = by; order.statusHistory.push({ state, note, at: new Date(), by });
+    await order.save(); 
+
+    if (oldState !== state) {
+      const phone = order.customer?.phone; const firstName = order.customer?.fullName?.split(' ')[0] || 'there';
+      if (phone) {
+        let smsMessage = "";
+        if (state === "shopping") smsMessage = `Hi ${firstName}! I've grabbed a cart and I'm officially picking your groceries. Let's hope the avocados are cooperating today. 🥑 - Tobermory Grocery Run`;
+        else if (state === "out_for_delivery") {
+          const run = await Run.findOne({ runKey: order.runKey }).lean(); let trackingLink = "";
+          if (run) trackingLink = `${PUBLIC_SITE_URL}/member?trackRunKey=${encodeURIComponent(run.runKey)}&token=${encodeURIComponent(signTrackingToken(order.orderId, run.runKey, dayjs(run.cutoffAt).add(1, "day").valueOf()))}&orderId=${encodeURIComponent(order.orderId)}`;
+          smsMessage = `Hi ${firstName}, the Jeep is loaded and I'm on the road! Track your delivery live right here: ${trackingLink} 🚙💨 - TGR`;
+        } 
+        else if (state === "delivered") smsMessage = `Mission accomplished! Your order has been dropped off. Enjoy the goodies, and thanks for trusting Tobermory Grocery Run! 🛒✨`;
+        if (smsMessage) await sendSms(phone, smsMessage);
+      }
+    }
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ ok: false, error: String(e) }); }
+});
+
+app.post("/api/admin/orders/:orderId/payments", requireLogin, requireAdmin, async (req, res) => {
+  try {
+    const order = await Order.findOne({ orderId: String(req.params.orderId || "").trim().toUpperCase() }); if (!order) return res.status(404).json({ ok: false, error: "Order not found" });
+    const fs = String(req.body?.feesStatus || "").trim(); const gs = String(req.body?.groceriesStatus || "").trim();
+    if (fs) { order.payments.fees.status = fs; order.payments.fees.paidAt = fs === "paid" ? new Date() : null; }
+    if (gs) { order.payments.groceries.status = gs; order.payments.groceries.paidAt = (gs === "paid" || gs === "deposit_paid") ? new Date() : null; }
+    if (req.body?.note) { order.payments.fees.note = String(req.body.note).trim(); order.payments.groceries.note = String(req.body.note).trim(); }
+    await order.save(); res.json({ ok: true });
+  } catch (e) { res.status(500).json({ ok: false, error: String(e) }); }
+});
+
+app.delete("/api/admin/orders/:orderId", requireLogin, requireAdmin, async (req, res) => {
+  try {
+    const orderId = String(req.params.orderId || "").trim().toUpperCase(); const order = await Order.findOne({ orderId }).lean(); if (!order) return res.status(404).json({ ok: false, error: "Order not found" });
+    if (ACTIVE_STATES.has(order.status?.state || "submitted")) await Run.updateOne({ runKey: order.runKey }, { $inc: { bookedOrdersCount: -1, bookedFeesTotal: -Number(order.pricingSnapshot?.totalFees || 0), bookedPoints: -Number(order.spacePoints || 1) }, $set: { lastRecalcAt: new Date() } });
+    await Order.deleteOne({ orderId }); res.json({ ok: true });
+  } catch (e) { res.status(500).json({ ok: false, error: String(e) }); }
+});
+
+app.post("/api/admin/tracking/:runKey/start", requireLogin, requireAdmin, async (req, res) => { try { const runKey = String(req.params.runKey || "").trim(); await ensureTrackingDoc(runKey); await Tracking.updateOne({ runKey }, { $set: { enabled: true, startedAt: new Date(), stoppedAt: null, updatedBy: adminBy(req) } }); res.json({ ok: true, runKey }); } catch (e) { res.status(500).json({ ok: false, error: String(e) }); } });
+app.post("/api/admin/tracking/:runKey/stop", requireLogin, requireAdmin, async (req, res) => { try { const runKey = String(req.params.runKey || "").trim(); await ensureTrackingDoc(runKey); await Tracking.updateOne({ runKey }, { $set: { enabled: false, stoppedAt: new Date(), updatedBy: adminBy(req) } }); res.json({ ok: true, runKey }); } catch (e) { res.status(500).json({ ok: false, error: String(e) }); } });
+app.post("/api/admin/tracking/:runKey/update", requireLogin, requireAdmin, async (req, res) => { try { const runKey = String(req.params.runKey || "").trim(); const lat = Number(req.body?.lat); const lng = Number(req.body?.lng); if (!Number.isFinite(lat) || !Number.isFinite(lng)) return res.status(400).json({ ok: false, error: "lat/lng required" }); await ensureTrackingDoc(runKey); await Tracking.updateOne({ runKey }, { $set: { lastLat: lat, lastLng: lng, lastHeading: Number.isFinite(Number(req.body?.heading)) ? Number(req.body?.heading) : null, lastSpeed: Number.isFinite(Number(req.body?.speed)) ? Number(req.body?.speed) : null, lastAccuracy: Number.isFinite(Number(req.body?.accuracy)) ? Number(req.body?.accuracy) : null, lastAt: new Date(), updatedBy: adminBy(req) } }); res.json({ ok: true }); } catch (e) { res.status(500).json({ ok: false, error: String(e) }); } });
+app.get("/api/admin/orders/:orderId/tracking-link", requireLogin, requireAdmin, async (req, res) => { try { const orderId = String(req.params.orderId || "").trim().toUpperCase(); const o = await Order.findOne({ orderId }).lean(); if (!o) return res.status(404).json({ ok: false, error: "Order not found" }); const run = await Run.findOne({ runKey: o.runKey }).lean(); if (!run) return res.status(404).json({ ok: false, error: "Run not found" }); res.json({ ok: true, url: `${PUBLIC_SITE_URL}/member?trackRunKey=${encodeURIComponent(run.runKey)}&token=${encodeURIComponent(signTrackingToken(o.orderId, run.runKey, dayjs(run.cutoffAt).add(1, "day").valueOf()))}&orderId=${encodeURIComponent(o.orderId)}` }); } catch (e) { res.status(500).json({ ok: false, error: String(e) }); } });
+
+// =========================
+// MEMBER PORTAL
+// =========================
+app.get("/member", requireLogin, async (req, res) => {
+  try {
+    const email = String(req.user?.email || "").toLowerCase().trim(); const name = String(req.user?.name || "").trim();
+    const orders = await Order.find({ "customer.email": email }).sort({ createdAt: -1 }).limit(80).lean();
+    const runKeys = Array.from(new Set(orders.map(o => o.runKey).filter(Boolean)));
+    const runs = await Run.find({ runKey: { $in: runKeys } }).lean(); const runByKey = new Map(runs.map(r => [r.runKey, r]));
+    const now = nowTz(); const trackables = [];
+    for (const o of orders) {
+      const status = o.status?.state || "submitted"; if (!ACTIVE_STATES.has(status)) continue;
+      const run = runByKey.get(o.runKey); if (!run?.runKey || !run?.cutoffAt) continue;
+      const expMs = dayjs(run.cutoffAt).add(1, "day").valueOf(); const tkn = signTrackingToken(o.orderId, run.runKey, expMs);
+      trackables.push({ orderId: o.orderId, runKey: run.runKey, token: tkn, status });
+    }
+
+    const rows = orders.map(o => {
+      const fees = typeof o.pricingSnapshot?.totalFees === "number" ? o.pricingSnapshot.totalFees.toFixed(2) : "0.00";
+      const status = o.status?.state || "submitted"; const run = runByKey.get(o.runKey);
+      const cutoffAt = run?.cutoffAt ? dayjs(run.cutoffAt).tz(TZ) : null; const cancelOpen = cutoffAt ? now.isBefore(cutoffAt) : false;
+      let cancelHtml = `<span class="muted">—</span>`;
+      if (ACTIVE_STATES.has(status) && cancelOpen) { const token = signCancelToken(o.orderId, cutoffAt.toDate().getTime()); cancelHtml = `<button class="btn" data-cancel="${escapeHtml(o.orderId)}" data-token="${escapeHtml(token)}">Cancel</button>`; }
+      else if (status === "cancelled") { cancelHtml = `<span class="pill">Cancelled</span>`; }
+      else if (!cancelOpen && ACTIVE_STATES.has(status)) { cancelHtml = `<span class="muted">Past cutoff</span>`; }
+
+      let trackHtml = `<span class="muted">—</span>`;
+      if (ACTIVE_STATES.has(status) && run?.runKey && run?.cutoffAt) {
+        const expMs = dayjs(run.cutoffAt).add(1, "day").valueOf(); const tkn = signTrackingToken(o.orderId, run.runKey, expMs);
+        const link = `https://api.tobermorygroceryrun.ca/member?trackRunKey=${encodeURIComponent(run.runKey)}&token=${encodeURIComponent(tkn)}&orderId=${encodeURIComponent(o.orderId)}`;
+        trackHtml = `<button class="btn" data-track-run="${escapeHtml(run.runKey)}" data-track-token="${escapeHtml(tkn)}" data-track-order="${escapeHtml(o.orderId)}">Track on map</button> <button class="btn" data-copy="${escapeHtml(link)}">Copy link</button>`;
+      }
+      const addr = `${o.address?.streetAddress || ""}${o.address?.unit ? " " + o.address.unit : ""}, ${o.address?.town || ""}, ON ${o.address?.postalCode || ""}`.trim();
+      return `<tr><td><div style="font-weight:1000;">${escapeHtml(o.orderId)}</div><div class="muted" style="font-size:12px;">${escapeHtml(fmtLocal(o.createdAt))}</div></td><td><div style="font-weight:900;">${escapeHtml(addr)}</div><div class="muted" style="font-size:12px;">Zone ${escapeHtml(o.address?.zone || "")}</div></td><td><span class="pill">${escapeHtml(o.runType || "")}</span><div class="muted" style="font-size:12px;margin-top:4px;">${escapeHtml(o.runKey || "")}</div></td><td><span class="pill">${escapeHtml(status)}</span><div class="muted" style="font-size:12px;margin-top:4px;">${escapeHtml(o.status?.note || "")}</div></td><td>$${escapeHtml(fees)}</td><td>${trackHtml}</td><td>${cancelHtml}</td></tr>`;
+    }).join("");
+
+    res.setHeader("Content-Type", "text/html; charset=utf-8");
+    res.send(`<!doctype html><html lang="en-CA"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>TGR Member Portal</title><style>:root{--bg:#0b0b0b; --panel:rgba(255,255,255,.06); --line:rgba(255,255,255,.14); --text:#fff; --muted:rgba(255,255,255,.75); --red:#e3342f; --red2:#ff4a44; --radius:14px;} body{margin:0;background:var(--bg);color:var(--text);font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;} .wrap{max-width:1250px;margin:0 auto;padding:16px;} .card{border:1px solid var(--line);background:var(--panel);border-radius:var(--radius);padding:14px;} .row{display:flex;gap:10px;flex-wrap:wrap;align-items:center;} .btn{border:1px solid rgba(255,255,255,.18);background:rgba(255,255,255,.06);color:#fff;font-weight:900;border-radius:999px;padding:10px 14px;cursor:pointer;text-decoration:none;white-space:nowrap;} .btn.primary{background:linear-gradient(180deg,var(--red2),var(--red));border-color:rgba(0,0,0,.25);} .btn.ghost{background:transparent;} .muted{color:var(--muted);} .pill{display:inline-block;padding:4px 10px;border-radius:999px;border:1px solid rgba(255,255,255,.18);background:rgba(255,255,255,.06);font-weight:900;font-size:12px;} table{width:100%;border-collapse:collapse;} th,td{padding:10px 8px;border-bottom:1px solid rgba(255,255,255,.12);vertical-align:top;} th{font-size:12px;color:rgba(255,255,255,.72);text-transform:uppercase;letter-spacing:.08em;text-align:left;} .toast{margin-top:10px;padding:10px 12px;border-radius:12px;border:1px solid rgba(255,255,255,.18);background:rgba(0,0,0,.24);display:none;font-weight:900;} .toast.show{display:block;} .hr{height:1px;background:rgba(255,255,255,.12);margin:12px 0;} .grid{display:grid;grid-template-columns: 1fr 1fr; gap:12px;} @media (max-width: 980px){ .grid{grid-template-columns: 1fr;} } #mapWrap{display:none;} #map{height: 420px; border-radius: 14px; border:1px solid rgba(255,255,255,.14); overflow:hidden;} .small{font-size:13px;} .warn{border:1px solid rgba(227,52,47,.45);background:rgba(227,52,47,.12);border-radius:12px;padding:10px 12px;}</style></head><body><div class="wrap"><div class="card"><div class="row" style="justify-content:space-between;"><div><div style="font-weight:1000;font-size:22px;">Member Portal</div><div class="muted">Signed in as <strong>${escapeHtml(email)}</strong>${name ? ` • ${escapeHtml(name)}` : ""}</div></div><div class="row"><a class="btn ghost" href="${escapeHtml(PUBLIC_SITE_URL)}/">Back to site</a><a class="btn" href="${escapeHtml(SQUARE_PAY_GROCERIES_LINK)}" target="_blank" rel="noopener">Pay Grocery Total</a><a class="btn" href="${escapeHtml(SQUARE_PAY_FEES_LINK)}" target="_blank" rel="noopener">Pay Service & Delivery Fees</a><a class="btn ghost" href="/logout?returnTo=${encodeURIComponent(PUBLIC_SITE_URL + "/")}">Log out</a></div></div><div class="toast" id="toast"></div><div class="hr"></div><div class="grid" id="mapWrap"><div class="card" style="box-shadow:none;"><div style="font-weight:1000;font-size:18px;">Live Tracking Map</div><div class="muted small" id="mapSub">Select an order to track. Tracking only works when enabled for the run.</div><div class="hr"></div><div id="map"></div><div class="hr"></div><div class="row"><span class="pill" id="mapStatus">—</span><span class="pill" id="mapLast">Last: —</span><button class="btn" id="stopMap">Stop</button></div><div class="muted small" id="mapErr" style="margin-top:10px;"></div></div><div class="card" style="box-shadow:none;"><div style="font-weight:1000;font-size:18px;">Tracking controls</div><div class="muted small">Only your active orders can track. If tracking is disabled, you’ll see “Tracking off”.</div><div class="hr"></div><div class="warn"><div style="font-weight:1000;">Tip</div><div class="muted small">If your map is blank, the driver hasn’t started tracking or hasn’t sent a GPS fix yet.</div></div></div></div><div class="hr"></div><div style="overflow:auto;"><table><thead><tr><th>Order</th><th>Address</th><th>Run</th><th>Status</th><th>Fees</th><th>Tracking</th><th>Cancel</th></tr></thead><tbody>${rows || `<tr><td colspan="7" class="muted">No orders yet.</td></tr>`}</tbody></table></div></div></div><script>const TRACKABLES = ${JSON.stringify(trackables)}; let MAPBOX_TOKEN = ""; let map = null; let marker = null; let pollTimer = null; let activeTrack = null; const toast = (msg)=>{const el = document.getElementById("toast"); el.textContent = msg; el.classList.add("show"); setTimeout(()=>el.classList.remove("show"), 3500);}; async function cancelOrder(orderId, token){const ok = confirm("Cancel " + orderId + " before cutoff?"); if(!ok) return; const r = await fetch("/api/orders/" + encodeURIComponent(orderId) + "/cancel", {method:"POST", headers:{ "Content-Type":"application/json" }, credentials:"include", body: JSON.stringify({ token })}); const d = await r.json().catch(()=>({})); if(!r.ok || d.ok===false) return toast(d.error || "Cancel failed"); toast("Cancelled " + orderId); setTimeout(()=>location.reload(), 700);} async function copy(text){try{ await navigator.clipboard.writeText(text); return true; } catch { return false; }} document.querySelectorAll("[data-cancel]").forEach(btn=>{btn.addEventListener("click", ()=>{cancelOrder(btn.getAttribute("data-cancel"), btn.getAttribute("data-token"));});}); document.querySelectorAll("[data-copy]").forEach(btn=>{btn.addEventListener("click", async ()=>{const url = btn.getAttribute("data-copy"); if (await copy(url)) toast("Link copied ✅"); else toast("Copy failed");});}); document.querySelectorAll("[data-track-run]").forEach(btn=>{btn.addEventListener("click", ()=>{const runKey = btn.getAttribute("data-track-run"); const token = btn.getAttribute("data-track-token"); const orderId = btn.getAttribute("data-track-order"); startMapTracking({ runKey, token, orderId });});}); document.getElementById("stopMap").addEventListener("click", ()=> stopMapTracking()); function qs(){const u = new URL(location.href); return {runKey: u.searchParams.get("trackRunKey") || "", token: u.searchParams.get("token") || "", orderId: u.searchParams.get("orderId") || ""};} async function loadConfig(){const r = await fetch("/api/public/config"); const d = await r.json().catch(()=>({})); if(r.ok && d.ok) MAPBOX_TOKEN = d.mapboxPublicToken || "";} function setMapWrap(show){document.getElementById("mapWrap").style.display = show ? "grid" : "none";} function setStatus(text){ document.getElementById("mapStatus").textContent = text; } function setLast(text){ document.getElementById("mapLast").textContent = text; } function setErr(text){ document.getElementById("mapErr").textContent = text || ""; } function loadMapboxLib(){return new Promise((resolve, reject)=>{if (window.mapboxgl) return resolve(); const css = document.createElement("link"); css.rel = "stylesheet"; css.href = "https://api.mapbox.com/mapbox-gl-js/v2.15.0/mapbox-gl.css"; document.head.appendChild(css); const s = document.createElement("script"); s.src = "https://api.mapbox.com/mapbox-gl-js/v2.15.0/mapbox-gl.js"; s.onload = ()=> resolve(); s.onerror = ()=> reject(new Error("Mapbox failed to load")); document.head.appendChild(s);});} async function ensureMap(){if (map) return; if (!MAPBOX_TOKEN) throw new Error("Mapbox token missing on server"); await loadMapboxLib(); mapboxgl.accessToken = MAPBOX_TOKEN; map = new mapboxgl.Map({container: "map", style: "mapbox://styles/mapbox/dark-v11", center: [-81.7, 45.25], zoom: 9}); marker = new mapboxgl.Marker({ color: "#ff4a44" }).setLngLat([-81.7, 45.25]).addTo(map);} function stopMapTracking(){activeTrack = null; if (pollTimer) clearInterval(pollTimer); pollTimer = null; setStatus("—"); setLast("Last: —"); setErr(""); toast("Tracking stopped");} async function pollOnce(){if (!activeTrack) return; const { runKey, token } = activeTrack; try{const r = await fetch("/api/public/tracking/" + encodeURIComponent(runKey) + "?token=" + encodeURIComponent(token)); const d = await r.json().catch(()=>({})); if(!r.ok || d.ok===false){setStatus("Error"); setErr(d.error || "Tracking error"); return;} if (!d.enabled){setStatus("Tracking off"); setErr("Tracking is not enabled for this run yet."); return;} if (!d.hasFix){setStatus("Waiting for GPS"); setErr("No GPS fix yet. Try again in a moment."); return;} const lat = d.last.lat; const lng = d.last.lng; const at = d.last.at ? new Date(d.last.at).toLocaleString() : "—"; setStatus("Live ✅"); setLast("Last: " + at); setErr(""); marker.setLngLat([lng, lat]); map.easeTo({ center: [lng, lat], zoom: 12, duration: 900 });} catch (e){setStatus("Error"); setErr(String(e.message || e));}} async function startMapTracking(t){activeTrack = t; setMapWrap(true); setStatus("Loading…"); setLast("Last: —"); setErr(""); document.getElementById("mapSub").textContent = "Tracking " + (t.orderId || "") + " • " + (t.runKey || ""); try{await ensureMap(); await pollOnce(); if (pollTimer) clearInterval(pollTimer); pollTimer = setInterval(pollOnce, 2500); toast("Map tracking started ✅");} catch (e){setStatus("Error"); setErr(String(e.message || e));}} (async function boot(){await loadConfig(); const p = qs(); if (p.runKey && p.token) {startMapTracking({ runKey: p.runKey, token: p.token, orderId: p.orderId || "" }); return;} setMapWrap(false);})();</script></body></html>`);
+  } catch (e) { res.status(500).send("Member portal error: " + String(e)); }
+});
+
+app.get("/api/admin/runs/:runKey/master-list", requireLogin, requireAdmin, async (req, res) => {
+  try {
+    const runKey = String(req.params.runKey || "").trim();
+    const orders = await Order.find({ runKey, "status.state": { $in: ["submitted", "confirmed", "shopping", "packed"] } }).lean();
+    const tally = {}; const extraStops = [];
+    for (const o of orders) {
+      if (o.orderClass === "ride") continue; 
+      if (o.list && o.list.groceryListText) {
+        for (const line of o.list.groceryListText.split(/\r?\n/)) {
+          let text = line.replace(/^•\s*/, '').trim(); if (!text) continue;
+          if (!tally[text.toLowerCase()]) tally[text.toLowerCase()] = { name: text, count: 0 };
+          tally[text.toLowerCase()].count += 1;
+        }
+      }
+      if (o.stores && Array.isArray(o.stores.extra)) o.stores.extra.forEach(stop => { if(stop.trim()) extraStops.push(`${stop.trim()} (Order: ${o.orderId})`); });
+    }
+    res.json({ ok: true, runKey, items: Object.values(tally).sort((a, b) => a.name.localeCompare(b.name)), extraStops });
+  } catch(e) { res.status(500).json({ ok: false, error: String(e) }); }
+});
+
+// =========================
+// ADMIN PAGE (Includes Magic Capture UI)
+// =========================
+app.get("/admin", requireLogin, requireAdmin, async (_req, res) => {
+  res.setHeader("Content-Type", "text/html; charset=utf-8");
+  res.send(`<!doctype html>
 <html lang="en-CA">
 <head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
-  <title>Tobermory Grocery Run (TGR)</title>
-
-  <style>
-    :root{
-      --black:#0b0b0b;
-      --grey-0:#0f0f10;
-      --grey-1:#151517;
-      --grey-2:#1f2023;
-      --grey-3:#2b2c31;
-      --grey-4:#3a3b42;
-      --light:#d9d9d9;
-      --white:#ffffff;
-      --red:#e3342f;
-      --red-2:#ff4a44;
-
-      --text:#ffffff;
-      --muted:rgba(255,255,255,.78);
-      --line:rgba(255,255,255,.18);
-      --shadow:0 14px 46px rgba(0,0,0,.45);
-
-      --radius:18px;
-      --focus:0 0 0 4px rgba(227,52,47,.35);
-
-      --fs-0:18px;
-      --fs-1:20px;
-      --fs-2:24px;
-      --fs-3:30px;
-
-      --pad:14px;
-      --pad-lg:18px;
-      --btn-h:54px;
-    }
-
-    *{ box-sizing:border-box; }
-    html,body{ height:100%; }
-
-    body{
-      margin:0;
-      font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;
-      background:
-        radial-gradient(900px 500px at 20% 0%, rgba(227,52,47,.20), transparent 55%),
-        radial-gradient(900px 500px at 80% 0%, rgba(255,255,255,.10), transparent 55%),
-        linear-gradient(180deg, var(--grey-0), var(--black));
-      color:var(--text);
-      font-size:var(--fs-0);
-      line-height:1.5;
-    }
-
-    a{ color:var(--white); text-decoration:none; }
-    a:hover{ text-decoration:underline; }
-
-    .wrap{ max-width:1120px; margin:0 auto; padding:0 var(--pad); }
-
-    #netBanner{
-      display:none;
-      padding:10px 12px;
-      border-bottom:1px solid rgba(255,255,255,.12);
-      background:rgba(227,52,47,.18);
-      color:#fff;
-      font-weight:1000;
-    }
-
-    header{
-      position:sticky;
-      top:0;
-      z-index:50;
-      background:rgba(11,11,11,.70);
-      backdrop-filter:blur(12px);
-      border-bottom:1px solid var(--line);
-    }
-
-    .hdr{
-      display:flex;
-      gap:14px;
-      align-items:center;
-      padding:14px 0;
-    }
-
-    .logo{
-      width:92px;
-      height:92px;
-      border-radius:18px;
-      border:1px solid var(--line);
-      background:rgba(255,255,255,.06);
-      padding:6px;
-      flex:0 0 auto;
-      object-fit:contain;
-    }
-
-    .hdr-title{ min-width:0; flex:1 1 auto; }
-    .brand{ display:flex; align-items:baseline; gap:10px; flex-wrap:wrap; }
-
-    .brand h1{
-      margin:0;
-      font-size:var(--fs-3);
-      letter-spacing:.2px;
-      line-height:1.1;
-    }
-
-    .tag{
-      display:inline-flex;
-      align-items:center;
-      gap:8px;
-      padding:6px 12px;
-      border:1px solid var(--line);
-      border-radius:999px;
-      color:var(--muted);
-      background:rgba(255,255,255,.06);
-      font-weight:700;
-      font-size:14px;
-      white-space:nowrap;
-    }
-
-    .tag .dot{
-      width:10px; height:10px;
-      border-radius:999px;
-      background:var(--red);
-      box-shadow:0 0 0 4px rgba(227,52,47,.18);
-    }
-
-    .hdr-actions{
-      display:flex;
-      gap:10px;
-      align-items:center;
-      flex:0 0 auto;
-      flex-wrap:wrap;
-      justify-content:flex-end;
-    }
-
-    .btn{
-      height:var(--btn-h);
-      padding:0 16px;
-      border-radius:999px;
-      border:1px solid rgba(255,255,255,.20);
-      background:rgba(255,255,255,.06);
-      color:var(--text);
-      font-weight:900;
-      font-size:18px;
-      display:inline-flex;
-      align-items:center;
-      justify-content:center;
-      gap:10px;
-      cursor:pointer;
-      user-select:none;
-      transition:transform .08s ease, background .15s ease, border-color .15s ease;
-      text-decoration:none;
-      white-space:nowrap;
-    }
-
-    .btn:active{ transform:translateY(1px); }
-    .btn:focus{ outline:none; box-shadow:var(--focus); }
-
-    .btn.primary{
-      background:linear-gradient(180deg, var(--red-2), var(--red));
-      border-color:rgba(0,0,0,.25);
-      color:#fff;
-      box-shadow:0 10px 30px rgba(227,52,47,.26);
-    }
-
-    .btn.secondary{
-      background:rgba(217,217,217,.10);
-      border-color:rgba(217,217,217,.22);
-      color:var(--white);
-    }
-
-    .btn.ghost{ background:transparent; border-color:rgba(255,255,255,.20); }
-    .btn.small{ height:46px; font-size:16px; padding:0 14px; }
-
-    .tabs{
-      display:flex;
-      gap:10px;
-      flex-wrap:wrap; 
-      padding:0 0 14px;
-    }
-
-    .tab{
-      height:46px;
-      padding:0 14px;
-      border-radius:999px;
-      border:1px solid var(--line);
-      background:rgba(255,255,255,.06);
-      color:var(--white);
-      font-weight:900;
-      font-size:16px;
-      cursor:pointer;
-      display:inline-flex;
-      align-items:center;
-      gap:10px;
-      white-space:nowrap;
-      flex:0 0 auto;
-    }
-
-    .tab:focus{ outline:none; box-shadow:var(--focus); }
-
-    .tab[aria-selected="true"]{
-      background:rgba(227,52,47,.16);
-      border-color:rgba(227,52,47,.55);
-    }
-
-    .tab .badge{
-      font-size:12px;
-      font-weight:900;
-      padding:3px 9px;
-      border-radius:999px;
-      border:1px solid rgba(255,255,255,.22);
-      background:rgba(255,255,255,.06);
-      color:var(--muted);
-    }
-
-    main{ padding:18px 0 60px; }
-
-    .grid{
-      display:grid;
-      grid-template-columns:1.25fr .75fr;
-      gap:14px;
-      align-items:start;
-    }
-
-    .split{
-      display:grid;
-      grid-template-columns:1fr 1fr;
-      gap:14px;
-      align-items:start;
-    }
-
-    @media (max-width:980px){
-      .grid, .split{ grid-template-columns:1fr; }
-      .hdr{ align-items:flex-start; }
-      .logo{ width:84px; height:84px; border-radius:18px; }
-      .brand h1{ font-size:28px; }
-    }
-
-    .card{
-      background:rgba(255,255,255,.06);
-      border:1px solid var(--line);
-      border-radius:var(--radius);
-      box-shadow:var(--shadow);
-      padding:var(--pad-lg);
-    }
-
-    .card h2{ margin:0 0 10px; font-size:var(--fs-2); letter-spacing:.2px; }
-    .muted{ color:var(--muted); }
-    .hr{ height:1px; background:var(--line); margin:14px 0; }
-
-    .pill{
-      display:inline-flex;
-      gap:8px;
-      align-items:center;
-      padding:8px 12px;
-      border-radius:999px;
-      border:1px solid var(--line);
-      background:rgba(255,255,255,.06);
-      font-weight:900;
-      font-size:14px;
-      color:var(--muted);
-    }
-
-    label{ display:block; font-weight:900; margin:12px 0 6px; }
-    .req{ color:var(--red-2); font-weight:900; margin-left:6px; }
-
-    input, select, textarea{
-      width:100%;
-      font-size:var(--fs-1);
-      color:var(--white);
-      background:rgba(0,0,0,.28);
-      border:1px solid rgba(217,217,217,.30);
-      border-radius:14px;
-      padding:14px 14px;
-      outline:none;
-    }
-
-    input::placeholder, textarea::placeholder{ color:rgba(255,255,255,.55); }
-    input:focus, select:focus, textarea:focus{ box-shadow:var(--focus); border-color:rgba(227,52,47,.60); }
-    input[readonly], input:disabled, select:disabled, textarea:disabled{ opacity:.78; }
-
-    select{
-      appearance:none;
-      background-image:
-        linear-gradient(45deg, transparent 50%, rgba(255,255,255,.75) 50%),
-        linear-gradient(135deg, rgba(255,255,255,.75) 50%, transparent 50%);
-      background-position:
-        calc(100% - 26px) 50%,
-        calc(100% - 18px) 50%;
-      background-size:8px 8px, 8px 8px;
-      background-repeat:no-repeat;
-      padding-right:44px;
-    }
-
-    textarea{ min-height:120px; resize:vertical; }
-
-    .row{ display:flex; gap:12px; flex-wrap:wrap; }
-    .col{ flex:1 1 260px; min-width:240px; }
-
-    .notice{
-      border:1px solid rgba(217,217,217,.20);
-      background:rgba(0,0,0,.18);
-      border-radius:16px;
-      padding:12px;
-    }
-
-    .notice.warn{
-      border:1px solid rgba(227,52,47,.45);
-      background:rgba(227,52,47,.10);
-    }
-
-    .checkrow{
-      display:flex;
-      gap:10px;
-      align-items:flex-start;
-      padding:10px 12px;
-      border:1px solid rgba(255,255,255,.14);
-      background:rgba(0,0,0,.18);
-      border-radius:14px;
-    }
-
-    .checkrow input[type="checkbox"],
-    .checkrow input[type="radio"]{
-      width:22px;
-      height:22px;
-      margin-top:4px;
-      accent-color:var(--red);
-      flex:0 0 auto;
-    }
-
-    .stack{ display:flex; flex-direction:column; gap:10px; }
-
-    .storeCard,
-    .addressCard{
-      border:1px solid rgba(255,255,255,.14);
-      background:rgba(0,0,0,.18);
-      border-radius:16px;
-      padding:12px;
-    }
-
-    .addonDetails{
-      display:none;
-      margin-top:10px;
-      padding:10px;
-      border-radius:14px;
-      border:1px solid rgba(255,255,255,.12);
-      background:rgba(0,0,0,.18);
-    }
-
-    .addonDetails.show{ display:block; }
-
-    .mini{
-      font-size:14px;
-      color:rgba(255,255,255,.75);
-    }
-
-    .profileStrip{
-      display:none;
-      margin-bottom:12px;
-    }
-
-    .mgrid{
-      display:grid;
-      grid-template-columns:repeat(2, minmax(0,1fr));
-      gap:12px;
-    }
-
-    @media (max-width:900px){ .mgrid{ grid-template-columns:1fr; } }
-
-    .mcard{
-      border:1px solid rgba(255,255,255,.14);
-      border-radius:16px;
-      padding:14px;
-      background:rgba(0,0,0,.18);
-    }
-
-    .mname{ font-weight:1000; font-size:20px; }
-    .mprice{ font-weight:1000; font-size:22px; margin-top:6px; }
-    .mlist{ margin:10px 0 0; padding-left:18px; }
-    .mlist li{ margin:6px 0; }
-
-    .hidden{ display:none !important; }
-
-    footer{
-      margin-top:14px;
-      padding:20px 0 36px;
-      color:rgba(255,255,255,.65);
-      font-size:14px;
-      text-align:center;
-    }
-
-    .pca { z-index: 99999 !important; }
-    .pca .pcamenu { background: #ffffff !important; border-radius: 12px !important; border: 1px solid rgba(0,0,0,0.2) !important; box-shadow: 0 14px 46px rgba(0,0,0,.45) !important; overflow: hidden !important; }
-    .pca .pcaitem { color: #0b0b0b !important; font-size: 16px !important; padding: 12px 14px !important; border-bottom: 1px solid rgba(0,0,0,0.05) !important; background: #ffffff !important; cursor: pointer !important; display: block !important; visibility: visible !important; }
-    .pca .pcaitem:hover, .pca .pcaitem.pcafocus { background: #f0f0f0 !important; }
-    .pca .pcalogo { display: none !important; }
-
-    .autocomplete-list { position: absolute; top: 100%; left: 0; right: 0; z-index: 99; background: var(--grey-3); border: 1px solid rgba(255,255,255,.2); border-radius: 14px; max-height: 250px; overflow-y: auto; box-shadow: 0 14px 46px rgba(0,0,0,.65); margin-top: 4px; }
-    .ac-item { padding: 12px 14px; border-bottom: 1px solid rgba(255,255,255,.05); cursor: pointer; transition: background 0.1s ease; }
-    .ac-item:hover { background: rgba(255,255,255,.1); }
-    .ac-item:last-child { border-bottom: none; }
-
-    /* Square Payment Element Container */
-    #card-container { min-height: 90px; background: #ffffff; padding: 12px; border-radius: 12px; }
-  </style>
-  
-  <script type="text/javascript">window.$crisp=[];window.CRISP_WEBSITE_ID="a8664389-5639-47c8-8556-2c4043696f06";(function(){d=document;s=d.createElement("script");s.src="https://client.crisp.chat/l.js";s.async=1;d.getElementsByTagName("head")[0].appendChild(s);})();</script>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>TGR Admin</title>
+<style>
+  :root{ --bg:#0b0b0b; --panel:rgba(255,255,255,.06); --line:rgba(255,255,255,.14); --text:#fff; --muted:rgba(255,255,255,.75); --red:#e3342f; --red2:#ff4a44; --radius:14px; }
+  body{margin:0;background:var(--bg);color:var(--text);font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;}
+  .wrap{max-width:1400px;margin:0 auto;padding:16px;}
+  .card{border:1px solid var(--line);background:var(--panel);border-radius:var(--radius);padding:14px;}
+  .row{display:flex;gap:10px;flex-wrap:wrap;align-items:center;}
+  .btn{border:1px solid rgba(255,255,255,.18);background:rgba(255,255,255,.06);color:#fff;font-weight:900;border-radius:999px;padding:10px 14px;cursor:pointer;text-decoration:none;white-space:nowrap;}
+  .btn.primary{background:linear-gradient(180deg,var(--red2),var(--red));border-color:rgba(0,0,0,.25);}
+  .btn.ghost{background:transparent;} .muted{color:var(--muted);}
+  .pill{display:inline-block;padding:4px 10px;border-radius:999px;border:1px solid rgba(255,255,255,.18);background:rgba(255,255,255,.06);font-weight:900;font-size:12px;}
+  .hr{height:1px;background:rgba(255,255,255,.12);margin:12px 0;}
+  input,select,textarea{width:100%;padding:12px 12px;border-radius:12px;border:1px solid rgba(255,255,255,.18);background:rgba(0,0,0,.22);color:#fff;font-size:15px;outline:none;}
+  table{width:100%;border-collapse:collapse;} th,td{padding:10px 8px;border-bottom:1px solid rgba(255,255,255,.12);vertical-align:top;} th{font-size:12px;color:rgba(255,255,255,.72);text-transform:uppercase;text-align:left;}
+  .grid{display:grid;grid-template-columns: 1.1fr .9fr; gap:12px;} @media (max-width: 980px){ .grid{grid-template-columns: 1fr;} }
+  .toast{margin-top:10px;padding:10px 12px;border-radius:12px;border:1px solid rgba(255,255,255,.18);background:rgba(0,0,0,.24);display:none;font-weight:900;} .toast.show{display:block;}
+  .modalBack{position:fixed; inset:0; background:rgba(0,0,0,.55); display:none; align-items:center; justify-content:center; padding:16px; z-index:100;}
+  .modal{width:min(980px, 100%); max-height:92vh; overflow:auto; border:1px solid rgba(255,255,255,.16); background:#0b0b0b; border-radius:16px; padding:14px;}
+  .k{font-size:12px;color:rgba(255,255,255,.7);text-transform:uppercase;letter-spacing:.08em;} .v{font-weight:900;} .two{display:grid;grid-template-columns:1fr 1fr; gap:10px;}
+  @media print { body * { visibility: hidden; } #masterListModalBack, #masterListModalBack * { visibility: visible; } #masterListModalBack { position: absolute; left: 0; top: 0; background: white; color: black; align-items: flex-start; } .modal { border: none; background: white; box-shadow: none; overflow: visible; max-height: none; } .btn, .toast { display: none !important; } .card { background: white !important; border: none !important; color: black !important; } pre { color: black !important; font-family: monospace; font-size: 14pt; } }
+</style>
 </head>
-
 <body>
-<div id="netBanner">Offline — some features may not work until you’re back online.</div>
-
-<header>
-  <div class="wrap">
-    <div class="hdr">
-      <img src="/tgr_logo_tight_512.png" class="logo" alt="Tobermory Grocery Run logo" />
-
-      <div class="hdr-title">
-        <div class="brand">
-          <h1>Tobermory Grocery Run</h1>
-          <span class="tag"><span class="dot"></span> Delivery • Errands • Rides</span>
-        </div>
-        <div class="muted" id="hdrSub">From cart to counter — your order perfected.</div>
-      </div>
-
-      <div class="hdr-actions">
-        <a id="btnSignIn" class="btn secondary" href="#">Sign In</a>
-        <a id="btnMember" class="btn ghost" href="#" style="display:none;">Member Portal</a>
-        <a id="btnAdmin" class="btn ghost" href="#" style="display:none;">Admin</a>
-      </div>
+<div class="wrap">
+  <div class="card">
+    <div class="row" style="justify-content:space-between;">
+      <div><div style="font-weight:1000;font-size:22px;">Admin Command Center</div><div class="muted">Manage orders, tracking, and grocery catalogue.</div></div>
+      <div class="row"><a class="btn ghost" href="${escapeHtml(PUBLIC_SITE_URL)}/">Back to site</a><a class="btn" href="/admin/tracking-control">Tracking Control</a><a class="btn ghost" href="/logout?returnTo=${encodeURIComponent(PUBLIC_SITE_URL + "/")}">Log out</a></div>
     </div>
+    <div class="toast" id="toast"></div><div class="hr" style="margin-top:16px; margin-bottom:16px;"></div>
+    <div class="row" style="margin-bottom:14px;"><button class="btn primary" id="tabBtnOrders" onclick="switchTab('orders')">Orders Management</button><button class="btn" id="tabBtnCatalogue" onclick="switchTab('catalogue')">Catalogue / Inventory</button></div>
 
-    <div class="tabs" role="tablist" aria-label="Primary navigation">
-      <button class="tab" id="tab-home" aria-selected="true" type="button">Home</button>
-      <button class="tab" id="tab-about" aria-selected="false" type="button">About Us</button>
-      <button class="tab" id="tab-pricing" aria-selected="false" type="button">Pricing</button>
-      <button class="tab" id="tab-areas" aria-selected="false" type="button">Service Areas</button>
-      <button class="tab" id="tab-estimator" aria-selected="false" type="button">Fee Estimator</button>
-      <button class="tab" id="tab-order" aria-selected="false" type="button">ORDER <span class="badge">Fast</span></button>
-      <button class="tab" id="tab-ride" aria-selected="false" type="button">Book a Ride</button>
-      <button class="tab" id="tab-account" aria-selected="false" type="button">Create Account</button>
-      <a class="tab" href="/terms.html" style="text-decoration:none;">Terms</a>
-      <button class="tab" id="tab-memberships" aria-selected="false" type="button">Memberships</button>
-      <button class="tab" id="tab-faq" aria-selected="false" type="button">FAQ</button>
-      <button class="tab" id="tab-contact" aria-selected="false" type="button">Contact</button>
+    <div id="tabContentOrders">
+      <div class="grid">
+        <div class="card" style="box-shadow:none;">
+          <div style="font-weight:1000;">Search / Filters</div><div class="hr"></div>
+          <div class="row"><div style="flex: 2 1 320px;"><label class="muted" style="font-weight:900;">Search</label><input id="q" placeholder="orderId, name, email, phone, address" /></div><div style="flex: 1 1 180px;"><label class="muted" style="font-weight:900;">State</label><select id="state"><option value="">Any</option><option>submitted</option><option>confirmed</option><option>shopping</option><option>packed</option><option>out_for_delivery</option><option>delivered</option><option>issue</option><option>cancelled</option></select></div><div style="flex: 1 1 180px;"><label class="muted" style="font-weight:900;">Run Key</label><input id="runKey" placeholder="YYYY-MM-DD-local" /></div></div>
+          <div class="row" style="margin-top:8px;"><button class="btn primary" id="searchBtn">Search</button><button class="btn ghost" id="clearBtn">Clear</button><span class="pill" id="countPill">—</span></div>
+        </div>
+        <div class="card" style="box-shadow:none;">
+          <div style="font-weight:1000;">Quick Tools</div><div class="hr"></div>
+          <div class="row" style="margin-top:10px;"><div style="flex:1 1 200px;"><input id="toolRunKey" placeholder="YYYY-MM-DD-local" /></div><button class="btn" id="exportBtn">Download CSV</button><button class="btn primary" id="masterListBtn">Master Shopping List</button></div>
+        </div>
+      </div>
+      <div class="hr"></div>
+      <div style="overflow:auto;"><table><thead><tr><th>Order</th><th>Customer</th><th>Address</th><th>Run</th><th>Status</th><th>Fees</th><th>Actions</th></tr></thead><tbody id="rows"><tr><td colspan="7" class="muted">Loading…</td></tr></tbody></table></div>
     </div>
   </div>
-</header>
+</div>
 
-<main class="wrap">
-  <datalist id="townSuggestions">
-    <option value="Tobermory"></option>
-    <option value="Dyers Bay"></option>
-    <option value="Lion's Head"></option>
-    <option value="Ferndale"></option>
-    <option value="Wiarton"></option>
-    <option value="Sauble Beach"></option>
-    <option value="Southampton"></option>
-    <option value="Howdenvale"></option>
-    <option value="Stokes Bay"></option>
-    <option value="Dunks Bay"></option>
-    <option value="Bruce Peninsula"></option>
-  </datalist>
-
-  <section id="panel-home" class="card">
-    <h2>Fast, reliable local runs — built for the Bruce Peninsula.</h2>
-    <div class="muted">
-      Groceries, prescriptions, errands, and optional rides — with a mobile-first ordering flow, membership perks, and clear tracking.
-    </div>
-
+<div class="modalBack" id="modalBack">
+  <div class="modal">
+    <div class="row" style="justify-content:space-between;"><div style="font-weight:1000;font-size:20px;">Order Details</div><button class="btn ghost" id="closeModal">Close</button></div>
     <div class="hr"></div>
-
-    <div class="grid">
-      <div class="card" style="box-shadow:none;background:rgba(0,0,0,.16);">
-        <h2 style="margin-bottom:8px;">What we do</h2>
-        <ul class="muted" style="margin:10px 0 0; padding-left:20px;">
-          <li>Scheduled delivery runs with clear cutoffs</li>
-          <li>Groceries, prescriptions, liquor, parcels, printing, rides, and extra stops</li>
-          <li>Saved profiles so future orders auto-fill</li>
-          <li>Member portal and live tracking links</li>
-        </ul>
-
-        <div class="hr"></div>
-
-        <div class="row">
-          <a class="btn primary" href="#" id="homeOrderBtn">Place an Order</a>
-          <a class="btn secondary" href="#" id="homeSignInBtn">Sign In</a>
-          <a class="btn ghost" href="#" id="homeMembershipBtn">Memberships</a>
-          <a class="btn ghost" href="#" id="homeEstimatorBtn">Fee Estimator</a>
-          <a class="btn ghost" href="mailto:orders@tobermorygroceryrun.ca">Email Orders</a>
-        </div>
-
-        <div class="muted" style="margin-top:10px;">Tip: Create your account once — future orders auto-fill your saved address and preferences.</div>
+    <div class="two">
+      <div class="card" style="box-shadow:none;">
+        <div class="k">Order ID</div><div class="v" id="m_orderId">—</div><div class="hr"></div>
+        <div class="k">Customer</div><div class="v" id="m_customer">—</div>
+        <div class="k">Phone</div><div class="v" id="m_phone">—</div>
+        <div class="k">Address</div><div class="v" id="m_addr">—</div>
+        <div class="k">Run</div><div class="v" id="m_run">—</div>
       </div>
-
-      <aside class="card" style="box-shadow:none;background:rgba(0,0,0,.16);">
-        <h2 style="margin-bottom:8px;">Quick highlights</h2>
-        <div class="row" style="gap:10px;">
-          <span class="pill">High-contrast UI</span>
-          <span class="pill">Mobile-first</span>
-          <span class="pill">Saved profiles</span>
-          <span class="pill">Order IDs</span>
-        </div>
-
-        <div class="hr"></div>
-
-        <div class="notice warn">
-          <div style="font-weight:900; font-size:20px;">Member tools</div>
-          <div class="muted">View your profile, orders, payment links, and tracking links in the Member Portal.</div>
-          <div style="margin-top:10px;">
-            <a class="btn primary small" id="goMemberBtn" href="#" style="text-decoration:none;">Open Member Portal</a>
+      <div class="card" style="box-shadow:none;">
+        <div class="k">Fees total</div><div class="v" id="m_fees">—</div>
+        <div class="k">Square Payment Status</div><div class="v" id="m_groceriesCurrent">—</div><div class="hr"></div>
+        
+        <div class="card" style="box-shadow:none; border: 1px solid rgba(227,52,47,.45) !important; background: rgba(227,52,47,.1) !important; margin-bottom:14px;">
+          <div class="k" style="color: #ff4a44;">Finalize Payment (Delayed Capture)</div>
+          <div class="muted small" style="margin-bottom:8px;">Enter exact receipt total. This captures the exact amount via Square and texts the customer.</div>
+          <div class="row">
+            <input id="m_finalGroceryTotal" type="number" step="0.01" placeholder="Receipt total ($)" style="max-width:160px; background:rgba(0,0,0,.4);" />
+            <button class="btn primary" id="m_captureBtn">Finalize & Dispatch 🚙</button>
           </div>
         </div>
-      </aside>
-    </div>
 
+        <label class="muted" style="font-weight:900;">Manual Status Override</label>
+        <div class="row"><select id="m_state" style="max-width:180px;"><option>submitted</option><option>confirmed</option><option>shopping</option><option>packed</option><option>out_for_delivery</option><option>delivered</option><option>issue</option><option>cancelled</option></select><button class="btn ghost" id="m_saveState">Save override</button></div>
+        <div class="row" style="margin-top:10px;"><button class="btn ghost" id="m_cancelAdmin">Cancel order</button><button class="btn ghost" id="m_deleteOrder">Delete order</button></div>
+      </div>
+    </div>
     <div class="hr"></div>
-
-    <div class="card" style="box-shadow:none;background:rgba(0,0,0,.16);">
-      <h2 style="margin-bottom:8px;">Scheduled Runs</h2>
-      <div class="muted">Live availability and dynamic capacity updates.</div>
-
-      <div class="hr"></div>
-
-      <div class="split">
-        <div class="card" style="box-shadow:none;background:rgba(255,255,255,.05);">
-          <div style="font-weight:1000;font-size:18px;">Local Run</div>
-          <div class="muted" id="homeLocalKey" title="Tap to copy">—</div>
-          <div class="hr"></div>
-          <div class="muted" id="homeLocalWindow">—</div>
-          <div style="margin-top:10px;" class="row">
-            <span class="pill" id="homeLocalOpen">—</span>
-            <span class="pill" id="homeLocalSlots">Capacity: —/10 Points</span>
-          </div>
-          <div class="hr"></div>
-          <div class="muted" id="homeLocalMin">—</div>
-          <div class="row" style="margin-top:10px;">
-            <span class="pill" id="homeLocalCount">Orders: —</span>
-            <span class="pill" id="homeLocalFees">Fees: $—</span>
-          </div>
-        </div>
-
-        <div class="card" style="box-shadow:none;background:rgba(255,255,255,.05);">
-          <div style="font-weight:1000;font-size:18px;">Owen Sound Run</div>
-          <div class="muted" id="homeOwenKey" title="Tap to copy">—</div>
-          <div class="hr"></div>
-          <div class="muted" id="homeOwenWindow">—</div>
-          <div style="margin-top:10px;" class="row">
-            <span class="pill" id="homeOwenOpen">—</span>
-            <span class="pill" id="homeOwenSlots">Capacity: —/10 Points</span>
-          </div>
-          <div class="hr"></div>
-          <div class="muted" id="homeOwenMin">—</div>
-          <div class="row" style="margin-top:10px;">
-            <span class="pill" id="homeOwenCount">Orders: —</span>
-            <span class="pill" id="homeOwenFees">Fees: $—</span>
-          </div>
-        </div>
-      </div>
-
-      <div class="muted" id="homeRunsHint" style="margin-top:12px;"></div>
+    <div class="two">
+      <div class="card" style="box-shadow:none;"><div style="font-weight:1000;">Grocery list</div><div class="hr"></div><pre id="m_list"></pre></div>
+      <div class="card" style="box-shadow:none;"><div style="font-weight:1000;">Add-ons / notes</div><div class="hr"></div><pre id="m_addons"></pre></div>
     </div>
-  </section>
-
-  <section id="panel-ride" class="card hidden">
-    <h2>Book a Passenger Ride</h2>
-    <div class="muted">Book a one-way seat to town. Rides take up 3 cargo space points, so availability is dynamically limited based on current grocery volume!</div>
-
-    <div class="hr"></div>
-
-    <form id="rideForm">
-      <div class="split">
-        <div class="card" style="box-shadow:none;background:rgba(0,0,0,.16);">
-          <div class="stack">
-            <label>Run Type<span class="req">*</span></label>
-            <select id="ride_runType" required>
-              <option value="local">Local Run ($15 Flat)</option>
-              <option value="owen">Owen Sound Run ($50 Flat)</option>
-            </select>
-
-            <label>Pickup Location<span class="req">*</span></label>
-            <input id="ride_pickup" required placeholder="Your address or pickup spot" />
-
-            <label>Destination<span class="req">*</span></label>
-            <input id="ride_dest" required placeholder="Where do you need to go?" />
-
-            <label>Preferred Time Window</label>
-            <input id="ride_window" placeholder="e.g., 10am - 12pm" />
-            
-            <label>Notes</label>
-            <input id="ride_notes" placeholder="Accessibility, bags, trunk space needed, etc." />
-          </div>
-        </div>
-        <div class="card" style="box-shadow:none;background:rgba(0,0,0,.16);">
-          <div class="stack">
-             <label>Passenger Name<span class="req">*</span></label>
-             <input id="ride_name" required placeholder="Full Name" />
-             
-             <label>Phone Number<span class="req">*</span></label>
-             <input id="ride_phone" required placeholder="519-555-1234" />
-             
-             <div class="checkrow" style="margin-top:14px;">
-                <input id="ride_consent" type="checkbox" required />
-                <div>
-                  <div style="font-weight:1000;">I accept the Terms</div>
-                  <div class="mini">Rides are subject to schedule changes based on grocery volume and routes.</div>
-                </div>
-             </div>
-             
-             <div class="row" style="margin-top:14px;">
-               <button class="btn primary" type="submit" id="ride_submitBtn">Book Ride</button>
-             </div>
-             <div class="mini" id="ride_msg" style="margin-top:12px;"></div>
-          </div>
-        </div>
-      </div>
-    </form>
-  </section>
-
-  <section id="panel-about" class="card hidden">
-    <h2>About Us</h2>
-    <div class="muted">
-      Tobermory Grocery Run is a local delivery and errands service built for clarity, accessibility, and reliability — serving the Bruce Peninsula with scheduled run windows, saved profiles, and live updates.
-    </div>
-  </section>
-
-  <section id="panel-pricing" class="card hidden">
-    <h2>Pricing</h2>
-    <div class="muted">Pricing is based on service fee + zone + add-ons. Memberships provide discounts and perks.</div>
-  </section>
-
-  <section id="panel-areas" class="card hidden">
-    <h2>Service Areas</h2>
-    <div class="muted">
-      We serve Tobermory and surrounding Bruce Peninsula communities. If you're outside the standard area, place the order and add details — we’ll confirm feasibility and pricing.
-    </div>
-  </section>
-
-  <section id="panel-estimator" class="card hidden">
-    <h2>Service & Delivery Fee Estimator</h2>
-    <div class="muted">Estimates service + delivery fees only. Grocery totals are separate.</div>
-
-    <div class="hr"></div>
-
-    <div class="row">
-      <div class="col">
-        <label for="est_zone">Zone</label>
-        <select id="est_zone">
-          <option value="">Select…</option>
-          <option value="A">Zone A</option>
-          <option value="B">Zone B</option>
-          <option value="C">Zone C</option>
-          <option value="D">Zone D</option>
-        </select>
-      </div>
-
-      <div class="col">
-        <label for="est_runType">Run Type</label>
-        <select id="est_runType">
-          <option value="local">Local</option>
-          <option value="owen">Owen Sound</option>
-        </select>
-        <div class="muted" id="est_runHint" style="font-size:14px;margin-top:6px;"></div>
-      </div>
-
-      <div class="col">
-        <label for="est_memberTier">Membership tier</label>
-        <select id="est_memberTier">
-          <option value="">None</option>
-          <option value="standard">Standard</option>
-          <option value="route">Route</option>
-          <option value="access">Access</option>
-          <option value="accesspro">Access Pro</option>
-        </select>
-      </div>
-    </div>
-
-    <div class="row">
-      <div class="col">
-        <label for="est_applyPerk">Apply perk?</label>
-        <select id="est_applyPerk">
-          <option value="yes">Yes</option>
-          <option value="no">No</option>
-        </select>
-      </div>
-
-      <div class="col">
-        <label for="est_extraStoresCount">Extra store stops (count)</label>
-        <input id="est_extraStoresCount" type="number" min="0" value="0" />
-      </div>
-
-      <div class="col">
-        <label for="est_grocerySubtotal">Estimated grocery subtotal</label>
-        <input id="est_grocerySubtotal" type="number" min="0" step="0.01" value="0" />
-      </div>
-    </div>
-
-    <div class="row">
-      <div class="col">
-        <label for="est_printing">Printing add-on?</label>
-        <select id="est_printing">
-          <option value="no">No</option>
-          <option value="yes">Yes</option>
-        </select>
-      </div>
-
-      <div class="col">
-        <label for="est_printPages">Print pages</label>
-        <input id="est_printPages" type="number" min="0" value="0" />
-      </div>
-
-      <div class="col">
-        <label>&nbsp;</label>
-        <button class="btn primary" id="est_calcBtn" type="button">Calculate</button>
-      </div>
-    </div>
-
-    <div class="hr"></div>
-
-    <div class="row" style="gap:10px;">
-      <span class="pill" id="est_serviceFee">Service: —</span>
-      <span class="pill" id="est_zoneFee">Zone: —</span>
-      <span class="pill" id="est_runFee">Run: —</span>
-      <span class="pill" id="est_addOns">Add-ons: —</span>
-      <span class="pill" id="est_surcharges">Surcharges: —</span>
-      <span class="pill" id="est_discount">Discount: —</span>
-      <span class="pill" id="est_total">Total Fees: —</span>
-    </div>
-
-    <div class="muted" id="est_msg" style="margin-top:10px;"></div>
-
-    <div class="hr"></div>
-
-    <div class="row">
-      <a class="btn secondary" href="#" id="est_goOrderBtn">Continue to ORDER</a>
-    </div>
-  </section>
-
-  <section id="panel-order" class="card hidden">
-    <h2>Place an Order</h2>
-    <div class="muted">Saved profiles auto-fill the order form. Extra stops and add-on services are included below.</div>
-
-    <div class="hr"></div>
-
-    <div class="notice warn" id="orderGate" style="display:none;">
-      <div style="font-weight:1000;">Action required</div>
-      <div class="mini" id="orderGateMsg" style="margin-top:6px;"></div>
-      <div class="row" style="margin-top:10px;">
-        <button class="btn primary small" id="orderGateBtn" type="button">Continue</button>
-        <button class="btn small ghost" id="orderGateGoAccount" type="button" style="display:none;">Create Account</button>
-      </div>
-    </div>
-
-    <div class="profileStrip notice" id="orderProfileStrip">
-      <div class="row" style="justify-content:space-between;">
-        <div>
-          <div style="font-weight:1000;">Saved profile loaded</div>
-          <div class="mini" id="orderProfileSummary">—</div>
-        </div>
-        <div class="row">
-          <select id="ord_savedAddress" style="min-width:260px;"></select>
-          <button class="btn small" type="button" id="ord_reloadProfile">Reload</button>
-          <button class="btn small ghost" type="button" id="ord_editProfile">Edit Profile</button>
-        </div>
-      </div>
-    </div>
-
-    <form id="orderForm" enctype="multipart/form-data">
-      <div class="split">
-        <div class="card" style="box-shadow:none;background:rgba(0,0,0,.16);">
-          <div style="font-weight:1000;font-size:18px;">Run + Delivery Details</div>
-          <div class="hr"></div>
-
-          <div class="row">
-            <div class="col">
-              <label for="ord_runType">Run Type<span class="req">*</span></label>
-              <select id="ord_runType" required>
-                <option value="local">Local</option>
-                <option value="owen">Owen Sound</option>
-              </select>
-              <div class="mini" id="ord_runStatus" style="margin-top:6px;"></div>
-            </div>
-
-            <div class="col">
-              <label for="ord_zone">Zone<span class="req">*</span></label>
-              <select id="ord_zone" required>
-                <option value="">Select…</option>
-                <option value="A">Zone A</option>
-                <option value="B">Zone B</option>
-                <option value="C">Zone C</option>
-                <option value="D">Zone D</option>
-              </select>
-            </div>
-          </div>
-
-          <label for="ord_lookup">Road address lookup (Canada Post)</label>
-          <input id="ord_lookup" class="addr_lookup" placeholder="Start typing your street address" autocomplete="off" />
-          <div class="mini">Selecting a suggestion fills street, unit, town, and postal code. Zone stays manual.</div>
-
-          <div class="row">
-            <div class="col">
-              <label for="ord_town">Town / City<span class="req">*</span></label>
-              <input id="ord_town" list="townSuggestions" required placeholder="Town / city" />
-            </div>
-            <div class="col">
-              <label for="ord_postal">Postal Code<span class="req">*</span></label>
-              <input id="ord_postal" required placeholder="e.g., N0H 2R0" autocomplete="postal-code" />
-            </div>
-          </div>
-
-          <div class="row">
-            <div class="col">
-              <label for="ord_street">Street Address<span class="req">*</span></label>
-              <input id="ord_street" required placeholder="123 Main St" autocomplete="street-address" />
-            </div>
-            <div class="col">
-              <label for="ord_unit">Unit / Apt / Cabin</label>
-              <input id="ord_unit" placeholder="Optional" autocomplete="address-line2" />
-            </div>
-          </div>
-
-          <div class="hr"></div>
-
-          <div style="font-weight:1000;font-size:18px;">Contact for This Order</div>
-
-          <div class="row">
-            <div class="col">
-              <label for="ord_name">Full Name<span class="req">*</span></label>
-              <input id="ord_name" required placeholder="First + last name" autocomplete="name" />
-            </div>
-            <div class="col">
-              <label for="ord_phone">Phone<span class="req">*</span></label>
-              <input id="ord_phone" required placeholder="e.g., 519-555-1234" autocomplete="tel" />
-            </div>
-          </div>
-
-          <div class="row">
-            <div class="col">
-              <label for="ord_email">Email</label>
-              <input id="ord_email" disabled />
-            </div>
-            <div class="col">
-              <label for="ord_dob">Date of Birth</label>
-              <input id="ord_dob" type="date" />
-            </div>
-          </div>
-
-          <div class="row">
-            <div class="col">
-              <label for="ord_contactPref">Contact preference<span class="req">*</span></label>
-              <select id="ord_contactPref" required>
-                <option value="">Select…</option>
-                <option value="Text">Text</option>
-                <option value="Phone call">Phone call</option>
-                <option value="Email">Email</option>
-              </select>
-            </div>
-
-            <div class="col">
-              <label for="ord_memberTier">Membership level</label>
-              <select id="ord_memberTier">
-                <option value="">None</option>
-                <option value="standard">Standard</option>
-                <option value="route">Route</option>
-                <option value="access">Access</option>
-                <option value="accesspro">Access Pro</option>
-              </select>
-            </div>
-          </div>
-        </div>
-
-        <div class="card" style="box-shadow:none;background:rgba(0,0,0,.16);">
-          <div style="font-weight:1000;font-size:18px;">Store + Grocery List</div>
-          <div class="hr"></div>
-
-          <label for="ord_primaryStore">Primary Store<span class="req">*</span></label>
-          <select id="ord_primaryStore" required></select>
-          <div class="mini">Store options change automatically based on run type.</div>
-
-          <div class="hr"></div>
-
-          <label>Grocery / shopping list<span class="req">*</span></label>
-          <div class="mini" style="margin-bottom:10px;">Search the catalogue for estimates, or type a custom item.</div>
-          
-          <div style="position:relative;">
-            <div class="row">
-              <input id="itemSearchInput" autocomplete="off" placeholder="e.g., Milk 2% 4L, Bread..." style="flex:1;" />
-              <button type="button" class="btn secondary" id="btnAddItem">Add</button>
-            </div>
-            <div id="autocompleteDropdown" class="autocomplete-list" style="display:none;"></div>
-          </div>
-
-          <div id="groceryListItems" class="stack" style="margin-top:14px;"></div>
-
-          <div class="row" style="justify-content:space-between; margin-top:14px; padding-top:14px; border-top:1px solid rgba(255,255,255,.1);">
-             <div style="font-weight:1000;">Catalogue Estimate:</div>
-             <div style="font-weight:1000; color:var(--red-2);" id="uiGroceryTotal">$0.00</div>
-          </div>
-
-          <textarea id="ord_groceryList" style="display:none;"></textarea>
-
-          <div class="row" style="margin-top:10px;">
-            <div class="col">
-              <label for="ord_groceryFile">Upload a list (optional)</label>
-              <input id="ord_groceryFile" type="file" accept=".jpg,.jpeg,.png,.pdf,.txt" />
-            </div>
-
-            <div class="col">
-              <label for="ord_grocerySubtotal">Estimated grocery subtotal</label>
-              <input id="ord_grocerySubtotal" type="number" min="0" step="0.01" value="0" />
-              <div class="mini">Automatically tallies from catalogue items. Adjust if needed.</div>
-            </div>
-          </div>
-
-          <div class="hr"></div>
-
-          <div style="font-weight:1000;font-size:18px;">Preferences</div>
-
-          <div class="row">
-            <div class="col">
-              <label for="ord_dropoffPref">Drop-off preference<span class="req">*</span></label>
-              <select id="ord_dropoffPref" required>
-                <option value="">Select…</option>
-                <option value="Leave at door">Leave at door</option>
-                <option value="Knock / ring bell">Knock / ring bell</option>
-                <option value="Call on arrival">Call on arrival</option>
-                <option value="Hand to me">Hand to me</option>
-              </select>
-            </div>
-
-            <div class="col">
-              <label for="ord_subsPref">Substitutions<span class="req">*</span></label>
-              <select id="ord_subsPref" required>
-                <option value="">Select…</option>
-                <option value="Allow substitutions">Allow substitutions</option>
-                <option value="No substitutions">No substitutions</option>
-                <option value="Text/call me for substitutions">Text/call me for substitutions</option>
-              </select>
-            </div>
-          </div>
-
-          <div class="row">
-            <div class="col">
-              <label for="ord_gateCode">Gate / buzzer code</label>
-              <input id="ord_gateCode" placeholder="Optional" />
-            </div>
-
-            <div class="col">
-              <label for="ord_budgetCap">Budget cap</label>
-              <input id="ord_budgetCap" type="number" min="0" step="0.01" value="0" placeholder="0 = no cap" />
-            </div>
-          </div>
-
-          <label for="ord_accessNotes">Building access notes</label>
-          <input id="ord_accessNotes" placeholder="Entrance, stairs, side door, etc." />
-
-          <label for="ord_parkingNotes">Parking / approach notes</label>
-          <input id="ord_parkingNotes" placeholder="Driveway, parking, gate, snow, etc." />
-
-          <div class="row">
-            <div class="col">
-              <label for="ord_receiptPref">Receipt preference</label>
-              <select id="ord_receiptPref">
-                <option value="">No preference</option>
-                <option value="Leave receipt in bags">Leave receipt in bags</option>
-                <option value="Photo of receipt (text)">Photo of receipt (text)</option>
-                <option value="Photo of receipt (email)">Photo of receipt (email)</option>
-              </select>
-            </div>
-
-            <div class="col">
-              <label>&nbsp;</label>
-              <div class="checkrow">
-                <input id="ord_photoProofOk" type="checkbox" />
-                <div>
-                  <div style="font-weight:1000;">Photo proof OK</div>
-                  <div class="mini">Optional photo of bags at the drop point.</div>
-                </div>
-              </div>
-            </div>
-          </div>
-        </div>
-      </div>
-
-      <div class="hr"></div>
-
-      <div class="split">
-        <div class="stack">
-          <div class="card" style="box-shadow:none;background:rgba(0,0,0,.16);">
-            <div style="font-weight:1000;font-size:18px;">Extra Store Stops</div>
-            <div class="mini">Add as many extra stops as you need.</div>
-            <div class="hr"></div>
-
-            <div id="extraStoresWrap" class="stack"></div>
-
-            <div class="row" style="margin-top:10px;">
-              <button class="btn small" type="button" id="btnAddStore">+ Add store stop</button>
-              <button class="btn small ghost" type="button" id="btnClearStores">Clear</button>
-            </div>
-
-            <div class="mini" style="margin-top:10px;">Examples: LCBO, pharmacy, Home Hardware, post office, parcel depot.</div>
-          </div>
-
-          <div class="card" style="box-shadow:none;background:rgba(0,0,0,.16);">
-            <div style="font-weight:1000;font-size:18px;">Consents & Payment<span class="req">*</span></div>
-            <div class="mini">Required to submit the order.</div>
-            <div class="hr"></div>
-
-            <div class="stack">
-              <div class="checkrow">
-                <input id="consent_terms" type="checkbox" />
-                <div><div style="font-weight:1000;">I agree to the Terms</div></div>
-              </div>
-              <div class="checkrow">
-                <input id="consent_accuracy" type="checkbox" />
-                <div><div style="font-weight:1000;">My information is accurate</div></div>
-              </div>
-              <div class="checkrow">
-                <input id="consent_dropoff" type="checkbox" />
-                <div><div style="font-weight:1000;">Drop-off authorization</div></div>
-              </div>
-            </div>
-
-            <div class="hr"></div>
-
-            <div class="card" style="box-shadow:none; background:rgba(255,255,255,.05); border-color: rgba(227,52,47,.5);">
-              <div style="font-weight:1000; font-size:16px;">Payment Authorization</div>
-              <div class="mini" style="margin-bottom:10px;">We will place a hold on your card for the estimated total + 15% buffer. You will only be charged the exact receipt total + fees upon delivery.</div>
-              <div id="card-container"></div>
-            </div>
-
-            <div class="row" style="justify-content:space-between; align-items:center; margin-top:14px;">
-              <div>
-                <div class="pill" id="ord_feePreview">Estimated fees: —</div>
-              </div>
-              <div class="row">
-                <button class="btn ghost" type="button" id="ord_calcFeesBtn">Estimate Fees</button>
-                <button class="btn primary" type="submit" id="ord_submitBtn">Authorize & Submit</button>
-              </div>
-            </div>
-
-            <div class="mini" id="ord_msg" style="margin-top:12px;"></div>
-          </div>
-        </div>
-
-        <div class="card" style="box-shadow:none;background:rgba(0,0,0,.16);">
-          <div style="font-weight:1000;font-size:18px;">Add-ons & Special Requests</div>
-          <div class="mini">Check an add-on to reveal its detail fields.</div>
-          <div class="hr"></div>
-
-          <div class="stack">
-            <div class="checkrow">
-              <input id="addon_prescription" type="checkbox" />
-              <div style="flex:1;"><div style="font-weight:1000;">Prescription pickup & delivery</div>
-                <div class="addonDetails" id="prescDetails"><div class="row"><div class="col"><input id="presc_pharmacy" placeholder="Pharmacy name" /></div><div class="col"><input id="presc_notes" placeholder="Notes" /></div></div></div>
-              </div>
-            </div>
-            <div class="checkrow">
-              <input id="addon_liquor" type="checkbox" />
-              <div style="flex:1;"><div style="font-weight:1000;">Liquor pickup & delivery</div>
-                <div class="addonDetails" id="liqDetails"><div class="row"><div class="col"><input id="liq_store" placeholder="Store name" /></div><div class="col"><input id="liq_notes" placeholder="Notes" /></div></div></div>
-              </div>
-            </div>
-            <div class="checkrow">
-              <input id="addon_printing" type="checkbox" />
-              <div style="flex:1;"><div style="font-weight:1000;">Printing / scanning / faxing</div>
-                <div class="addonDetails" id="printDetails"><div class="row"><div class="col"><input id="addon_printPages" type="number" min="0" value="0" /></div><div class="col"><input id="addon_printNotes" placeholder="Notes" /></div></div></div>
-              </div>
-            </div>
-            <div class="checkrow">
-              <input id="addon_fastfood" type="checkbox" />
-              <div style="flex:1;"><div style="font-weight:1000;">Fast food pickup</div>
-                <div class="addonDetails" id="ffDetails"><div class="row"><div class="col"><input id="ff_rest" placeholder="Restaurant name" /></div><div class="col"><input id="ff_order" placeholder="Order details" /></div></div></div>
-              </div>
-            </div>
-            <div class="checkrow">
-              <input id="addon_parcel" type="checkbox" />
-              <div style="flex:1;"><div style="font-weight:1000;">Parcel drop-off / pickup</div>
-                <div class="addonDetails" id="parcelDetails"><div class="row"><div class="col"><input id="par_carrier" placeholder="Carrier" /></div><div class="col"><input id="par_details" placeholder="Details" /></div></div></div>
-              </div>
-            </div>
-            <div class="checkrow">
-              <input id="addon_bulky" type="checkbox" />
-              <div style="flex:1;"><div style="font-weight:1000;">Bulky / heavy items</div>
-                <div class="addonDetails" id="bulkyDetails"><input id="bulky_notes" placeholder="Cases of water, large items, pet food, etc." /></div>
-              </div>
-            </div>
-            <div>
-              <label for="ord_optionalNotes">Additional notes</label>
-              <textarea id="ord_optionalNotes" placeholder="Delivery notes, preferred brands, accessibility notes, other errands, etc."></textarea>
-            </div>
-          </div>
-        </div>
-      </div>
-    </form>
-  </section>
-
-  <section id="panel-account" class="card hidden">
-    <h2>Create Account / Edit Profile</h2>
-    <div class="muted">Complete this once. Your saved contact details, address, and defaults will auto-fill future orders.</div>
-    <div class="hr"></div>
-    <div class="notice warn" id="acctGate" style="display:none;">
-      <div style="font-weight:1000;">Action required</div>
-      <div class="mini" id="acctGateMsg" style="margin-top:6px;"></div>
-      <div class="row" style="margin-top:10px;"><button class="btn primary small" id="acctGateBtn" type="button">Continue</button></div>
-    </div>
-
-    <form id="acctForm">
-      <div class="split">
-        <div class="card" style="box-shadow:none;background:rgba(0,0,0,.16);">
-          <div style="font-weight:1000;font-size:18px;">Contact</div><div class="hr"></div>
-          <div class="row"><div class="col"><label for="acc_fullName">Full legal name<span class="req">*</span></label><input id="acc_fullName" required /></div><div class="col"><label for="acc_preferredName">Preferred name</label><input id="acc_preferredName" /></div></div>
-          <div class="row"><div class="col"><label for="acc_phone">Phone<span class="req">*</span></label><input id="acc_phone" required /></div><div class="col"><label for="acc_altPhone">Alternate phone</label><input id="acc_altPhone" /></div></div>
-          <div class="row">
-            <div class="col"><label for="acc_contactPref">Contact preference<span class="req">*</span></label><select id="acc_contactPref" required><option value="">Select…</option><option value="Text">Text</option><option value="Phone call">Phone call</option><option value="Email">Email</option></select></div>
-            <div class="col"><label>&nbsp;</label><div class="checkrow"><input id="acc_contactAuth" type="checkbox" /><div><div style="font-weight:1000;">Authorize contact<span class="req">*</span></div><div class="mini">Required for substitutions and delivery coordination.</div></div></div></div>
-          </div>
-          <div class="hr"></div>
-          <div style="font-weight:1000;font-size:18px;">Saved Defaults</div>
-          <div class="row"><div class="col"><label for="acc_subsDefault">Default substitutions</label><select id="acc_subsDefault"><option value="">(none)</option><option value="Allow substitutions">Allow substitutions</option><option value="No substitutions">No substitutions</option><option value="Text/call me for substitutions">Text/call me for substitutions</option></select></div><div class="col"><label for="acc_dropoffDefault">Default drop-off</label><select id="acc_dropoffDefault"><option value="">(none)</option><option value="Leave at door">Leave at door</option><option value="Knock / ring bell">Knock / ring bell</option><option value="Call on arrival">Call on arrival</option><option value="Hand to me">Hand to me</option></select></div></div>
-          <label for="acc_notes">Notes</label><textarea id="acc_notes" placeholder="Accessibility, regular preferences, account notes, etc."></textarea>
-        </div>
-
-        <div class="card" style="box-shadow:none;background:rgba(0,0,0,.16);">
-          <div style="font-weight:1000;font-size:18px;">Saved Addresses</div><div class="mini">You can save more than one address and choose a default.</div><div class="hr"></div>
-          <div id="acc_addresses" class="stack"></div>
-          <div class="row" style="margin-top:10px;"><button class="btn small" type="button" id="acc_addAddress">+ Add saved address</button><button class="btn small ghost" type="button" id="acc_loadBtn">Load Existing</button></div>
-          <div class="hr"></div>
-          <div style="font-weight:1000;font-size:18px;">Consents<span class="req">*</span></div>
-          <div class="stack">
-            <div class="checkrow"><input id="acc_consentTerms" type="checkbox" /><div><div style="font-weight:1000;">Accept Terms</div><div class="mini">Required.</div></div></div>
-            <div class="checkrow"><input id="acc_consentPrivacy" type="checkbox" /><div><div style="font-weight:1000;">Accept Privacy / data handling</div><div class="mini">Required.</div></div></div>
-            <div class="checkrow"><input id="acc_consentMarketing" type="checkbox" /><div><div style="font-weight:1000;">Marketing consent</div><div class="mini">Optional.</div></div></div>
-          </div>
-          <div class="hr"></div>
-          <div class="row"><button class="btn primary" type="submit" id="acc_saveBtn">Save Profile</button></div>
-          <div class="mini" id="acc_msg" style="margin-top:10px;"></div>
-        </div>
-      </div>
-    </form>
-  </section>
-
-  <section id="panel-memberships" class="card hidden">
-    <h2>Memberships</h2><div class="muted">Monthly memberships. Buy through Square using the buttons below.</div><div class="hr"></div>
-    <div class="mgrid">
-      <div class="mcard"><div class="mname">Standard</div><div class="mprice">$15 / month</div><ul class="mlist muted"><li>1 free add-on up to $10 OR $10 off zone fee monthly</li></ul><div class="row" style="margin-top:12px;"><a class="btn primary small" id="buyStandard" href="#" target="_blank" rel="noopener">Buy Standard</a></div></div>
-      <div class="mcard"><div class="mname">Route</div><div class="mprice">$25 / month</div><ul class="mlist muted"><li>1 free add-on up to $10 OR $10 off zone fee monthly</li><li>$5 off service fee on 1 order per run day</li></ul><div class="row" style="margin-top:12px;"><a class="btn primary small" id="buyRoute" href="#" target="_blank" rel="noopener">Buy Route</a></div></div>
-      <div class="mcard"><div class="mname">Access</div><div class="mprice">$12 / month</div><ul class="mlist muted"><li>Seniors 60+ / disabled</li><li>1 free add-on up to $10 OR $10 off zone fee per run cycle</li><li>$8 off service fee on 1 order per run day</li><li>Free phone/text ordering</li></ul><div class="row" style="margin-top:12px;"><a class="btn primary small" id="buyAccess" href="#" target="_blank" rel="noopener">Buy Access</a></div></div>
-      <div class="mcard"><div class="mname">Access Pro</div><div class="mprice">$20 / month</div><ul class="mlist muted"><li>$10 off service fee on 1 order per run day</li><li>1 prescription pickup/delivery included monthly</li><li>Document services included up to 10 pages/month in Tobermory area</li></ul><div class="row" style="margin-top:12px;"><a class="btn primary small" id="buyAccessPro" href="#" target="_blank" rel="noopener">Buy Access Pro</a></div></div>
-    </div>
-  </section>
-
-  <section id="panel-faq" class="card hidden"><h2>FAQ</h2><div class="muted">Common questions.</div></section>
-  <section id="panel-contact" class="card hidden"><h2>Contact</h2><div class="muted">Fastest ways to reach us.</div><div class="hr"></div><ul class="muted" style="margin:0; padding-left:20px;"><li>Email orders: <a href="mailto:orders@tobermorygroceryrun.ca">orders@tobermorygroceryrun.ca</a></li><li>General: <a href="mailto:info@tobermorygroceryrun.ca">info@tobermorygroceryrun.ca</a></li></ul></section>
-
-  <footer>© <span id="year"></span> Tobermory Grocery Run • Candy red / light grey / black</footer>
-</main>
+  </div>
+</div>
 
 <script>
-  const BACKEND = "https://api.tobermorygroceryrun.ca";
-  const API_ME = BACKEND + "/api/me";
-  const API_RUNS = BACKEND + "/api/runs/active";
-  const API_ESTIMATOR = BACKEND + "/api/estimator";
-  const API_CONFIG = BACKEND + "/api/public/config";
-  const API_PROFILE = BACKEND + "/api/profile";
-  const API_ORDERS = BACKEND + "/api/orders";
+  const toast = (msg)=>{ const el = document.getElementById("toast"); el.textContent = msg; el.classList.add("show"); setTimeout(()=>el.classList.remove("show"), 3500); };
+  const qs = (k)=> document.getElementById(k);
+  function switchTab(tab) { qs('tabContentOrders').style.display = tab === 'orders' ? 'block' : 'none'; }
 
-  const STORES_BY_RUN = { local: ["Foodland (Tobermory)", "Foodland (Lion's Head)", "Foodland (Wiarton)"], owen: ["Walmart (Owen Sound)", "FreshCo (Owen Sound)", "Giant Tiger (Owen Sound)", "Zehrs (Owen Sound)", "Metro (Owen Sound)", "Foodland (Owen Sound)", "No Frills (Owen Sound)", "Food Basics (Owen Sound)"] };
+  const rowsEl = qs("rows"); let modalOrder = null;
+  function buildQuery(){ const p = new URLSearchParams(); const q = qs("q").value.trim(); const state = qs("state").value.trim(); const runKey = qs("runKey").value.trim(); if(q) p.set("q", q); if(state) p.set("state", state); if(runKey) p.set("runKey", runKey); p.set("limit","200"); return p.toString(); }
+  function esc(s){ return String(s||"").replaceAll("&","&amp;").replaceAll("<","&lt;").replaceAll(">","&gt;").replaceAll('"',"&quot;"); }
+  function money(n){ return Number(n||0).toFixed(2); }
 
-  let meCache = { loggedIn:false, profileComplete:false, email:"", name:"", membershipLevel:"none", membershipStatus:"inactive", isAdmin:false };
-  let cachedRuns = null; let profileCache = null; let membershipLinks = {}; let canadaPostKey = ""; let acCounter = 0;
-  let currentGroceryList = [];
-
-  // SQUARE INTEGRATION VARIABLES
-  let squarePayments = null;
-  let squareCard = null;
-
-  const tabs = [
-    { tab: "tab-home", panel: "panel-home" }, { tab: "tab-about", panel: "panel-about" }, { tab: "tab-pricing", panel: "panel-pricing" }, { tab: "tab-areas", panel: "panel-areas" }, { tab: "tab-estimator", panel: "panel-estimator" }, { tab: "tab-order", panel: "panel-order" }, { tab: "tab-ride", panel: "panel-ride" }, { tab: "tab-account", panel: "panel-account" }, { tab: "tab-memberships", panel: "panel-memberships" }, { tab: "tab-faq", panel: "panel-faq" }, { tab: "tab-contact", panel: "panel-contact" }
-  ];
-
-  const qs = (id) => document.getElementById(id); const qsa = (sel, root=document) => Array.from(root.querySelectorAll(sel));
-
-  function selectTab(tabId){
-    tabs.forEach(t => {
-      const tabEl = qs(t.tab); const panelEl = qs(t.panel); if (!tabEl || !panelEl) return;
-      const active = (t.tab === tabId); tabEl.setAttribute("aria-selected", active ? "true" : "false"); panelEl.classList.toggle("hidden", !active);
-    });
-    window.scrollTo({ top: 0, behavior: "smooth" });
-  }
-  tabs.forEach(t => { const el = qs(t.tab); if (!el) return; el.addEventListener("click", () => selectTab(t.tab)); });
-
-  function initOfflineBanner(){ const banner = qs("netBanner"); const sync = () => { banner.style.display = navigator.onLine ? "none" : "block"; }; window.addEventListener("online", sync); window.addEventListener("offline", sync); sync(); }
-  async function copyText(text){ try { await navigator.clipboard.writeText(String(text || "")); return true; } catch { return false; } }
-
-  async function getMe(){ try{ const r = await fetch(API_ME, { credentials:"include" }); const d = await r.json().catch(()=>({})); if (r.ok && d.ok) meCache = d; return d; } catch { return {}; } }
-
-  function loadCanadaPostScript(key) {
-    if (document.getElementById("pca-script")) return;
-    const css = document.createElement("link"); css.rel = "stylesheet"; css.href = `https://ws1.postescanada-canadapost.ca/css/addresscomplete-2.50.min.css?key=${encodeURIComponent(key)}`; document.head.appendChild(css);
-    const script = document.createElement("script"); script.id = "pca-script"; script.src = `https://ws1.postescanada-canadapost.ca/js/addresscomplete-2.50.min.js?key=${encodeURIComponent(key)}`; document.head.appendChild(script);
+  function render(items){
+    const list = items || []; qs("countPill").textContent = "Results: " + list.length;
+    if(!list.length){ rowsEl.innerHTML = '<tr><td colspan="7" class="muted">No results.</td></tr>'; return; }
+    rowsEl.innerHTML = list.map(o=>{
+      const id = esc(o.orderId); const cust = esc(o.customer?.fullName || ""); const phone = esc(o.customer?.phone || ""); const email = esc(o.customer?.email || ""); const addr = esc((o.address?.streetAddress||"") + ", " + (o.address?.town||"")); const run = esc(o.runKey || ""); const rt = esc(o.runType || ""); const st = esc(o.status?.state || ""); const fees = money(o.pricingSnapshot?.totalFees || 0);
+      return \`<tr><td><div style="font-weight:1000;">\${id}</div><div class="muted" style="font-size:12px;">\${email}</div></td><td><div style="font-weight:900;">\${cust}</div><div class="muted" style="font-size:12px;">\${phone}</div></td><td>\${addr}</td><td><span class="pill">\${rt}</span><div class="muted" style="font-size:12px;margin-top:4px;">\${run}</div></td><td><span class="pill">\${st}</span></td><td>$\${fees}</td><td><button class="btn" data-open="\${id}">Open</button></td></tr>\`;
+    }).join("");
+    document.querySelectorAll("[data-open]").forEach(btn=>{ btn.addEventListener("click", ()=> openOrder(btn.getAttribute("data-open"))); });
   }
 
-  // INITIALIZE SQUARE SDK
-  async function initSquare(appId, locationId, env) {
-    if (!appId || !locationId) return;
-    const script = document.createElement("script");
-    script.src = env === "production" ? "https://web.squarecdn.com/v1/square.js" : "https://sandbox.web.squarecdn.com/v1/square.js";
-    script.onload = async () => {
-      try {
-        squarePayments = window.Square.payments(appId, locationId);
-        squareCard = await squarePayments.card();
-        await squareCard.attach('#card-container');
-      } catch (e) {
-        console.error("Square initialization failed:", e);
-      }
-    };
-    document.head.appendChild(script);
-  }
+  async function search(){ rowsEl.innerHTML = '<tr><td colspan="7" class="muted">Loading…</td></tr>'; try{ const r = await fetch("/api/admin/orders?" + buildQuery(), { credentials:"include" }); const d = await r.json(); render(d.items || []); } catch(e){ rowsEl.innerHTML = '<tr><td colspan="7" class="muted">Error: ' + esc(e) + '</td></tr>'; } }
 
-  async function loadConfig(){
+  function openModal(show){ qs("modalBack").style.display = show ? "flex" : "none"; }
+  function buildAddonsText(o){ const lines = []; if (o.addOns?.generalNotes) lines.push("General notes: " + o.addOns.generalNotes); return lines.length ? lines.join("\\n") : "—"; }
+
+  async function openOrder(orderId){
     try{
-      const r = await fetch(API_CONFIG); const d = await r.json().catch(()=>({}));
-      if (r.ok && d.ok){
-        membershipLinks = d.squareMembershipLinks || {};
-        canadaPostKey = d.canadaPostKey || "";
-        if (canadaPostKey) loadCanadaPostScript(canadaPostKey);
-        
-        // Load Square Web Payments SDK
-        initSquare(d.squareAppId, d.squareLocationId, d.squareEnv);
-      }
-    } catch {}
+      const r = await fetch("/api/admin/orders/" + encodeURIComponent(orderId), { credentials:"include" }); const d = await r.json(); modalOrder = d.order;
+      qs("m_orderId").textContent = modalOrder.orderId || "—"; qs("m_customer").textContent = modalOrder.customer?.fullName || "—"; qs("m_phone").textContent = modalOrder.customer?.phone || "—"; 
+      qs("m_addr").textContent = (modalOrder.address?.streetAddress || "") + ", " + (modalOrder.address?.town || ""); qs("m_run").textContent = (modalOrder.runKey||""); qs("m_fees").textContent = "$" + money(modalOrder.pricingSnapshot?.totalFees || 0); qs("m_groceriesCurrent").textContent = modalOrder.payments?.groceries?.status || "—"; qs("m_state").value = (modalOrder.status?.state || "submitted"); qs("m_list").textContent = modalOrder.list?.groceryListText || "—"; qs("m_addons").textContent = buildAddonsText(modalOrder);
+      qs("m_finalGroceryTotal").value = "";
+      openModal(true);
+    } catch(e){ toast(String(e)); }
   }
 
-  function goLogin(returnToUrl){
-    const w = 500; const h = 600; const y = window.top.outerHeight / 2 + window.top.screenY - ( h / 2); const x = window.top.outerWidth / 2 + window.top.screenX - ( w / 2);
-    const popup = window.open(BACKEND + "/auth/google?returnTo=popup", "GoogleLogin", `width=${w},height=${h},top=${y},left=${x}`);
-    const timer = setInterval(async () => {
-      if (popup && popup.closed) {
-        clearInterval(timer); await initAuthUI();
-        if (meCache.loggedIn) { await loadProfile(); if (profileCache) populateAccountForm(profileCache); if (meCache.profileComplete) selectTab("tab-order"); else selectTab("tab-account"); }
-      }
-    }, 500);
-  }
-
-  function syncAccountTabVisibility(){ const tab = qs("tab-account"); if (!tab) return; tab.style.display = ""; tab.textContent = (meCache.loggedIn && meCache.profileComplete) ? "Edit Profile" : "Create Account"; }
-
-  function bindHeaderButtons(){
-    qs("btnSignIn").addEventListener("click", (e) => { e.preventDefault(); if (meCache.loggedIn) window.location.href = BACKEND + "/logout?returnTo=" + encodeURIComponent("https://tobermorygroceryrun.ca/"); else goLogin("https://tobermorygroceryrun.ca/"); });
-    qs("homeSignInBtn").addEventListener("click", (e) => { e.preventDefault(); goLogin("https://tobermorygroceryrun.ca/"); });
-    qs("homeMembershipBtn").addEventListener("click", (e) => { e.preventDefault(); selectTab("tab-memberships"); });
-    qs("homeEstimatorBtn").addEventListener("click", (e) => { e.preventDefault(); selectTab("tab-estimator"); });
-    qs("homeOrderBtn").addEventListener("click", async (e) => { e.preventDefault(); await getMe(); if (!meCache.loggedIn) return goLogin("https://tobermorygroceryrun.ca/?tab=account"); if (!meCache.profileComplete) return selectTab("tab-account"); selectTab("tab-order"); });
-    qs("goMemberBtn").addEventListener("click", (e) => { e.preventDefault(); if (!meCache.loggedIn) return goLogin("https://tobermorygroceryrun.ca/"); window.location.href = BACKEND + "/member"; });
-    qs("est_goOrderBtn").addEventListener("click", (e) => { e.preventDefault(); selectTab("tab-order"); });
-  }
-
-  async function initAuthUI(){
-    await getMe(); const signIn = qs("btnSignIn"); const member = qs("btnMember"); const admin = qs("btnAdmin");
-    if (meCache.loggedIn){
-      signIn.classList.remove("secondary"); signIn.classList.add("ghost"); signIn.textContent = "Log out";
-      member.style.display = ""; member.href = BACKEND + "/member"; member.textContent = "Member Portal";
-      if (meCache.isAdmin){ admin.style.display = ""; admin.href = BACKEND + "/admin"; admin.textContent = "Admin"; } else { admin.style.display = "none"; }
-    } else {
-      signIn.classList.add("secondary"); signIn.classList.remove("ghost"); signIn.textContent = "Sign In";
-      member.style.display = "none"; admin.style.display = "none";
-    }
-    syncAccountTabVisibility();
-  }
-
-  function initMembershipLinks(){
-    if (qs("buyStandard")) qs("buyStandard").href = membershipLinks.standard || "#"; if (qs("buyRoute")) qs("buyRoute").href = membershipLinks.route || "#"; if (qs("buyAccess")) qs("buyAccess").href = membershipLinks.access || "#"; if (qs("buyAccessPro")) qs("buyAccessPro").href = membershipLinks.accesspro || "#";
-  }
-
-  function renderRunsHome(runs){
-    if (!runs) return; const local = runs.local || {}; const owen = runs.owen || {};
-    qs("homeLocalKey").textContent = local.runKey || "—"; qs("homeLocalWindow").textContent = "Opens: " + (local.opensAtLocal || "—") + " • Cutoff: " + (local.cutoffAtLocal || "—"); qs("homeLocalOpen").textContent = local.isOpen ? "OPEN ✅" : "CLOSED"; qs("homeLocalSlots").textContent = "Capacity: " + (local.bookedPoints || 0) + "/" + (local.maxPoints || 10) + " Points"; qs("homeLocalMin").textContent = local.minimumText || "—"; qs("homeLocalCount").textContent = "Orders: " + (local.bookedOrdersCount ?? "—"); qs("homeLocalFees").textContent = "Fees: $" + Number(local.bookedFeesTotal || 0).toFixed(2);
-    qs("homeOwenKey").textContent = owen.runKey || "—"; qs("homeOwenWindow").textContent = "Opens: " + (owen.opensAtLocal || "—") + " • Cutoff: " + (owen.cutoffAtLocal || "—"); qs("homeOwenOpen").textContent = owen.isOpen ? "OPEN ✅" : "CLOSED"; qs("homeOwenSlots").textContent = "Capacity: " + (owen.bookedPoints || 0) + "/" + (owen.maxPoints || 10) + " Points"; qs("homeOwenMin").textContent = owen.minimumText || "—"; qs("homeOwenCount").textContent = "Orders: " + (owen.bookedOrdersCount ?? "—"); qs("homeOwenFees").textContent = "Fees: $" + Number(owen.bookedFeesTotal || 0).toFixed(2);
-    qs("homeRunsHint").textContent = (!!local.isOpen || !!owen.isOpen) ? "At least one run is currently open for ordering." : "No run is open for ordering.";
-    if (local.runKey){ qs("homeLocalKey").style.cursor = "pointer"; qs("homeLocalKey").onclick = async () => { await copyText(local.runKey); }; }
-    if (owen.runKey){ qs("homeOwenKey").style.cursor = "pointer"; qs("homeOwenKey").onclick = async () => { await copyText(owen.runKey); }; }
-    updateEstimatorRunHint(); updateOrderRunStatus();
-  }
-
-  async function loadRuns(){ try{ const r = await fetch(API_RUNS, { credentials:"include" }); const d = await r.json().catch(()=>({})); if (!r.ok || d.ok === false) throw new Error(d.error || "Runs unavailable"); cachedRuns = d.runs || null; renderRunsHome(cachedRuns); } catch { qs("homeRunsHint").textContent = "Runs unavailable right now."; } }
-
-  function dollars(n){ return "$" + Number(n || 0).toFixed(2); }
-
-  function buildEstimatorPayload(){
-    const extraStoresCount = Number(qs("est_extraStoresCount").value || 0); const extraStores = Array.from({ length: Math.max(0, extraStoresCount) }, (_, i) => "Stop " + (i + 1));
-    return { zone: qs("est_zone").value, runType: qs("est_runType").value, memberTier: qs("est_memberTier").value, applyPerk: qs("est_applyPerk").value, extraStores, addon_printing: qs("est_printing").value, printPages: Number(qs("est_printPages").value || 0), grocerySubtotal: Number(qs("est_grocerySubtotal").value || 0) };
-  }
-
-  function updateEstimatorRunHint(){
-    const hint = qs("est_runHint"); const rt = qs("est_runType").value; if (!hint) return; if (!cachedRuns || !cachedRuns[rt]){ hint.textContent = ""; return; } const rr = cachedRuns[rt];
-    hint.textContent = "Cutoff: " + (rr.cutoffAtLocal || "—") + " • Capacity Points: " + (rr.bookedPoints || 0) + "/" + (rr.maxPoints || 10);
-  }
-
-  async function runEstimator(){
-    qs("est_msg").textContent = "Calculating…";
-    try{
-      const r = await fetch(API_ESTIMATOR, { method:"POST", headers:{ "Content-Type":"application/json" }, body: JSON.stringify(buildEstimatorPayload()) }); const d = await r.json().catch(()=>({}));
-      if (!r.ok || d.ok === false) throw new Error(d.error || "Estimator failed"); const t = d.breakdown?.totals || {};
-      qs("est_serviceFee").textContent = "Service: " + dollars(t.serviceFee); qs("est_zoneFee").textContent = "Zone: " + dollars(t.zoneFee); qs("est_runFee").textContent = "Run: " + dollars(t.runFee); qs("est_addOns").textContent = "Add-ons: " + dollars(t.addOnsFees); qs("est_surcharges").textContent = "Surcharges: " + dollars(t.surcharges); qs("est_discount").textContent = "Discount: -" + dollars(t.discount); qs("est_total").textContent = "Total Fees: " + dollars(t.totalFees); qs("est_msg").textContent = "Estimate complete ✅";
-    } catch (e){ qs("est_msg").textContent = String(e.message || e); }
-  }
-
-  function bindEstimatorUI(){ qs("est_calcBtn").addEventListener("click", runEstimator); qs("est_runType").addEventListener("change", updateEstimatorRunHint); }
-
-  function nextAcId(prefix){ acCounter += 1; return prefix + "_" + acCounter; }
-
-  const initAcDelegator = (e) => {
-    if (e.target && e.target.classList.contains("addr_lookup")) {
-      const lookupEl = e.target; if (lookupEl.dataset.acBound === "1") return; if (!canadaPostKey || typeof pca === "undefined" || !pca.Address) return;
-      const lookupId = lookupEl.id; let streetId, unitId, townId, postalId;
-      if (lookupId === "ord_lookup") { streetId = "ord_street"; unitId = "ord_unit"; townId = "ord_town"; postalId = "ord_postal"; } else { const prefix = lookupId.replace("_lookup", ""); streetId = prefix + "_street"; unitId = prefix + "_unit"; townId = prefix + "_town"; postalId = prefix + "_postal"; }
-      try {
-        const fields = [ { element: lookupId, field: "", mode: pca.fieldMode.SEARCH }, { element: streetId, field: "Line1", mode: pca.fieldMode.POPULATE }, { element: unitId, field: "Line2", mode: pca.fieldMode.POPULATE }, { element: townId, field: "City", mode: pca.fieldMode.POPULATE }, { element: postalId, field: "PostalCode", mode: pca.fieldMode.POPULATE } ];
-        const options = { key: canadaPostKey, countries: { codesList: "CAN" } }; const control = new pca.Address(fields, options); control.listen("load", function() { control.setCountry("CAN"); }); lookupEl.dataset.acBound = "1"; lookupEl._pcaControl = control;
-      } catch (err) { console.error("AddressComplete Error:", err); }
-    }
-  };
-  document.addEventListener("focusin", initAcDelegator, true); document.addEventListener("click", initAcDelegator, true);
-
-  let acTimeout; function hideAc() { qs("autocompleteDropdown").style.display = "none"; }
-  async function doCatalogueSearch(q) { if(q.length < 2) { hideAc(); return; } try { const r = await fetch(BACKEND + "/api/public/catalogue/search?q=" + encodeURIComponent(q)); const d = await r.json(); if(r.ok && d.ok) renderAc(d.items || []); } catch(e) { hideAc(); } }
-  function renderAc(items) { const dd = qs("autocompleteDropdown"); if(!items.length) { hideAc(); return; } dd.innerHTML = items.map(i => `<div class="ac-item" onclick="selectAcItem('${i.name.replace(/'/g,"\\'").replace(/"/g,"&quot;")}', ${i.estimatedPrice})"><div style="font-weight:900;">${i.name}</div><div class="mini">${i.category} • $${Number(i.estimatedPrice).toFixed(2)}</div></div>`).join(""); dd.style.display = "block"; }
-  window.selectAcItem = function(name, price) { addGroceryItem(name, price); qs("itemSearchInput").value = ""; hideAc(); };
-  function addGroceryItem(name, price) { currentGroceryList.push({ id: Math.random().toString(36).substr(2,9), name: name, price: Number(price) || 0 }); updateGroceryUI(); }
-  window.removeGroceryItem = function(id) { currentGroceryList = currentGroceryList.filter(i => i.id !== id); updateGroceryUI(); };
-  function updateGroceryUI() { const wrap = qs("groceryListItems"); if(!currentGroceryList.length) { wrap.innerHTML = ""; } else { wrap.innerHTML = currentGroceryList.map(i => `<div class="checkrow" style="justify-content:space-between; align-items:center;"><div><div style="font-weight:900;">${i.name}</div>${i.price > 0 ? `<div class="mini">$${i.price.toFixed(2)}</div>` : `<div class="mini">Custom / Unpriced</div>`}</div><button type="button" class="btn small ghost" onclick="removeGroceryItem('${i.id}')">Remove</button></div>`).join(""); } const total = currentGroceryList.reduce((sum, i) => sum + i.price, 0); qs("uiGroceryTotal").textContent = "$" + total.toFixed(2); qs("ord_grocerySubtotal").value = total.toFixed(2); qs("ord_groceryList").value = currentGroceryList.map(i => `• ${i.name}`).join("\n"); }
-
-  function fillPrimaryStores(){ const sel = qs("ord_primaryStore"); const runType = qs("ord_runType").value || "local"; const current = sel.value; const items = STORES_BY_RUN[runType] || []; sel.innerHTML = '<option value="">Select…</option>'; items.forEach(item => { const o = document.createElement("option"); o.value = item; o.textContent = item; sel.appendChild(o); }); if (items.includes(current)) sel.value = current; }
-  function addExtraStoreRow(value=""){ const wrap = qs("extraStoresWrap"); const card = document.createElement("div"); card.className = "storeCard"; card.innerHTML = `<div class="row" style="justify-content:space-between;"><div style="font-weight:1000;">Extra stop</div><button class="btn small ghost" type="button">Remove</button></div><label style="margin-top:10px;">Store / stop name</label><input placeholder="e.g., LCBO Wiarton, pharmacy, post office" value="${String(value).replace(/"/g, '&quot;')}" />`; card.querySelector("button").addEventListener("click", () => card.remove()); wrap.appendChild(card); }
-  function getExtraStores(){ return qsa("#extraStoresWrap input").map(i => String(i.value || "").trim()).filter(Boolean); }
-  function bindAddonToggle(chkId, detailsId){ const chk = qs(chkId); const details = qs(detailsId); if(chk && details) { const sync = () => details.classList.toggle("show", chk.checked); chk.addEventListener("change", sync); sync(); } }
-
-  function updateOrderRunStatus(){ const el = qs("ord_runStatus"); const btn = qs("ord_submitBtn"); const rt = qs("ord_runType").value || "local"; if (!cachedRuns || !cachedRuns[rt]){ el.textContent = "Run info unavailable."; btn.disabled = true; return; } const rr = cachedRuns[rt]; el.textContent = `${rt.toUpperCase()} • ${rr.isOpen ? "OPEN ✅" : "CLOSED"} • Capacity Points: ${rr.bookedPoints || 0}/${rr.maxPoints || 10} • Cutoff: ${rr.cutoffAtLocal || "—"}`; btn.disabled = !rr.isOpen; }
-
-  async function estimateOrderFees(){
-    const msg = qs("ord_msg");
-    try{
-      const zone = qs("ord_zone").value; if (!zone) throw new Error("Select a zone first."); msg.textContent = "Estimating…";
-      const r = await fetch(API_ESTIMATOR, { method:"POST", headers:{ "Content-Type":"application/json" }, body: JSON.stringify({ zone, runType: qs("ord_runType").value, memberTier: qs("ord_memberTier").value, applyPerk: "yes", extraStores: getExtraStores(), addon_printing: qs("addon_printing").checked ? "yes" : "no", printPages: Number(qs("addon_printPages").value || 0), grocerySubtotal: Number(qs("ord_grocerySubtotal").value || 0) }) });
-      const d = await r.json().catch(()=>({})); if (!r.ok || d.ok === false) throw new Error(d.error || "Estimator failed");
-      qs("ord_feePreview").textContent = "Estimated fees: " + dollars(d.breakdown?.totals?.totalFees ?? 0); msg.textContent = "Estimate updated ✅";
-    } catch (e){ msg.textContent = String(e.message || e); }
-  }
-
-  function buildOrderGate(message, buttonText, action, showAccount=false){ qs("orderGate").style.display = ""; qs("orderGateMsg").textContent = message; qs("orderGateBtn").textContent = buttonText; qs("orderGateBtn").onclick = action; qs("orderGateGoAccount").style.display = showAccount ? "" : "none"; qs("orderGateGoAccount").onclick = () => selectTab("tab-account"); }
-  function hideOrderGate(){ qs("orderGate").style.display = "none"; }
-
-  async function loadProfile(){ if (!meCache.loggedIn){ profileCache = null; return null; } try{ const r = await fetch(API_PROFILE, { credentials:"include" }); const d = await r.json().catch(()=>({})); if (!r.ok || d.ok === false) return null; profileCache = d.profile || {}; return d; } catch { return null; } }
-
-  function renderProfileSummary(){
-    const strip = qs("orderProfileStrip"); if (!meCache.loggedIn || !profileCache || !Array.isArray(profileCache.addresses) || !profileCache.addresses.length){ strip.style.display = "none"; return; }
-    strip.style.display = ""; const defaultId = String(profileCache.defaultId || ""); const addresses = profileCache.addresses || []; const selected = defaultId ? (addresses.find(a => String(a.id) === defaultId) || addresses[0]) : addresses[0];
-    const name = profileCache.fullName || meCache.name || ""; const phone = profileCache.phone || "";
-    qs("orderProfileSummary").textContent = `${name} • ${phone}${selected ? " • " + (selected.streetAddress || "") + ", " + (selected.town || "") + " " + (selected.postalCode || "") : ""}`;
-    const sel = qs("ord_savedAddress"); sel.innerHTML = ""; addresses.forEach(a => { const o = document.createElement("option"); o.value = a.id; o.textContent = `${a.label || "Saved address"} — ${a.streetAddress || ""}, ${a.town || ""} ${a.postalCode || ""}`; sel.appendChild(o); });
-    if (selected?.id) sel.value = selected.id;
-  }
-
-  function applySavedAddressToOrder(addressId){ if (!profileCache || !Array.isArray(profileCache.addresses)) return; const a = (profileCache.addresses || []).find(x => String(x.id) === String(addressId)) || profileCache.addresses[0]; if (!a) return; qs("ord_town").value = a.town || ""; qs("ord_street").value = a.streetAddress || ""; qs("ord_unit").value = a.unit || ""; qs("ord_postal").value = a.postalCode || ""; qs("ord_zone").value = a.zone || ""; }
-
-  async function prefillOrderFromProfile(){
-    if (!meCache.loggedIn || !profileCache) return;
-    qs("ord_name").value = profileCache.fullName || meCache.name || ""; qs("ord_phone").value = profileCache.phone || ""; qs("ord_email").value = meCache.email || "";
-    if (profileCache.contactPref) qs("ord_contactPref").value = profileCache.contactPref; if (profileCache.subsDefault) qs("ord_subsPref").value = profileCache.subsDefault; if (profileCache.dropoffDefault) qs("ord_dropoffPref").value = profileCache.dropoffDefault;
-    if (meCache.membershipLevel && meCache.membershipLevel !== "none"){ qs("ord_memberTier").value = meCache.membershipLevel; }
-    renderProfileSummary(); const selectedId = qs("ord_savedAddress").value || profileCache.defaultId || ""; if (selectedId) applySavedAddressToOrder(selectedId);
-  }
-
-  async function submitOrder(e){
-    e.preventDefault(); const msg = qs("ord_msg"); const btn = qs("ord_submitBtn"); msg.textContent = "";
-    try{
-      await getMe();
-      if (!meCache.loggedIn){ buildOrderGate("Sign-in required to place an order.", "Sign In", () => goLogin("https://tobermorygroceryrun.ca/?tab=account")); return; }
-      if (!meCache.profileComplete){ buildOrderGate("Please complete Create Account first.", "Go to Create Account", () => selectTab("tab-account"), true); return; }
-      hideOrderGate();
-
-      if (!qs("consent_terms").checked || !qs("consent_accuracy").checked || !qs("consent_dropoff").checked) throw new Error("All required consents must be checked.");
-      const groceryList = qs("ord_groceryList").value.trim(); if (!groceryList) throw new Error("Grocery list is empty.");
-      if (!qs("ord_primaryStore").value.trim() || !qs("ord_zone").value.trim() || !qs("ord_town").value.trim() || !qs("ord_street").value.trim() || !qs("ord_postal").value.trim()) throw new Error("Please fill all required store and address fields.");
-
-      btn.disabled = true; msg.textContent = "Authorizing payment… please wait.";
-
-      // SECURE CARD TOKENIZATION
-      let paymentSourceId = "";
-      if (squareCard) {
-        const result = await squareCard.tokenize();
-        if (result.status === 'OK') {
-          paymentSourceId = result.token;
-        } else {
-          throw new Error("Payment error: " + (result.errors[0]?.message || "Check card details."));
-        }
-      } else {
-        throw new Error("Payment system not loaded. Please refresh.");
-      }
-
-      const fd = new FormData();
-      fd.append("orderClass", "grocery"); fd.append("paymentSourceId", paymentSourceId);
-      fd.append("fullName", qs("ord_name").value.trim()); fd.append("phone", qs("ord_phone").value.trim());
-      fd.append("town", qs("ord_town").value.trim()); fd.append("streetAddress", qs("ord_street").value.trim()); fd.append("unit", qs("ord_unit").value.trim()); fd.append("postalCode", qs("ord_postal").value.trim()); fd.append("zone", qs("ord_zone").value.trim());
-      fd.append("runType", qs("ord_runType").value.trim()); fd.append("primaryStore", qs("ord_primaryStore").value.trim()); fd.append("groceryList", groceryList);
-      fd.append("dropoffPref", qs("ord_dropoffPref").value.trim()); fd.append("subsPref", qs("ord_subsPref").value.trim()); fd.append("contactPref", qs("ord_contactPref").value.trim());
-      fd.append("consent_terms", "yes"); fd.append("consent_accuracy", "yes"); fd.append("consent_dropoff", "yes");
-      fd.append("extraStores", JSON.stringify(getExtraStores())); fd.append("grocerySubtotal", String(Number(qs("ord_grocerySubtotal").value || 0))); fd.append("memberTier", qs("ord_memberTier").value || ""); fd.append("applyPerk", "yes");
-      fd.append("dob", qs("ord_dob").value || ""); fd.append("altPhone", "");
-      fd.append("addon_prescription", qs("addon_prescription").checked ? "yes" : "no"); fd.append("prescriptionPharmacy", qs("presc_pharmacy").value || ""); fd.append("prescriptionNotes", qs("presc_notes").value || "");
-      fd.append("addon_liquor", qs("addon_liquor").checked ? "yes" : "no"); fd.append("liquorStore", qs("liq_store").value || ""); fd.append("liquorNotes", qs("liq_notes").value || "");
-      fd.append("addon_printing", qs("addon_printing").checked ? "yes" : "no"); fd.append("printPages", String(Number(qs("addon_printPages").value || 0))); fd.append("printingNotes", qs("addon_printNotes").value || "");
-      fd.append("addon_fastfood", qs("addon_fastfood").checked ? "yes" : "no"); fd.append("fastFoodRestaurant", qs("ff_rest").value || ""); fd.append("fastFoodOrder", qs("ff_order").value || "");
-      fd.append("addon_parcel", qs("addon_parcel").checked ? "yes" : "no"); fd.append("parcelCarrier", qs("par_carrier").value || ""); fd.append("parcelDetails", qs("par_details").value || "");
-      fd.append("addon_bulky", qs("addon_bulky").checked ? "yes" : "no"); fd.append("bulkyDetails", qs("bulky_notes").value || "");
-      fd.append("optionalNotes", qs("ord_optionalNotes").value || "");
-      fd.append("gateCode", qs("ord_gateCode").value || ""); fd.append("buildingAccessNotes", qs("ord_accessNotes").value || ""); fd.append("parkingNotes", qs("ord_parkingNotes").value || ""); fd.append("budgetCap", String(Number(qs("ord_budgetCap").value || 0))); fd.append("receiptPreference", qs("ord_receiptPref").value || ""); fd.append("photoProofOk", qs("ord_photoProofOk").checked ? "yes" : "no");
-      const file = qs("ord_groceryFile").files?.[0]; if (file) fd.append("groceryFile", file, file.name);
-
-      const r = await fetch(API_ORDERS, { method:"POST", body: fd, credentials:"include" });
-      const d = await r.json().catch(()=>({}));
-      if (!r.ok || d.ok === false) throw new Error(d.error || "Order failed");
-
-      msg.textContent = `Order submitted ✅ Order ID: ${d.orderId}`;
-      setTimeout(() => { window.location.href = BACKEND + "/member"; }, 900);
-    } catch (e){ msg.textContent = String(e.message || e); } finally { btn.disabled = false; }
-  }
-
-  async function submitRide(e) {
-    e.preventDefault(); const msg = qs("ride_msg"); const btn = qs("ride_submitBtn"); msg.textContent = "";
+  qs("m_captureBtn").addEventListener("click", async () => {
+    if(!modalOrder?.orderId) return;
+    const finalGroc = qs("m_finalGroceryTotal").value;
+    if(!finalGroc) return toast("Enter the exact grocery total from the receipt.");
+    if(!confirm("Capture exact payment and dispatch driver?")) return;
     try {
-      await getMe();
-      if (!meCache.loggedIn) { alert("Please Sign In or Create an Account first!"); goLogin("https://tobermorygroceryrun.ca/?tab=account"); return; }
-      if (!qs("ride_consent").checked) throw new Error("Terms consent is required.");
+      const r = await fetch("/api/admin/orders/" + encodeURIComponent(modalOrder.orderId) + "/capture", {
+        method: "POST", headers:{ "Content-Type":"application/json" }, credentials: "include",
+        body: JSON.stringify({ finalGroceryTotal: Number(finalGroc) })
+      });
+      const d = await r.json();
+      if(!r.ok || d.ok===false) throw new Error(d.error || "Capture failed");
+      toast("Payment captured & customer notified! ✅");
+      await openOrder(modalOrder.orderId); await search();
+    } catch(e) { toast(String(e.message||e)); }
+  });
 
-      btn.disabled = true; msg.textContent = "Submitting Ride Request…";
+  async function saveStatus(){ if(!modalOrder?.orderId) return; try{ await fetch("/api/admin/orders/" + encodeURIComponent(modalOrder.orderId) + "/status", { method:"POST", headers:{ "Content-Type":"application/json" }, credentials:"include", body: JSON.stringify({ state: qs("m_state").value }) }); toast("Status saved ✅"); await search(); } catch(e){ toast(String(e)); } }
+  qs("closeModal").addEventListener("click", ()=> openModal(false)); qs("searchBtn").addEventListener("click", search); qs("clearBtn").addEventListener("click", ()=>{ qs("q").value=""; qs("runKey").value=""; search(); }); qs("m_saveState").addEventListener("click", saveStatus);
+  search();
 
-      const fd = new FormData();
-      fd.append("orderClass", "ride");
-      fd.append("runType", qs("ride_runType").value); fd.append("ridePickup", qs("ride_pickup").value.trim()); fd.append("rideDestination", qs("ride_dest").value.trim()); fd.append("rideWindow", qs("ride_window").value.trim()); fd.append("rideNotes", qs("ride_notes").value.trim());
-      fd.append("fullName", qs("ride_name").value.trim()); fd.append("phone", qs("ride_phone").value.trim()); fd.append("consent_terms", "yes"); fd.append("consent_accuracy", "yes");
+// =========================
+// ROOT + BOOT
+// =========================
+app.get("/", (_req, res) => res.send("TGR backend up"));
 
-      const r = await fetch(API_ORDERS, { method:"POST", body: fd, credentials:"include" });
-      const d = await r.json().catch(()=>({}));
-      if (!r.ok || d.ok === false) throw new Error(d.error || "Booking failed");
+async function main() {
+  await mongoose.connect(MONGODB_URI);
+  console.log("Connected to MongoDB");
+  app.listen(PORT, () => console.log("Server running on port", PORT));
+}
 
-      msg.textContent = `Ride booked ✅ Order ID: ${d.orderId}`;
-      setTimeout(() => { window.location.href = BACKEND + "/member"; }, 900);
-    } catch (e) { msg.textContent = String(e.message || e); } finally { btn.disabled = false; }
-  }
-
-  function addressCardTemplate(address={}, isDefault=false){
-    const uid = nextAcId("addr"); const lookupId = uid + "_lookup"; const labelId = uid + "_label"; const zoneId = uid + "_zone"; const townId = uid + "_town"; const postalId = uid + "_postal"; const streetId = uid + "_street"; const unitId = uid + "_unit"; const instructionsId = uid + "_instructions"; const gateId = uid + "_gate";
-    const label = String(address.label || ""); const town = String(address.town || ""); const streetAddress = String(address.streetAddress || ""); const unit = String(address.unit || ""); const postalCode = String(address.postalCode || ""); const zone = String(address.zone || ""); const instructions = String(address.instructions || ""); const gateCode = String(address.gateCode || ""); const storedId = String(address.id || "");
-    const wrapper = document.createElement("div"); wrapper.className = "addressCard"; wrapper.dataset.addrId = storedId || uid;
-    wrapper.innerHTML = `<div class="row" style="justify-content:space-between;"><div style="font-weight:1000;">Saved address</div><div class="row"><label class="checkrow" style="padding:6px 10px; align-items:center;"><input type="radio" name="acc_default_address" ${isDefault ? "checked" : ""}><div class="mini" style="margin:0;">Default</div></label><button class="btn small ghost" type="button">Remove</button></div></div><label for="${lookupId}">Address lookup (Canada Post)</label><input id="${lookupId}" class="addr_lookup" placeholder="Start typing your street address" autocomplete="off" /><div class="mini">Selecting a suggestion fills street, unit, town, and postal code.</div><div class="row"><div class="col"><label for="${labelId}">Label</label><input id="${labelId}" class="addr_label" value="${label.replace(/"/g,'&quot;')}" placeholder="Home, cottage, rental" /></div><div class="col"><label for="${zoneId}">Zone<span class="req">*</span></label><select id="${zoneId}" class="addr_zone"><option value="">Select…</option><option value="A" ${zone==="A" ? "selected" : ""}>Zone A</option><option value="B" ${zone==="B" ? "selected" : ""}>Zone B</option><option value="C" ${zone==="C" ? "selected" : ""}>Zone C</option><option value="D" ${zone==="D" ? "selected" : ""}>Zone D</option></select></div></div><div class="row"><div class="col"><label for="${townId}">Town / City<span class="req">*</span></label><input id="${townId}" class="addr_town" list="townSuggestions" value="${town.replace(/"/g,'&quot;')}" placeholder="Town / city" /></div><div class="col"><label for="${postalId}">Postal Code<span class="req">*</span></label><input id="${postalId}" class="addr_postal" value="${postalCode.replace(/"/g,'&quot;')}" placeholder="N0H 2R0" /></div></div><div class="row"><div class="col"><label for="${streetId}">Street Address<span class="req">*</span></label><input id="${streetId}" class="addr_street" value="${streetAddress.replace(/"/g,'&quot;')}" placeholder="123 Main St" /></div><div class="col"><label for="${unitId}">Unit / Apt</label><input id="${unitId}" class="addr_unit" value="${unit.replace(/"/g,'&quot;')}" placeholder="Optional" /></div></div><label for="${instructionsId}">Delivery instructions</label><input id="${instructionsId}" class="addr_instructions" value="${instructions.replace(/"/g,'&quot;')}" placeholder="Optional" /><label for="${gateId}">Gate / buzzer code</label><input id="${gateId}" class="addr_gate" value="${gateCode.replace(/"/g,'&quot;')}" placeholder="Optional" />`;
-    const removeBtn = wrapper.querySelector("button"); removeBtn.addEventListener("click", () => { wrapper.remove(); const cards = qsa("#acc_addresses .addressCard"); if (cards.length && !qsa('input[name="acc_default_address"]:checked').length){ cards[0].querySelector('input[type="radio"]').checked = true; } });
-    return wrapper;
-  }
-
-  function addAddressCard(address={}, isDefault=false){ qs("acc_addresses").appendChild(addressCardTemplate(address, isDefault)); }
-
-  function populateAccountForm(profile){
-    qs("acc_fullName").value = profile?.fullName || meCache.name || ""; qs("acc_preferredName").value = profile?.preferredName || ""; qs("acc_phone").value = profile?.phone || ""; qs("acc_altPhone").value = profile?.altPhone || ""; qs("acc_contactPref").value = profile?.contactPref || ""; qs("acc_contactAuth").checked = !!profile?.contactAuth; qs("acc_subsDefault").value = profile?.subsDefault || ""; qs("acc_dropoffDefault").value = profile?.dropoffDefault || ""; qs("acc_notes").value = profile?.notes || ""; qs("acc_consentTerms").checked = !!profile?.consentTerms; qs("acc_consentPrivacy").checked = !!profile?.consentPrivacy; qs("acc_consentMarketing").checked = !!profile?.consentMarketing;
-    qs("acc_addresses").innerHTML = ""; const addresses = Array.isArray(profile?.addresses) ? profile.addresses : []; const defId = String(profile?.defaultId || "");
-    if (addresses.length){ addresses.forEach((a, idx) => addAddressCard(a, defId ? String(a.id) === defId : idx === 0)); } else { addAddressCard({}, true); }
-  }
-
-  function buildProfilePayload(){
-    const cards = qsa("#acc_addresses .addressCard"); const checkedDefault = qsa('input[name="acc_default_address"]:checked')[0];
-    const addresses = cards.map(card => { return { id: card.dataset.addrId || ("addr_" + Math.random().toString(36).slice(2, 10)), label: card.querySelector(".addr_label").value.trim(), town: card.querySelector(".addr_town").value.trim(), zone: card.querySelector(".addr_zone").value.trim(), streetAddress: card.querySelector(".addr_street").value.trim(), unit: card.querySelector(".addr_unit").value.trim(), postalCode: card.querySelector(".addr_postal").value.trim(), instructions: card.querySelector(".addr_instructions").value.trim(), gateCode: card.querySelector(".addr_gate").value.trim() }; });
-    let defaultId = ""; if (checkedDefault){ const holder = checkedDefault.closest(".addressCard"); defaultId = holder?.dataset.addrId || ""; }
-    return { fullName: qs("acc_fullName").value.trim(), preferredName: qs("acc_preferredName").value.trim(), phone: qs("acc_phone").value.trim(), altPhone: qs("acc_altPhone").value.trim(), contactPref: qs("acc_contactPref").value.trim(), contactAuth: qs("acc_contactAuth").checked ? "yes" : "no", subsDefault: qs("acc_subsDefault").value.trim(), dropoffDefault: qs("acc_dropoffDefault").value.trim(), customerType: "", accessibility: "", dietary: "", notes: qs("acc_notes").value.trim(), addresses, defaultId, consentTerms: qs("acc_consentTerms").checked ? "yes" : "no", consentPrivacy: qs("acc_consentPrivacy").checked ? "yes" : "no", consentMarketing: qs("acc_consentMarketing").checked ? "yes" : "no" };
-  }
-
-  async function saveProfile(e){
-    e.preventDefault(); const msg = qs("acc_msg"); msg.textContent = "";
-    try{
-      await getMe();
-      if (!meCache.loggedIn){ qs("acctGate").style.display = ""; qs("acctGateMsg").textContent = "Sign-in required to create an account."; qs("acctGateBtn").textContent = "Sign In"; qs("acctGateBtn").onclick = () => goLogin("https://tobermorygroceryrun.ca/?tab=account"); return; }
-      const payload = buildProfilePayload();
-      if (!payload.fullName || !payload.phone || !payload.contactPref) throw new Error("Please fill all required contact fields.");
-      if (payload.contactAuth !== "yes") throw new Error("Authorize contact is required.");
-      if (!payload.addresses.length) throw new Error("At least one saved address is required.");
-      if (payload.addresses.find(a => !a.town || !a.zone || !a.streetAddress || !a.postalCode)) throw new Error("Each saved address must include town, zone, street address, and postal code.");
-      if (payload.consentTerms !== "yes" || payload.consentPrivacy !== "yes") throw new Error("Terms and Privacy consents are required.");
-
-      msg.textContent = "Saving profile…";
-      const r = await fetch(API_PROFILE, { method:"POST", headers:{ "Content-Type":"application/json" }, credentials:"include", body: JSON.stringify(payload) });
-      const d = await r.json().catch(()=>({}));
-      if (!r.ok || d.ok === false) throw new Error(d.error || "Profile save failed");
-      await getMe(); await loadProfile(); populateAccountForm(profileCache || {}); await prefillOrderFromProfile(); syncAccountTabVisibility();
-      msg.textContent = "Profile saved ✅"; setTimeout(() => selectTab("tab-order"), 500);
-    } catch (e){ msg.textContent = String(e.message || e); }
-  }
-
-  async function initOrderPanel(){
-    await getMe();
-    if (!meCache.loggedIn){ buildOrderGate("Sign in with Google first. Then you can create your profile and place an order.", "Sign In", () => goLogin("https://tobermorygroceryrun.ca/?tab=account")); return; }
-    if (!profileCache) await loadProfile(); await prefillOrderFromProfile();
-    if (!meCache.profileComplete){ buildOrderGate("Create your account once, save your profile, then the order form will auto-fill automatically.", "Go to Create Account", () => selectTab("tab-account"), true); } else { hideOrderGate(); }
-    updateOrderRunStatus();
-  }
-
-  function bindOrderUI(){
-    fillPrimaryStores();
-    qs("ord_runType").addEventListener("change", () => { fillPrimaryStores(); updateOrderRunStatus(); });
-    qs("ord_savedAddress").addEventListener("change", () => { applySavedAddressToOrder(qs("ord_savedAddress").value); });
-    qs("ord_reloadProfile").addEventListener("click", async () => { await loadProfile(); await prefillOrderFromProfile(); });
-    qs("ord_editProfile").addEventListener("click", () => { selectTab("tab-account"); });
-    qs("btnAddStore").addEventListener("click", () => addExtraStoreRow("")); qs("btnClearStores").addEventListener("click", () => { qs("extraStoresWrap").innerHTML = ""; });
-    qs("ord_calcFeesBtn").addEventListener("click", estimateOrderFees);
-    qs("orderForm").addEventListener("submit", submitOrder);
-    qs("rideForm").addEventListener("submit", submitRide);
-
-    qs("itemSearchInput").addEventListener("input", (e) => { clearTimeout(acTimeout); acTimeout = setTimeout(() => doCatalogueSearch(e.target.value), 300); });
-    qs("itemSearchInput").addEventListener("keydown", (e) => { if(e.key === "Enter") { e.preventDefault(); qs("btnAddItem").click(); } });
-    qs("btnAddItem").addEventListener("click", () => { const val = qs("itemSearchInput").value.trim(); if(val) { addGroceryItem(val, 0); qs("itemSearchInput").value = ""; hideAc(); } });
-    document.addEventListener("click", (e) => { if(!e.target.closest("#autocompleteDropdown") && e.target.id !== "itemSearchInput") hideAc(); });
-    bindAddonToggle("addon_prescription", "prescDetails"); bindAddonToggle("addon_liquor", "liqDetails"); bindAddonToggle("addon_printing", "printDetails"); bindAddonToggle("addon_fastfood", "ffDetails"); bindAddonToggle("addon_parcel", "parcelDetails"); bindAddonToggle("addon_bulky", "bulkyDetails");
-  }
-
-  function bindAccountUI(){ qs("acc_addAddress").addEventListener("click", () => addAddressCard({}, false)); qs("acc_loadBtn").addEventListener("click", async () => { await loadProfile(); populateAccountForm(profileCache || {}); qs("acc_msg").textContent = "Loaded existing profile ✅"; }); qs("acctForm").addEventListener("submit", saveProfile); }
-
-  function applyQueryTab(){
-    const params = new URLSearchParams(window.location.search); const requested = (params.get("tab") || "").toLowerCase();
-    const map = { home: "tab-home", about: "tab-about", pricing: "tab-pricing", areas: "tab-areas", estimator: "tab-estimator", order: "tab-order", ride: "tab-ride", account: "tab-account", memberships: "tab-memberships", faq: "tab-faq", contact: "tab-contact" };
-    if (map[requested]){ selectTab(map[requested]); } else { selectTab("tab-home"); }
-    if (params.get("onboarding") === "1" && meCache.loggedIn && meCache.profileComplete === false){ selectTab("tab-account"); }
-  }
-
-  async function boot(){
-    qs("year").textContent = String(new Date().getFullYear());
-    initOfflineBanner(); bindHeaderButtons(); bindEstimatorUI(); bindOrderUI(); bindAccountUI();
-    await loadConfig(); initMembershipLinks(); await initAuthUI(); await loadRuns();
-    if (meCache.loggedIn){ await loadProfile(); if (profileCache) { populateAccountForm(profileCache); await prefillOrderFromProfile(); } }
-    applyQueryTab(); addExtraStoreRow(""); setInterval(loadRuns, 20000);
-  }
-
-  boot();
+main().catch((err) => {
+  console.error(err);
+  process.exit(1);
+});
 </script>
 </body>
 </html>
