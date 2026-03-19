@@ -17,10 +17,8 @@ const GoogleStrategy = require("passport-google-oauth20").Strategy;
 const postmark = require("postmark");
 const twilio = require("twilio");
 
-// BULLETPROOF SQUARE SDK IMPORT
-const squarePkg = require("square/legacy");
-const Client = squarePkg.Client || squarePkg.default?.Client;
-const Environment = squarePkg.Environment || squarePkg.default?.Environment || { Production: "production", Sandbox: "sandbox" };
+// SQUARE SDK IMPORT (Legacy CommonJS Path)
+const { Client, Environment } = require("square/legacy");
 
 const dayjs = require("dayjs");
 const utc = require("dayjs/plugin/utc");
@@ -63,8 +61,9 @@ const TWILIO_AUTH_TOKEN = process.env.TWILIO_AUTH_TOKEN || "";
 const TWILIO_PHONE_NUMBER = process.env.TWILIO_PHONE_NUMBER || "";
 const twilioClient = (TWILIO_ACCOUNT_SID && TWILIO_AUTH_TOKEN) ? twilio(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN) : null;
 
-// SQUARE API CONFIG (Wrapped in safety net to prevent server crashes)
-const SQUARE_ENVIRONMENT = String(process.env.SQUARE_ENVIRONMENT || "sandbox").toLowerCase() === "production" ? Environment.Production : Environment.Sandbox;
+// SQUARE API CONFIG
+// Safely handling the Environment to prevent "undefined" errors
+const SQUARE_ENVIRONMENT = String(process.env.SQUARE_ENVIRONMENT || "sandbox").toLowerCase() === "production" ? "production" : "sandbox";
 const SQUARE_APP_ID = process.env.SQUARE_APP_ID || "";
 const SQUARE_ACCESS_TOKEN = process.env.SQUARE_ACCESS_TOKEN || "";
 const SQUARE_LOCATION_ID = process.env.SQUARE_LOCATION_ID || "";
@@ -182,6 +181,7 @@ function requireLogin(req, res, next) { if (!req.user) return res.status(401).js
 function requireProfileComplete(req, res, next) { if (!isProfileComplete(req.user?.profile || {})) return res.status(403).json({ ok: false, error: "Account setup required. Please complete your profile." }); next(); }
 function isAdminEmail(email) { const e = String(email || "").toLowerCase().trim(); return !e ? false : (!ADMIN_EMAILS.length ? true : ADMIN_EMAILS.includes(e)); }
 function requireAdmin(req, res, next) { const email = String(req.user?.email || "").toLowerCase().trim(); if (!email || !isAdminEmail(email)) return res.status(403).send("Admin access required."); next(); }
+function adminBy(req) { return req.user?.email || "admin"; }
 
 async function pmSend(to, subject, htmlBody, textBody) { try { const rcpt = String(to || "").trim(); if (!pmClient || !POSTMARK_FROM_EMAIL || !rcpt) return; await pmClient.sendEmail({ From: POSTMARK_FROM_EMAIL, To: rcpt, Subject: subject, HtmlBody: htmlBody, TextBody: textBody || "", MessageStream: POSTMARK_MESSAGE_STREAM }); } catch (e) { console.error("Postmark send failed:", String(e)); } }
 async function sendSms(toPhone, message) {
@@ -423,6 +423,48 @@ app.post("/api/orders/:orderId/cancel", async (req, res) => {
     order.statusHistory.push({ state: "cancelled", note: "Cancelled by customer", at: new Date(), by: "customer" }); 
     await order.save(); return res.json({ ok: true });
   } catch (e) { return res.status(500).json({ ok: false, error: String(e) }); }
+});
+
+// =========================
+// ADMIN: FETCH ORDERS API
+// =========================
+app.get("/api/admin/orders", requireLogin, requireAdmin, async (req, res) => {
+  try {
+    const q = String(req.query.q || "").trim();
+    const state = String(req.query.state || "").trim();
+    const runKey = String(req.query.runKey || "").trim();
+    const limit = Math.min(Number(req.query.limit || 200), 500);
+
+    const filter = {};
+    if (state) filter["status.state"] = state;
+    if (runKey) filter.runKey = runKey;
+    if (q) {
+      const re = new RegExp(q.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i");
+      filter.$or = [
+        { orderId: re },
+        { "customer.fullName": re },
+        { "customer.email": re },
+        { "customer.phone": re },
+        { "address.streetAddress": re }
+      ];
+    }
+
+    const items = await Order.find(filter).sort({ createdAt: -1 }).limit(limit).lean();
+    res.json({ ok: true, items });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: String(e) });
+  }
+});
+
+app.get("/api/admin/orders/:orderId", requireLogin, requireAdmin, async (req, res) => {
+  try {
+    const orderId = String(req.params.orderId || "").trim().toUpperCase();
+    const order = await Order.findOne({ orderId }).lean();
+    if (!order) return res.status(404).json({ ok: false, error: "Order not found" });
+    res.json({ ok: true, order });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: String(e) });
+  }
 });
 
 // SQUARE FINAL CAPTURE (ADMIN ONLY)
