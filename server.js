@@ -69,6 +69,10 @@ const SQUARE_LOCATION_ID = process.env.SQUARE_LOCATION_ID || "";
 const SQUARE_WEBHOOK_SIGNATURE_KEY = process.env.SQUARE_WEBHOOK_SIGNATURE_KEY || "";
 const SQUARE_WEBHOOK_URL = process.env.SQUARE_WEBHOOK_URL || "https://api.tobermorygroceryrun.ca/api/webhooks/square";
 
+// Dynamic Tip & Review Links
+const SQUARE_TIP_LINK = process.env.SQUARE_TIP_LINK || "";
+const GOOGLE_REVIEW_LINK = process.env.GOOGLE_REVIEW_LINK || "";
+
 let squareClient = null;
 try {
   if (SQUARE_ACCESS_TOKEN && Client) {
@@ -268,7 +272,7 @@ function computeFeeBreakdown(input) {
   }
 
   let addOnsFees = 0;
-  let discountableAddOns = 0; // For tracking the "1 Free Extra Store Stop" perk value
+  let discountableAddOns = 0; 
   
   if (extraStores.length) {
       const storeFees = extraStores.length * PRICING.addOns.extraStore;
@@ -285,7 +289,6 @@ function computeFeeBreakdown(input) {
   }
 
   let surcharges = 0;
-  // Apply the $15 Small Order Surcharge unless they are Route or AccessPro members
   if (grocerySubtotal > 0 && grocerySubtotal < PRICING.groceryUnderMin.threshold) {
      if (memberTier !== "route" && memberTier !== "accesspro") {
         surcharges += PRICING.groceryUnderMin.surcharge;
@@ -295,11 +298,9 @@ function computeFeeBreakdown(input) {
   let discount = Math.min(serviceFee, disc.serviceOff || 0);
 
   if (memberTier === "accesspro" && applyPerk) {
-      // AccessPro Double Perk: Both zone AND addon discount apply simultaneously
       discount += Math.min(zoneFee, disc.zoneOff || 0);
       discount += Math.min(discountableAddOns, disc.freeAddonUpTo || 0);
   } else if (applyPerk) {
-      // Standard Perk: Best of either Zone OR Addon discount
       discount += Math.max(Math.min(zoneFee, disc.zoneOff || 0), Math.min(discountableAddOns, disc.freeAddonUpTo || 0));
   }
 
@@ -361,20 +362,25 @@ app.get("/api/public/tracking/:runKey", async (req, res) => {
 });
 
 app.get("/api/public/config", (_req, res) => { 
-  res.json({ ok: true, mapboxPublicToken: MAPBOX_PUBLIC_TOKEN || "", canadaPostKey: CANADAPOST_KEY || "", 
-  squareAppId: SQUARE_APP_ID, squareLocationId: SQUARE_LOCATION_ID, squareEnv: process.env.SQUARE_ENVIRONMENT || "sandbox",
-  squareMembershipLinks: { standard: SQUARE_LINK_STANDARD, route: SQUARE_LINK_ROUTE, access: SQUARE_LINK_ACCESS, accesspro: SQUARE_LINK_ACCESSPRO } }); 
+  res.json({ 
+    ok: true, 
+    mapboxPublicToken: MAPBOX_PUBLIC_TOKEN || "", 
+    canadaPostKey: CANADAPOST_KEY || "", 
+    squareAppId: SQUARE_APP_ID, 
+    squareLocationId: SQUARE_LOCATION_ID, 
+    squareEnv: process.env.SQUARE_ENVIRONMENT || "sandbox",
+    squareMembershipLinks: { standard: SQUARE_LINK_STANDARD, route: SQUARE_LINK_ROUTE, access: SQUARE_LINK_ACCESS, accesspro: SQUARE_LINK_ACCESSPRO },
+    squareTipLink: SQUARE_TIP_LINK,
+    googleReviewLink: GOOGLE_REVIEW_LINK
+  }); 
 });
 app.get("/api/public/memberships", (_req, res) => { res.json({ ok: true, plans: getPublicMembershipPlans() }); });
-
 
 // =========================
 // SQUARE WEBHOOK LISTENER
 // =========================
 app.post("/api/webhooks/square", async (req, res) => {
-  // Acknowledge receipt immediately to prevent Square from retrying
   res.status(200).send("OK");
-
   try {
     const signature = req.headers["x-square-hmacsha256-signature"];
     if (SQUARE_WEBHOOK_SIGNATURE_KEY && signature) {
@@ -390,19 +396,14 @@ app.post("/api/webhooks/square", async (req, res) => {
     const event = req.body;
     if (!event || !event.type) return;
 
-    // Listen for payment events triggered by membership link purchases
     if (event.type === "payment.updated" || event.type === "payment.created") {
       const payment = event.data?.object?.payment;
       if (payment && payment.status === "COMPLETED" && payment.customer_id && payment.order_id) {
-         
          if (!squareClient) return;
-         
-         // Fetch the customer to get their email address
          const custRes = await squareClient.customersApi.retrieveCustomer(payment.customer_id);
          const email = custRes.result?.customer?.emailAddress;
          if (!email) return;
 
-         // Fetch the order to see exactly what they bought
          const orderRes = await squareClient.ordersApi.retrieveOrder(payment.order_id);
          const lineItems = orderRes.result?.order?.lineItems || [];
          
@@ -416,7 +417,6 @@ app.post("/api/webhooks/square", async (req, res) => {
          }
 
          if (newTier) {
-            // Upgrade the user in the database
             const normalizedEmail = email.toLowerCase().trim();
             const renewal = dayjs().tz(TZ).add(1, 'month').toDate();
             await User.updateOne(
@@ -431,7 +431,6 @@ app.post("/api/webhooks/square", async (req, res) => {
     console.error("Square Webhook Processing Error:", err);
   }
 });
-
 
 // =========================
 // AUTH ROUTES
@@ -468,21 +467,6 @@ app.post("/api/profile", requireLogin, async (req, res) => {
     u.profile = newProfile; u.markModified("profile"); await u.save(); res.json({ ok: true, profileComplete: newProfile.complete === true, profile: newProfile });
   } catch (e) { res.status(500).json({ ok: false, error: String(e) }); }
 });
-
-// =========================
-// RUNS + ESTIMATOR
-// =========================
-app.get("/api/runs/active", async (_req, res) => {
-  try {
-    const runs = await ensureUpcomingRuns(); const now = nowTz(); const out = {};
-    for (const type of ["local", "owen"]) {
-      const run = runs[type]; const opensAt = dayjs(run.opensAt).tz(TZ); const cutoffAt = dayjs(run.cutoffAt).tz(TZ); const windowOpen = now.isAfter(opensAt) && now.isBefore(cutoffAt); const pointsRemaining = Math.max(0, (run.maxPoints || 10) - (run.bookedPoints || 0));
-      out[type] = { runKey: run.runKey, type: run.type, maxPoints: run.maxPoints || 10, bookedPoints: run.bookedPoints || 0, bookedOrdersCount: run.bookedOrdersCount || 0, bookedFeesTotal: run.bookedFeesTotal || 0, pointsRemaining, isOpen: windowOpen && pointsRemaining > 0, opensAtLocal: fmtLocal(run.opensAt), cutoffAtLocal: fmtLocal(run.cutoffAt), meetsMinimums: meetsMinimums(run), minimumText: runMinimumConfig(type).minimumText, cutoffAtISO: run.cutoffAt, opensAtISO: run.opensAt };
-    }
-    res.json({ ok: true, runs: out });
-  } catch (e) { res.status(500).json({ ok: false, error: String(e) }); }
-});
-app.post("/api/estimator", (req, res) => { try { const effectiveMemberTier = getEffectiveMemberTierForUser(req.user, req.body?.memberTier || ""); res.json({ ok: true, effectiveMemberTier, breakdown: computeFeeBreakdown({ ...(req.body || {}), memberTier: effectiveMemberTier, applyPerk: "yes" }) }); } catch (e) { res.status(500).json({ ok: false, error: String(e) }); } });
 
 // =========================
 // NEW PAYMENT ENGINE (FEES UPFRONT, GROCERIES ON FILE)
@@ -528,7 +512,6 @@ app.post("/api/orders", requireLogin, requireProfileComplete, upload.single("gro
     if (b.paymentSourceId && squareClient) {
       const feeCents = Math.round(pricingSnapshot.totalFees * 100);
       try {
-        // 1. Create a Square Customer
         const custRes = await squareClient.customersApi.createCustomer({
           idempotencyKey: crypto.randomBytes(12).toString('hex'),
           givenName: fullName.split(' ')[0],
@@ -538,7 +521,6 @@ app.post("/api/orders", requireLogin, requireProfileComplete, upload.single("gro
         });
         squareCustomerId = custRes.result.customer.id;
 
-        // 2. Save the card on file
         const cardRes = await squareClient.cardsApi.createCard({
           idempotencyKey: crypto.randomBytes(12).toString('hex'),
           sourceId: b.paymentSourceId,
@@ -546,7 +528,6 @@ app.post("/api/orders", requireLogin, requireProfileComplete, upload.single("gro
         });
         squareCardId = cardRes.result.card.id;
 
-        // 3. Instantly Charge the Service/Delivery Fees
         if (feeCents > 0) {
           const payRes = await squareClient.paymentsApi.createPayment({
             idempotencyKey: crypto.randomBytes(12).toString('hex'),
@@ -609,7 +590,6 @@ app.post("/api/orders/:orderId/cancel", async (req, res) => {
     if (!verifyCancelToken(orderId, String(req.body?.token || "").trim()).ok) return res.status(403).json({ ok: false, error: "Invalid cancel token." });
     if (!nowTz().isBefore(dayjs(run.cutoffAt).tz(TZ))) return res.status(403).json({ ok: false, error: "Cancellation window closed." });
 
-    // REFUND THE FEES IF CANCELED BEFORE CUTOFF
     if (order.payments.fees.squarePaymentId && order.payments.fees.status === "paid" && squareClient) {
       try { 
         await squareClient.refundsApi.refundPayment({
@@ -628,51 +608,6 @@ app.post("/api/orders/:orderId/cancel", async (req, res) => {
   } catch (e) { return res.status(500).json({ ok: false, error: String(e) }); }
 });
 
-// =========================
-// ADMIN: FETCH ORDERS API
-// =========================
-app.get("/api/admin/orders", requireLogin, requireAdmin, async (req, res) => {
-  try {
-    const q = String(req.query.q || "").trim();
-    const state = String(req.query.state || "").trim();
-    const runKey = String(req.query.runKey || "").trim();
-    const limit = Math.min(Number(req.query.limit || 200), 500);
-
-    const filter = {};
-    if (state) filter["status.state"] = state;
-    if (runKey) filter.runKey = runKey;
-    if (q) {
-      const re = new RegExp(q.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i");
-      filter.$or = [
-        { orderId: re },
-        { "customer.fullName": re },
-        { "customer.email": re },
-        { "customer.phone": re },
-        { "address.streetAddress": re }
-      ];
-    }
-
-    const items = await Order.find(filter).sort({ createdAt: -1 }).limit(limit).lean();
-    res.json({ ok: true, items });
-  } catch (e) {
-    res.status(500).json({ ok: false, error: String(e) });
-  }
-});
-
-app.get("/api/admin/orders/:orderId", requireLogin, requireAdmin, async (req, res) => {
-  try {
-    const orderId = String(req.params.orderId || "").trim().toUpperCase();
-    const order = await Order.findOne({ orderId }).lean();
-    if (!order) return res.status(404).json({ ok: false, error: "Order not found" });
-    res.json({ ok: true, order });
-  } catch (e) {
-    res.status(500).json({ ok: false, error: String(e) });
-  }
-});
-
-// =========================
-// ADMIN: CHARGE GROCERIES TO SAVED CARD
-// =========================
 app.post("/api/admin/orders/:orderId/capture", requireLogin, requireAdmin, async (req, res) => {
   try {
     const orderId = String(req.params.orderId || "").trim().toUpperCase();
@@ -714,58 +649,8 @@ app.post("/api/admin/orders/:orderId/capture", requireLogin, requireAdmin, async
   } catch(e) { res.status(500).json({ ok: false, error: String(e) }); }
 });
 
-app.post("/api/admin/orders/:orderId/status", requireLogin, requireAdmin, async (req, res) => {
-  try {
-    const orderId = String(req.params.orderId || "").trim().toUpperCase(); const state = String(req.body?.state || "").trim(); const note = String(req.body?.note || "").trim(); const by = adminBy(req);
-    if (!AllowedStates.includes(state)) return res.status(400).json({ ok: false, error: "Invalid state" });
-    const order = await Order.findOne({ orderId }); if (!order) return res.status(404).json({ ok: false, error: "Order not found" });
-    const oldState = order.status.state; order.status.state = state; order.status.note = note; order.status.updatedAt = new Date(); order.status.updatedBy = by; order.statusHistory.push({ state, note, at: new Date(), by });
-    await order.save(); 
-
-    if (oldState !== state) {
-      const phone = order.customer?.phone; const firstName = order.customer?.fullName?.split(' ')[0] || 'there';
-      if (phone) {
-        let smsMessage = "";
-        if (state === "shopping") smsMessage = `Hi ${firstName}! I've grabbed a cart and I'm officially picking your groceries. Let's hope the avocados are cooperating today. 🥑 - Tobermory Grocery Run`;
-        else if (state === "out_for_delivery") {
-          const run = await Run.findOne({ runKey: order.runKey }).lean(); let trackingLink = "";
-          if (run) trackingLink = `${PUBLIC_SITE_URL}/member?trackRunKey=${encodeURIComponent(run.runKey)}&token=${encodeURIComponent(signTrackingToken(order.orderId, run.runKey, dayjs(run.cutoffAt).add(1, "day").valueOf()))}&orderId=${encodeURIComponent(order.orderId)}`;
-          smsMessage = `Hi ${firstName}, the Jeep is loaded and I'm on the road! Track your delivery live right here: ${trackingLink} 🚙💨 - TGR`;
-        } 
-        else if (state === "delivered") smsMessage = `Mission accomplished! Your order has been dropped off. Enjoy the goodies, and thanks for trusting Tobermory Grocery Run! 🛒✨`;
-        if (smsMessage) await sendSms(phone, smsMessage);
-      }
-    }
-    res.json({ ok: true });
-  } catch (e) { res.status(500).json({ ok: false, error: String(e) }); }
-});
-
-app.post("/api/admin/orders/:orderId/payments", requireLogin, requireAdmin, async (req, res) => {
-  try {
-    const order = await Order.findOne({ orderId: String(req.params.orderId || "").trim().toUpperCase() }); if (!order) return res.status(404).json({ ok: false, error: "Order not found" });
-    const fs = String(req.body?.feesStatus || "").trim(); const gs = String(req.body?.groceriesStatus || "").trim();
-    if (fs) { order.payments.fees.status = fs; order.payments.fees.paidAt = fs === "paid" ? new Date() : null; }
-    if (gs) { order.payments.groceries.status = gs; order.payments.groceries.paidAt = (gs === "paid" || gs === "deposit_paid") ? new Date() : null; }
-    if (req.body?.note) { order.payments.fees.note = String(req.body.note).trim(); order.payments.groceries.note = String(req.body.note).trim(); }
-    await order.save(); res.json({ ok: true });
-  } catch (e) { res.status(500).json({ ok: false, error: String(e) }); }
-});
-
-app.delete("/api/admin/orders/:orderId", requireLogin, requireAdmin, async (req, res) => {
-  try {
-    const orderId = String(req.params.orderId || "").trim().toUpperCase(); const order = await Order.findOne({ orderId }).lean(); if (!order) return res.status(404).json({ ok: false, error: "Order not found" });
-    if (ACTIVE_STATES.has(order.status?.state || "submitted")) await Run.updateOne({ runKey: order.runKey }, { $inc: { bookedOrdersCount: -1, bookedFeesTotal: -Number(order.pricingSnapshot?.totalFees || 0), bookedPoints: -Number(order.spacePoints || 1) }, $set: { lastRecalcAt: new Date() } });
-    await Order.deleteOne({ orderId }); res.json({ ok: true });
-  } catch (e) { res.status(500).json({ ok: false, error: String(e) }); }
-});
-
-app.post("/api/admin/tracking/:runKey/start", requireLogin, requireAdmin, async (req, res) => { try { const runKey = String(req.params.runKey || "").trim(); await ensureTrackingDoc(runKey); await Tracking.updateOne({ runKey }, { $set: { enabled: true, startedAt: new Date(), stoppedAt: null, updatedBy: adminBy(req) } }); res.json({ ok: true, runKey }); } catch (e) { res.status(500).json({ ok: false, error: String(e) }); } });
-app.post("/api/admin/tracking/:runKey/stop", requireLogin, requireAdmin, async (req, res) => { try { const runKey = String(req.params.runKey || "").trim(); await ensureTrackingDoc(runKey); await Tracking.updateOne({ runKey }, { $set: { enabled: false, stoppedAt: new Date(), updatedBy: adminBy(req) } }); res.json({ ok: true, runKey }); } catch (e) { res.status(500).json({ ok: false, error: String(e) }); } });
-app.post("/api/admin/tracking/:runKey/update", requireLogin, requireAdmin, async (req, res) => { try { const runKey = String(req.params.runKey || "").trim(); const lat = Number(req.body?.lat); const lng = Number(req.body?.lng); if (!Number.isFinite(lat) || !Number.isFinite(lng)) return res.status(400).json({ ok: false, error: "lat/lng required" }); await ensureTrackingDoc(runKey); await Tracking.updateOne({ runKey }, { $set: { lastLat: lat, lastLng: lng, lastHeading: Number.isFinite(Number(req.body?.heading)) ? Number(req.body?.heading) : null, lastSpeed: Number.isFinite(Number(req.body?.speed)) ? Number(req.body?.speed) : null, lastAccuracy: Number.isFinite(Number(req.body?.accuracy)) ? Number(req.body?.accuracy) : null, lastAt: new Date(), updatedBy: adminBy(req) } }); res.json({ ok: true }); } catch (e) { res.status(500).json({ ok: false, error: String(e) }); } });
-app.get("/api/admin/orders/:orderId/tracking-link", requireLogin, requireAdmin, async (req, res) => { try { const orderId = String(req.params.orderId || "").trim().toUpperCase(); const o = await Order.findOne({ orderId }).lean(); if (!o) return res.status(404).json({ ok: false, error: "Order not found" }); const run = await Run.findOne({ runKey: o.runKey }).lean(); if (!run) return res.status(404).json({ ok: false, error: "Run not found" }); res.json({ ok: true, url: `${PUBLIC_SITE_URL}/member?trackRunKey=${encodeURIComponent(run.runKey)}&token=${encodeURIComponent(signTrackingToken(o.orderId, run.runKey, dayjs(run.cutoffAt).add(1, "day").valueOf()))}&orderId=${encodeURIComponent(o.orderId)}` }); } catch (e) { res.status(500).json({ ok: false, error: String(e) }); } });
-
 // =========================
-// MEMBER PORTAL
+// MEMBER PORTAL (With Rating & Tipping)
 // =========================
 app.get("/member", requireLogin, async (req, res) => {
   try {
@@ -801,29 +686,44 @@ app.get("/member", requireLogin, async (req, res) => {
     }).join("");
 
     res.setHeader("Content-Type", "text/html; charset=utf-8");
-    res.send(`<!doctype html><html lang="en-CA"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>TGR Member Portal</title><style>:root{--bg:#0b0b0b; --panel:rgba(255,255,255,.06); --line:rgba(255,255,255,.14); --text:#fff; --muted:rgba(255,255,255,.75); --red:#e3342f; --red2:#ff4a44; --radius:14px;} body{margin:0;background:var(--bg);color:var(--text);font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;} .wrap{max-width:1250px;margin:0 auto;padding:16px;} .card{border:1px solid var(--line);background:var(--panel);border-radius:var(--radius);padding:14px;} .row{display:flex;gap:10px;flex-wrap:wrap;align-items:center;} .btn{border:1px solid rgba(255,255,255,.18);background:rgba(255,255,255,.06);color:#fff;font-weight:900;border-radius:999px;padding:10px 14px;cursor:pointer;text-decoration:none;white-space:nowrap;} .btn.primary{background:linear-gradient(180deg,var(--red2),var(--red));border-color:rgba(0,0,0,.25);} .btn.ghost{background:transparent;} .muted{color:var(--muted);} .pill{display:inline-block;padding:4px 10px;border-radius:999px;border:1px solid rgba(255,255,255,.18);background:rgba(255,255,255,.06);font-weight:900;font-size:12px;} table{width:100%;border-collapse:collapse;} th,td{padding:10px 8px;border-bottom:1px solid rgba(255,255,255,.12);vertical-align:top;} th{font-size:12px;color:rgba(255,255,255,.72);text-transform:uppercase;letter-spacing:.08em;text-align:left;} .toast{margin-top:10px;padding:10px 12px;border-radius:12px;border:1px solid rgba(255,255,255,.18);background:rgba(0,0,0,.24);display:none;font-weight:900;} .toast.show{display:block;} .hr{height:1px;background:rgba(255,255,255,.12);margin:12px 0;} .grid{display:grid;grid-template-columns: 1fr 1fr; gap:12px;} @media (max-width: 980px){ .grid{grid-template-columns: 1fr;} } #mapWrap{display:none;} #map{height: 420px; border-radius: 14px; border:1px solid rgba(255,255,255,.14); overflow:hidden;} .small{font-size:13px;} .warn{border:1px solid rgba(227,52,47,.45);background:rgba(227,52,47,.12);border-radius:12px;padding:10px 12px;}</style></head><body><div class="wrap"><div class="card"><div class="row" style="justify-content:space-between;"><div><div style="font-weight:1000;font-size:22px;">Member Portal</div><div class="muted">Signed in as <strong>${escapeHtml(email)}</strong>${name ? ` • ${escapeHtml(name)}` : ""}</div></div><div class="row"><a class="btn ghost" href="${escapeHtml(PUBLIC_SITE_URL)}/">Back to site</a><a class="btn ghost" href="/logout?returnTo=${encodeURIComponent(PUBLIC_SITE_URL + "/")}">Log out</a></div></div><div class="toast" id="toast"></div>
+    res.send(`<!doctype html><html lang="en-CA"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>TGR Member Portal</title><style>:root{--bg:#0b0b0b; --panel:rgba(255,255,255,.06); --line:rgba(255,255,255,.14); --text:#fff; --muted:rgba(255,255,255,.75); --red:#e3342f; --red2:#ff4a44; --radius:14px;} body{margin:0;background:var(--bg);color:var(--text);font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;} .wrap{max-width:1250px;margin:0 auto;padding:16px;} .card{border:1px solid var(--line);background:var(--panel);border-radius:var(--radius);padding:14px;} .row{display:flex;gap:10px;flex-wrap:wrap;align-items:center;} .btn{border:1px solid rgba(255,255,255,.18);background:rgba(255,255,255,.06);color:#fff;font-weight:900;border-radius:999px;padding:10px 14px;cursor:pointer;text-decoration:none;white-space:nowrap;} .btn.primary{background:linear-gradient(180deg,var(--red2),var(--red));border-color:rgba(0,0,0,.25);} .btn.secondary{background:rgba(217,217,217,.10);border-color:rgba(217,217,217,.22);color:var(--white);} .btn.ghost{background:transparent;} .muted{color:var(--muted);} .pill{display:inline-block;padding:4px 10px;border-radius:999px;border:1px solid rgba(255,255,255,.18);background:rgba(255,255,255,.06);font-weight:900;font-size:12px;} table{width:100%;border-collapse:collapse;} th,td{padding:10px 8px;border-bottom:1px solid rgba(255,255,255,.12);vertical-align:top;} th{font-size:12px;color:rgba(255,255,255,.72);text-transform:uppercase;letter-spacing:.08em;text-align:left;} .toast{margin-top:10px;padding:10px 12px;border-radius:12px;border:1px solid rgba(255,255,255,.18);background:rgba(0,0,0,.24);display:none;font-weight:900;} .toast.show{display:block;} .hr{height:1px;background:rgba(255,255,255,.12);margin:12px 0;} .grid{display:grid;grid-template-columns: 1fr 1fr; gap:12px;} @media (max-width: 980px){ .grid{grid-template-columns: 1fr;} } #mapWrap{display:none;} #map{height: 420px; border-radius: 14px; border:1px solid rgba(255,255,255,.14); overflow:hidden;} .small{font-size:13px;} .warn{border:1px solid rgba(227,52,47,.45);background:rgba(227,52,47,.12);border-radius:12px;padding:10px 12px;}</style></head><body><div class="wrap"><div class="card"><div class="row" style="justify-content:space-between;"><div><div style="font-weight:1000;font-size:22px;">Member Portal</div><div class="muted">Signed in as <strong>${escapeHtml(email)}</strong>${name ? ` • ${escapeHtml(name)}` : ""}</div></div><div class="row"><a class="btn ghost" href="${escapeHtml(PUBLIC_SITE_URL)}/">Back to site</a><a class="btn ghost" href="/logout?returnTo=${encodeURIComponent(PUBLIC_SITE_URL + "/")}">Log out</a></div></div><div class="toast" id="toast"></div>
 
 <div class="hr"></div>
 
-<div class="card" style="box-shadow:none; border: 1px solid rgba(227,52,47,.45); background: rgba(227,52,47,.08); margin-bottom:14px;">
-  <div style="font-weight:1000;font-size:18px;">My Membership</div>
-  <div class="muted small" style="margin-bottom:10px;">Your active perks are automatically applied to your orders at checkout.</div>
-  <div class="row">
-    <div style="flex:1 1 150px;">
-       <div class="muted small">Current Tier</div>
-       <div style="font-size:22px; font-weight:900; text-transform:capitalize;">${escapeHtml(req.user?.membershipLevel && req.user.membershipLevel !== 'none' ? req.user.membershipLevel : 'No active plan')}</div>
+<div class="grid">
+  <div class="card" style="box-shadow:none; border: 1px solid rgba(227,52,47,.45); background: rgba(227,52,47,.08); margin-bottom:14px;">
+    <div style="font-weight:1000;font-size:18px;">My Membership</div>
+    <div class="muted small" style="margin-bottom:10px;">Your active perks are automatically applied to your orders at checkout.</div>
+    <div class="row">
+      <div style="flex:1 1 120px;">
+         <div class="muted small">Current Tier</div>
+         <div style="font-size:20px; font-weight:900; text-transform:capitalize;">${escapeHtml(req.user?.membershipLevel && req.user.membershipLevel !== 'none' ? req.user.membershipLevel : 'No active plan')}</div>
+      </div>
+      <div style="flex:1 1 120px;">
+         <div class="muted small">Status</div>
+         <div style="font-size:20px; font-weight:900; text-transform:capitalize;">${escapeHtml(req.user?.membershipStatus || 'Inactive')}</div>
+      </div>
+      <div style="flex:1 1 150px;">
+         <div class="muted small">Renews On</div>
+         <div style="font-size:20px; font-weight:900;">${req.user?.renewalDate ? new Date(req.user.renewalDate).toLocaleDateString() : '—'}</div>
+      </div>
     </div>
-    <div style="flex:1 1 150px;">
-       <div class="muted small">Status</div>
-       <div style="font-size:22px; font-weight:900; text-transform:capitalize;">${escapeHtml(req.user?.membershipStatus || 'Inactive')}</div>
-    </div>
-    <div style="flex:1 1 200px;">
-       <div class="muted small">Renews On</div>
-       <div style="font-size:22px; font-weight:900;">${req.user?.renewalDate ? new Date(req.user.renewalDate).toLocaleDateString() : '—'}</div>
+    <div class="row" style="margin-top:14px;">
+       <a class="btn primary small" href="${escapeHtml(PUBLIC_SITE_URL)}/?tab=memberships">Upgrade / Renew Plan</a>
     </div>
   </div>
-  <div class="row" style="margin-top:14px;">
-     <a class="btn primary small" href="${escapeHtml(PUBLIC_SITE_URL)}/?tab=memberships">Upgrade / Renew Plan</a>
+
+  <div class="card" style="box-shadow:none; border: 1px solid rgba(255,193,7,.45); background: rgba(255,193,7,.08); margin-bottom:14px;">
+    <div style="font-weight:1000;font-size:18px; color:#ffc107;">⭐ Rate & Tip</div>
+    <div class="muted small" style="margin-bottom:14px;">If you loved your experience, please consider leaving a 5-star review or a tip!</div>
+    <div class="row" style="margin-bottom: 14px;">
+      <a class="btn primary small" href="${escapeHtml(SQUARE_TIP_LINK || '#')}" target="_blank" rel="noopener" style="background:linear-gradient(180deg, #ffc107, #ff9800); color:#000; border:none; box-shadow:0 5px 15px rgba(255,193,7,.3);">☕ Tip the Driver</a>
+      <a class="btn secondary small" href="${escapeHtml(GOOGLE_REVIEW_LINK || '#')}" target="_blank" rel="noopener">⭐ Leave a Review</a>
+    </div>
+    <div class="row" style="align-items:center;">
+      <img src="/GOOGLE_REVIEW_QR.png" alt="Scan to review" style="width:80px; height:80px; border-radius:8px; border:1px solid rgba(255,255,255,.2);">
+      <div class="muted small" style="margin-left: 8px;">Scan the QR code to open our Google Reviews directly on your phone!</div>
+    </div>
   </div>
 </div>
 
@@ -831,6 +731,7 @@ app.get("/member", requireLogin, async (req, res) => {
   } catch (e) { res.status(500).send("Member portal error: " + String(e)); }
 });
 
+// ADMIN API & UI
 app.get("/api/admin/runs/:runKey/master-list", requireLogin, requireAdmin, async (req, res) => {
   try {
     const runKey = String(req.params.runKey || "").trim();
@@ -851,6 +752,79 @@ app.get("/api/admin/runs/:runKey/master-list", requireLogin, requireAdmin, async
   } catch(e) { res.status(500).json({ ok: false, error: String(e) }); }
 });
 
+app.get("/api/admin/orders", requireLogin, requireAdmin, async (req, res) => {
+  try {
+    const q = String(req.query.q || "").trim();
+    const state = String(req.query.state || "").trim();
+    const runKey = String(req.query.runKey || "").trim();
+    const limit = Math.min(Number(req.query.limit || 200), 500);
+
+    const filter = {};
+    if (state) filter["status.state"] = state;
+    if (runKey) filter.runKey = runKey;
+    if (q) {
+      const re = new RegExp(q.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i");
+      filter.$or = [
+        { orderId: re },
+        { "customer.fullName": re },
+        { "customer.email": re },
+        { "customer.phone": re },
+        { "address.streetAddress": re }
+      ];
+    }
+
+    const items = await Order.find(filter).sort({ createdAt: -1 }).limit(limit).lean();
+    res.json({ ok: true, items });
+  } catch (e) { res.status(500).json({ ok: false, error: String(e) }); }
+});
+
+app.get("/api/admin/orders/:orderId", requireLogin, requireAdmin, async (req, res) => {
+  try {
+    const orderId = String(req.params.orderId || "").trim().toUpperCase();
+    const order = await Order.findOne({ orderId }).lean();
+    if (!order) return res.status(404).json({ ok: false, error: "Order not found" });
+    res.json({ ok: true, order });
+  } catch (e) { res.status(500).json({ ok: false, error: String(e) }); }
+});
+
+app.post("/api/admin/orders/:orderId/status", requireLogin, requireAdmin, async (req, res) => {
+  try {
+    const orderId = String(req.params.orderId || "").trim().toUpperCase(); const state = String(req.body?.state || "").trim(); const note = String(req.body?.note || "").trim(); const by = adminBy(req);
+    if (!AllowedStates.includes(state)) return res.status(400).json({ ok: false, error: "Invalid state" });
+    const order = await Order.findOne({ orderId }); if (!order) return res.status(404).json({ ok: false, error: "Order not found" });
+    const oldState = order.status.state; order.status.state = state; order.status.note = note; order.status.updatedAt = new Date(); order.status.updatedBy = by; order.statusHistory.push({ state, note, at: new Date(), by });
+    await order.save(); 
+
+    if (oldState !== state) {
+      const phone = order.customer?.phone; const firstName = order.customer?.fullName?.split(' ')[0] || 'there';
+      if (phone) {
+        let smsMessage = "";
+        if (state === "shopping") smsMessage = `Hi ${firstName}! I've grabbed a cart and I'm officially picking your groceries. Let's hope the avocados are cooperating today. 🥑 - Tobermory Grocery Run`;
+        else if (state === "out_for_delivery") {
+          const run = await Run.findOne({ runKey: order.runKey }).lean(); let trackingLink = "";
+          if (run) trackingLink = `${PUBLIC_SITE_URL}/member?trackRunKey=${encodeURIComponent(run.runKey)}&token=${encodeURIComponent(signTrackingToken(order.orderId, run.runKey, dayjs(run.cutoffAt).add(1, "day").valueOf()))}&orderId=${encodeURIComponent(order.orderId)}`;
+          smsMessage = `Hi ${firstName}, the Jeep is loaded and I'm on the road! Track your delivery live right here: ${trackingLink} 🚙💨 - TGR`;
+        } 
+        else if (state === "delivered") smsMessage = `Mission accomplished! Your order has been dropped off. Enjoy the goodies, and thanks for trusting Tobermory Grocery Run! 🛒✨`;
+        if (smsMessage) await sendSms(phone, smsMessage);
+      }
+    }
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ ok: false, error: String(e) }); }
+});
+
+app.delete("/api/admin/orders/:orderId", requireLogin, requireAdmin, async (req, res) => {
+  try {
+    const orderId = String(req.params.orderId || "").trim().toUpperCase(); const order = await Order.findOne({ orderId }).lean(); if (!order) return res.status(404).json({ ok: false, error: "Order not found" });
+    if (ACTIVE_STATES.has(order.status?.state || "submitted")) await Run.updateOne({ runKey: order.runKey }, { $inc: { bookedOrdersCount: -1, bookedFeesTotal: -Number(order.pricingSnapshot?.totalFees || 0), bookedPoints: -Number(order.spacePoints || 1) }, $set: { lastRecalcAt: new Date() } });
+    await Order.deleteOne({ orderId }); res.json({ ok: true });
+  } catch (e) { res.status(500).json({ ok: false, error: String(e) }); }
+});
+
+app.post("/api/admin/tracking/:runKey/start", requireLogin, requireAdmin, async (req, res) => { try { const runKey = String(req.params.runKey || "").trim(); await ensureTrackingDoc(runKey); await Tracking.updateOne({ runKey }, { $set: { enabled: true, startedAt: new Date(), stoppedAt: null, updatedBy: adminBy(req) } }); res.json({ ok: true, runKey }); } catch (e) { res.status(500).json({ ok: false, error: String(e) }); } });
+app.post("/api/admin/tracking/:runKey/stop", requireLogin, requireAdmin, async (req, res) => { try { const runKey = String(req.params.runKey || "").trim(); await ensureTrackingDoc(runKey); await Tracking.updateOne({ runKey }, { $set: { enabled: false, stoppedAt: new Date(), updatedBy: adminBy(req) } }); res.json({ ok: true, runKey }); } catch (e) { res.status(500).json({ ok: false, error: String(e) }); } });
+app.post("/api/admin/tracking/:runKey/update", requireLogin, requireAdmin, async (req, res) => { try { const runKey = String(req.params.runKey || "").trim(); const lat = Number(req.body?.lat); const lng = Number(req.body?.lng); if (!Number.isFinite(lat) || !Number.isFinite(lng)) return res.status(400).json({ ok: false, error: "lat/lng required" }); await ensureTrackingDoc(runKey); await Tracking.updateOne({ runKey }, { $set: { lastLat: lat, lastLng: lng, lastHeading: Number.isFinite(Number(req.body?.heading)) ? Number(req.body?.heading) : null, lastSpeed: Number.isFinite(Number(req.body?.speed)) ? Number(req.body?.speed) : null, lastAccuracy: Number.isFinite(Number(req.body?.accuracy)) ? Number(req.body?.accuracy) : null, lastAt: new Date(), updatedBy: adminBy(req) } }); res.json({ ok: true }); } catch (e) { res.status(500).json({ ok: false, error: String(e) }); } });
+
 function buildAddonsText(o){
   const lines = [];
   if (o.addOns?.stockFridge?.requested) lines.push("PREMIUM: Stock the Fridge (+$25)");
@@ -860,9 +834,6 @@ function buildAddonsText(o){
   return lines.length ? lines.join("\n") : "—";
 }
 
-// =========================
-// ADMIN PAGE (Includes Magic Capture UI)
-// =========================
 app.get("/admin", requireLogin, requireAdmin, async (_req, res) => {
   res.setHeader("Content-Type", "text/html; charset=utf-8");
   res.send(`<!doctype html>
@@ -980,16 +951,6 @@ app.get("/admin", requireLogin, requireAdmin, async (_req, res) => {
 
   function openModal(show){ qs("modalBack").style.display = show ? "flex" : "none"; }
 
-  // Admin formatting for the modal popup
-  function buildAddonsText(o){
-    const lines = [];
-    if (o.addOns?.stockFridge?.requested) lines.push("PREMIUM: Stock the Fridge (+$25)");
-    if (o.addOns?.empties?.requested) lines.push("PREMIUM: Empties Return (+$15)");
-    if (o.addOns?.bulky?.requested) lines.push("OVERSIZE ITEM: " + (o.addOns.bulky.details || "Yes"));
-    if (o.addOns?.generalNotes) lines.push("General notes: " + o.addOns.generalNotes);
-    return lines.length ? lines.join("\\n") : "—";
-  }
-
   async function openOrder(orderId){
     try{
       const r = await fetch("/api/admin/orders/" + encodeURIComponent(orderId), { credentials:"include" }); const d = await r.json(); modalOrder = d.order;
@@ -1025,9 +986,6 @@ app.get("/admin", requireLogin, requireAdmin, async (_req, res) => {
 </html>`);
 });
 
-// =========================
-// EXPORT CSV 
-// =========================
 app.get("/api/admin/routific/export-csv", requireLogin, requireAdmin, async (req, res) => {
   try {
     const runKey = String(req.query.runKey || "").trim();
@@ -1045,9 +1003,6 @@ app.get("/api/admin/routific/export-csv", requireLogin, requireAdmin, async (req
   } catch (e) { res.status(500).send(String(e)); }
 });
 
-// =========================
-// ROOT + BOOT
-// =========================
 app.get("/", (_req, res) => res.send("TGR backend up"));
 
 async function main() {
