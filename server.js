@@ -1,5 +1,3 @@
-
-//FORCE RENDER PUSH
 // ======= server.js (FULL FILE) — TGR backend =======
 const express = require("express");
 const mongoose = require("mongoose");
@@ -64,11 +62,12 @@ const TWILIO_PHONE_NUMBER = process.env.TWILIO_PHONE_NUMBER || "";
 const twilioClient = (TWILIO_ACCOUNT_SID && TWILIO_AUTH_TOKEN) ? twilio(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN) : null;
 
 // SQUARE API CONFIG
-// Safely handling the Environment to prevent "undefined" errors
 const SQUARE_ENVIRONMENT = String(process.env.SQUARE_ENVIRONMENT || "sandbox").toLowerCase() === "production" ? "production" : "sandbox";
 const SQUARE_APP_ID = process.env.SQUARE_APP_ID || "";
 const SQUARE_ACCESS_TOKEN = process.env.SQUARE_ACCESS_TOKEN || "";
 const SQUARE_LOCATION_ID = process.env.SQUARE_LOCATION_ID || "";
+const SQUARE_WEBHOOK_SIGNATURE_KEY = process.env.SQUARE_WEBHOOK_SIGNATURE_KEY || "";
+const SQUARE_WEBHOOK_URL = process.env.SQUARE_WEBHOOK_URL || "https://api.tobermorygroceryrun.ca/api/webhooks/square";
 
 let squareClient = null;
 try {
@@ -96,7 +95,15 @@ const CANADAPOST_KEY = process.env.CANADAPOST_KEY || "mn86-az16-ku32-hj78";
 // =========================
 const app = express();
 app.use(cors({ origin: function (origin, cb) { if (!origin) return cb(null, true); return cb(null, ALLOWED_ORIGINS.includes(origin)); }, credentials: true }));
-app.use(express.json({ limit: "6mb" }));
+
+// Express JSON body parser WITH raw body capture for Square Webhook verification
+app.use(express.json({ 
+  limit: "6mb",
+  verify: (req, res, buf) => {
+    req.rawBody = buf.toString('utf8');
+  }
+}));
+
 app.use(express.urlencoded({ extended: true }));
 app.use(cookieParser());
 app.set("trust proxy", 1);
@@ -124,24 +131,35 @@ app.use(passport.initialize());
 app.use(passport.session());
 
 // =========================
-// PRICING BASELINE
+// PRICING BASELINE & LOGIC
 // =========================
 const PRICING = {
-  serviceFee: 25, zone: { A: 20, B: 15, C: 10, D: 25 }, owenRunFeePerOrder: 20,
-  addOns: { extraStore: 8, printingBase: 5, printingFirst10: 1.25, printingAfter10: 0.75, rideLocal: 15, rideOwen: 50 },
-  groceryUnderMin: { threshold: 35, surcharge: 19 },
+  serviceFee: 25, 
+  zone: { A: 20, B: 15, C: 10, D: 25 }, 
+  owenRunFeePerOrder: 15,
+  addOns: { extraStore: 8, printingBase: 5, printingFirst10: 1.25, printingAfter10: 0.75, rideLocal: 15, rideOwen: 50, stockFridge: 25, empties: 15, bulky: 10 },
+  groceryUnderMin: { threshold: 35, surcharge: 15 },
 };
+
+function membershipDiscounts(tier, applyPerkYes) { 
+  if (!tier || !applyPerkYes) return { serviceOff: 0, zoneOff: 0, freeAddonUpTo: 0, osOff: 0 }; 
+  if (tier === "standard") return { serviceOff: 0, zoneOff: 10, freeAddonUpTo: 10, osOff: 0 }; 
+  if (tier === "route") return { serviceOff: 5, zoneOff: 10, freeAddonUpTo: 10, osOff: 10 }; 
+  if (tier === "access") return { serviceOff: 8, zoneOff: 10, freeAddonUpTo: 10, osOff: 10 }; 
+  if (tier === "accesspro") return { serviceOff: 10, zoneOff: 10, freeAddonUpTo: 10, osOff: 15 }; 
+  return { serviceOff: 0, zoneOff: 0, freeAddonUpTo: 0, osOff: 0 }; 
+}
+
 const MEMBERSHIP_PLANS = {
-  standard: { id: "standard", name: "Standard", monthlyPrice: 15, link: SQUARE_LINK_STANDARD, eligibility: "", perks: ["1 free add-on up to $10 OR $10 off zone fee monthly"] },
-  route: { id: "route", name: "Route", monthlyPrice: 25, link: SQUARE_LINK_ROUTE, eligibility: "", perks: ["1 free add-on up to $10 OR $10 off zone fee monthly", "$5 off service fee on 1 order per run day"] },
-  access: { id: "access", name: "Access", monthlyPrice: 12, link: SQUARE_LINK_ACCESS, eligibility: "Seniors 60+ or disabled / mobility-limited / low income", perks: ["1 free add-on up to $10 OR $10 off zone fee per run cycle", "$8 off service fee on 1 order per run day", "Free phone/text ordering"] },
-  accesspro: { id: "accesspro", name: "Access Pro", monthlyPrice: 20, link: SQUARE_LINK_ACCESSPRO, eligibility: "Enhanced support tier", perks: ["$10 off service fee on 1 order per run day", "1 prescription pickup/delivery included monthly", "Document services included up to 10 pages/month in Tobermory area"] },
+  standard: { id: "standard", name: "Standard", monthlyPrice: 15, link: SQUARE_LINK_STANDARD, eligibility: "" },
+  route: { id: "route", name: "Route", monthlyPrice: 25, link: SQUARE_LINK_ROUTE, eligibility: "" },
+  access: { id: "access", name: "Access", monthlyPrice: 12, link: SQUARE_LINK_ACCESS, eligibility: "Seniors 60+ or disabled / mobility-limited" },
+  accesspro: { id: "accesspro", name: "Access Pro", monthlyPrice: 20, link: SQUARE_LINK_ACCESSPRO, eligibility: "Enhanced support tier" },
 };
 const MEMBERSHIP_ORDER = ["standard", "route", "access", "accesspro"];
-function getPublicMembershipPlans() { return MEMBERSHIP_ORDER.map((id) => { const p = MEMBERSHIP_PLANS[id]; return { id: p.id, name: p.name, monthlyPrice: p.monthlyPrice, priceLabel: `$${p.monthlyPrice} / month`, link: p.link, eligibility: p.eligibility, perks: p.perks }; }); }
+function getPublicMembershipPlans() { return MEMBERSHIP_ORDER.map((id) => { const p = MEMBERSHIP_PLANS[id]; return { id: p.id, name: p.name, monthlyPrice: p.monthlyPrice, priceLabel: `$${p.monthlyPrice} / month`, link: p.link, eligibility: p.eligibility }; }); }
 function getEffectiveMemberTierForUser(user, requestedTier = "") { const activeTier = user && user.membershipStatus === "active" && user.membershipLevel && user.membershipLevel !== "none" ? String(user.membershipLevel).trim().toLowerCase() : ""; if (activeTier && MEMBERSHIP_PLANS[activeTier]) return activeTier; const reqTier = String(requestedTier || "").trim().toLowerCase(); if (reqTier && MEMBERSHIP_PLANS[reqTier]) return reqTier; return ""; }
 function calcPrinting(pages) { const p = Number(pages || 0); if (p <= 0) return 0; const first = Math.min(p, 10); const rest = Math.max(0, p - 10); return PRICING.addOns.printingBase + first * PRICING.addOns.printingFirst10 + rest * PRICING.addOns.printingAfter10; }
-function membershipDiscounts(tier, applyPerkYes) { if (!tier || !applyPerkYes) return { serviceOff: 0, zoneOff: 0, freeAddonUpTo: 0, waitWaived: false }; if (tier === "standard") return { serviceOff: 0, zoneOff: 10, freeAddonUpTo: 10, waitWaived: false }; if (tier === "route") return { serviceOff: 5, zoneOff: 10, freeAddonUpTo: 10, waitWaived: false }; if (tier === "access") return { serviceOff: 8, zoneOff: 10, freeAddonUpTo: 10, waitWaived: true }; if (tier === "accesspro") return { serviceOff: 10, zoneOff: 0, freeAddonUpTo: 0, waitWaived: true }; return { serviceOff: 0, zoneOff: 0, freeAddonUpTo: 0, waitWaived: false }; }
 
 // =========================
 // MODELS
@@ -155,10 +173,24 @@ const OrderSchema = new mongoose.Schema(
     orderId: { type: String, unique: true, index: true }, orderClass: { type: String, enum: ["grocery", "ride"], default: "grocery" }, runKey: { type: String, required: true }, runType: { type: String, enum: ["local", "owen"], required: true }, spacePoints: { type: Number, default: 1 }, hold: { type: Boolean, default: false },
     flags: { type: { idRequired: { type: Boolean, default: false }, prescription: { type: Boolean, default: false }, alcohol: { type: Boolean, default: false }, bulky: { type: Boolean, default: false }, newCustomerDepositRequired: { type: Boolean, default: false }, needsContact: { type: Boolean, default: false } }, default: {} },
     customer: { fullName: String, email: String, phone: String, altPhone: { type: String, default: "" }, dob: { type: String, default: "" } }, address: { town: String, streetAddress: String, unit: { type: String, default: "" }, postalCode: { type: String, default: "" }, zone: { type: String, enum: ["A", "B", "C", "D"] } }, stores: { primary: String, extra: [String] }, preferences: { dropoffPref: String, subsPref: String, contactPref: String, contactAuth: Boolean },
-    addOns: { prescription: { requested: { type: Boolean, default: false }, pharmacyName: { type: String, default: "" }, notes: { type: String, default: "" } }, liquor: { requested: { type: Boolean, default: false }, storeName: { type: String, default: "" }, notes: { type: String, default: "" }, idRequired: { type: Boolean, default: true } }, printing: { requested: { type: Boolean, default: false }, pages: { type: Number, default: 0 }, notes: { type: String, default: "" } }, fastFood: { requested: { type: Boolean, default: false }, restaurant: { type: String, default: "" }, orderDetails: { type: String, default: "" } }, parcel: { requested: { type: Boolean, default: false }, carrier: { type: String, default: "" }, details: { type: String, default: "" } }, bulky: { requested: { type: Boolean, default: false }, details: { type: String, default: "" } }, ride: { requested: { type: Boolean, default: false }, pickupAddress: { type: String, default: "" }, destination: { type: String, default: "" }, preferredWindow: { type: String, default: "" }, notes: { type: String, default: "" } }, generalNotes: { type: String, default: "" } },
+    addOns: { 
+      prescription: { requested: { type: Boolean, default: false }, pharmacyName: { type: String, default: "" }, notes: { type: String, default: "" } }, 
+      liquor: { requested: { type: Boolean, default: false }, storeName: { type: String, default: "" }, notes: { type: String, default: "" }, idRequired: { type: Boolean, default: true } }, 
+      printing: { requested: { type: Boolean, default: false }, pages: { type: Number, default: 0 }, notes: { type: String, default: "" } }, 
+      fastFood: { requested: { type: Boolean, default: false }, restaurant: { type: String, default: "" }, orderDetails: { type: String, default: "" } }, 
+      parcel: { requested: { type: Boolean, default: false }, carrier: { type: String, default: "" }, details: { type: String, default: "" } }, 
+      bulky: { requested: { type: Boolean, default: false }, details: { type: String, default: "" } }, 
+      stockFridge: { requested: { type: Boolean, default: false } },
+      empties: { requested: { type: Boolean, default: false } },
+      ride: { requested: { type: Boolean, default: false }, pickupAddress: { type: String, default: "" }, destination: { type: String, default: "" }, preferredWindow: { type: String, default: "" }, notes: { type: String, default: "" } }, 
+      generalNotes: { type: String, default: "" } 
+    },
     deliveryMeta: { gateCode: { type: String, default: "" }, buildingAccessNotes: { type: String, default: "" }, parkingNotes: { type: String, default: "" }, budgetCap: { type: Number, default: 0 }, receiptPreference: { type: String, default: "" }, photoProofOk: { type: Boolean, default: false } },
     list: { groceryListText: String, attachment: { originalName: String, mimeType: String, size: Number, path: String } }, consents: { terms: Boolean, accuracy: Boolean, dropoff: Boolean }, pricingSnapshot: { serviceFee: Number, zoneFee: Number, runFee: Number, addOnsFees: Number, surcharges: Number, discount: Number, totalFees: Number },
-    payments: { fees: { status: { type: String, default: "unpaid" }, note: { type: String, default: "" }, paidAt: { type: Date, default: null } }, groceries: { status: { type: String, default: "unpaid" }, note: { type: String, default: "" }, paidAt: { type: Date, default: null }, squarePaymentId: { type: String, default: "" } } },
+    payments: { 
+      fees: { status: { type: String, default: "unpaid" }, note: { type: String, default: "" }, paidAt: { type: Date, default: null }, squarePaymentId: { type: String, default: "" } }, 
+      groceries: { status: { type: String, default: "unpaid" }, note: { type: String, default: "" }, paidAt: { type: Date, default: null }, squarePaymentId: { type: String, default: "" }, squareCustomerId: { type: String, default: "" }, squareCardId: { type: String, default: "" } } 
+    },
     status: { state: { type: String, enum: AllowedStates, default: "submitted" }, note: { type: String, default: "" }, updatedAt: { type: Date, default: Date.now }, updatedBy: { type: String, default: "system" } }, statusHistory: { type: [{ state: { type: String, enum: AllowedStates }, note: String, at: Date, by: String }], default: [] }, adminLog: { type: [{ at: Date, by: String, action: String, meta: Object }], default: [] },
   },
   { timestamps: true }
@@ -196,7 +228,6 @@ async function sendSms(toPhone, message) {
   } catch (error) { console.error("Twilio error:", String(error)); }
 }
 
-function money(n) { return Number(n || 0).toFixed(2); }
 function base64urlEncode(buf) { return Buffer.from(buf).toString("base64").replaceAll("+", "-").replaceAll("/", "_").replaceAll("=", ""); }
 function base64urlDecodeToString(b64url) { const pad = b64url.length % 4 ? "=".repeat(4 - (b64url.length % 4)) : ""; const b64 = b64url.replaceAll("-", "+").replaceAll("_", "/") + pad; return Buffer.from(b64, "base64").toString("utf8"); }
 function signCancelToken(orderId, expMs) { const payload = `${orderId}.${String(expMs)}`; const sig = crypto.createHmac("sha256", CANCEL_TOKEN_SECRET).update(payload).digest(); return `${base64urlEncode(payload)}.${base64urlEncode(sig)}`; }
@@ -212,13 +243,66 @@ async function nextOrderId(runType, runKey) {
 
 function safeJsonArray(str) { try { const v = JSON.parse(str || "[]"); return Array.isArray(v) ? v.map((x) => String(x || "").trim()).filter(Boolean) : []; } catch { return []; } }
 
+// =========================
+// CENTRAL PRICING CALCULATOR
+// =========================
 function computeFeeBreakdown(input) {
   if (input.orderClass === "ride") { const f = input.runType === "owen" ? PRICING.addOns.rideOwen : PRICING.addOns.rideLocal; return { totals: { serviceFee: 0, zoneFee: 0, runFee: 0, addOnsFees: f, surcharges: 0, discount: 0, totalFees: f } }; }
-  const zone = String(input.zone || ""); const runType = String(input.runType || "local"); const extraStores = Array.isArray(input.extraStores) ? input.extraStores.map(String).map((s) => s.trim()).filter(Boolean) : safeJsonArray(input.extraStoresJson); const pages = Math.max(0, Number(input.printPages || 0)); const grocerySubtotal = Math.max(0, Number(input.grocerySubtotal || 0)); const memberTier = String(input.memberTier || ""); const applyPerk = String(input.applyPerk || "yes") === "yes"; const disc = membershipDiscounts(memberTier, applyPerk);
-  const serviceFee = PRICING.serviceFee; const zoneFee = PRICING.zone[zone] || 0; const runFee = runType === "owen" ? PRICING.owenRunFeePerOrder : 0;
-  let addOnsFees = 0; if (extraStores.length) addOnsFees += extraStores.length * PRICING.addOns.extraStore; if (String(input.addon_printing || "") === "yes" && pages > 0) addOnsFees += calcPrinting(pages);
-  let surcharges = 0; if (grocerySubtotal > 0 && grocerySubtotal < PRICING.groceryUnderMin.threshold) surcharges += PRICING.groceryUnderMin.surcharge;
-  const discount = Math.min(serviceFee, disc.serviceOff || 0) + Math.max(Math.min(zoneFee, disc.zoneOff || 0), Math.min(addOnsFees + runFee, disc.freeAddonUpTo || 0));
+  
+  const zone = String(input.zone || ""); 
+  const runType = String(input.runType || "local"); 
+  const extraStores = Array.isArray(input.extraStores) ? input.extraStores.map(String).map((s) => s.trim()).filter(Boolean) : safeJsonArray(input.extraStoresJson); 
+  const pages = Math.max(0, Number(input.printPages || 0)); 
+  const grocerySubtotal = Math.max(0, Number(input.grocerySubtotal || 0)); 
+  const memberTier = String(input.memberTier || ""); 
+  const applyPerk = String(input.applyPerk || "yes") === "yes"; 
+
+  const disc = membershipDiscounts(memberTier, applyPerk);
+
+  const serviceFee = PRICING.serviceFee;
+  const zoneFee = PRICING.zone[zone] || 0;
+  
+  let runFee = runType === "owen" ? PRICING.owenRunFeePerOrder : 0;
+  if (runType === "owen" && applyPerk && disc.osOff) {
+     runFee = Math.max(0, runFee - disc.osOff);
+  }
+
+  let addOnsFees = 0;
+  let discountableAddOns = 0; // For tracking the "1 Free Extra Store Stop" perk value
+  
+  if (extraStores.length) {
+      const storeFees = extraStores.length * PRICING.addOns.extraStore;
+      addOnsFees += storeFees;
+      discountableAddOns += storeFees;
+  }
+  
+  if (String(input.addon_printing || "") === "yes" && pages > 0) addOnsFees += calcPrinting(pages);
+  if (String(input.addon_stockFridge || "") === "yes") addOnsFees += PRICING.addOns.stockFridge;
+  if (String(input.addon_empties || "") === "yes") addOnsFees += PRICING.addOns.empties;
+  
+  if (String(input.addon_bulky || "") === "yes") {
+      if (memberTier !== "accesspro") { addOnsFees += PRICING.addOns.bulky; }
+  }
+
+  let surcharges = 0;
+  // Apply the $15 Small Order Surcharge unless they are Route or AccessPro members
+  if (grocerySubtotal > 0 && grocerySubtotal < PRICING.groceryUnderMin.threshold) {
+     if (memberTier !== "route" && memberTier !== "accesspro") {
+        surcharges += PRICING.groceryUnderMin.surcharge;
+     }
+  }
+
+  let discount = Math.min(serviceFee, disc.serviceOff || 0);
+
+  if (memberTier === "accesspro" && applyPerk) {
+      // AccessPro Double Perk: Both zone AND addon discount apply simultaneously
+      discount += Math.min(zoneFee, disc.zoneOff || 0);
+      discount += Math.min(discountableAddOns, disc.freeAddonUpTo || 0);
+  } else if (applyPerk) {
+      // Standard Perk: Best of either Zone OR Addon discount
+      discount += Math.max(Math.min(zoneFee, disc.zoneOff || 0), Math.min(discountableAddOns, disc.freeAddonUpTo || 0));
+  }
+
   const totalFees = Math.max(0, serviceFee + zoneFee + runFee + addOnsFees + surcharges - discount);
   return { totals: { serviceFee, zoneFee, runFee, addOnsFees, surcharges, discount, totalFees } };
 }
@@ -283,6 +367,72 @@ app.get("/api/public/config", (_req, res) => {
 });
 app.get("/api/public/memberships", (_req, res) => { res.json({ ok: true, plans: getPublicMembershipPlans() }); });
 
+
+// =========================
+// SQUARE WEBHOOK LISTENER
+// =========================
+app.post("/api/webhooks/square", async (req, res) => {
+  // Acknowledge receipt immediately to prevent Square from retrying
+  res.status(200).send("OK");
+
+  try {
+    const signature = req.headers["x-square-hmacsha256-signature"];
+    if (SQUARE_WEBHOOK_SIGNATURE_KEY && signature) {
+      const hmac = crypto.createHmac("sha256", SQUARE_WEBHOOK_SIGNATURE_KEY);
+      hmac.update(SQUARE_WEBHOOK_URL + req.rawBody);
+      const hash = hmac.digest("base64");
+      if (hash !== signature) {
+        console.warn("⚠️ Invalid Square Webhook Signature received.");
+        return;
+      }
+    }
+
+    const event = req.body;
+    if (!event || !event.type) return;
+
+    // Listen for payment events triggered by membership link purchases
+    if (event.type === "payment.updated" || event.type === "payment.created") {
+      const payment = event.data?.object?.payment;
+      if (payment && payment.status === "COMPLETED" && payment.customer_id && payment.order_id) {
+         
+         if (!squareClient) return;
+         
+         // Fetch the customer to get their email address
+         const custRes = await squareClient.customersApi.retrieveCustomer(payment.customer_id);
+         const email = custRes.result?.customer?.emailAddress;
+         if (!email) return;
+
+         // Fetch the order to see exactly what they bought
+         const orderRes = await squareClient.ordersApi.retrieveOrder(payment.order_id);
+         const lineItems = orderRes.result?.order?.lineItems || [];
+         
+         let newTier = "";
+         for (const item of lineItems) {
+           const name = String(item.name).toLowerCase();
+           if (name.includes("access pro")) newTier = "accesspro";
+           else if (name.includes("access")) newTier = "access";
+           else if (name.includes("route")) newTier = "route";
+           else if (name.includes("standard")) newTier = "standard";
+         }
+
+         if (newTier) {
+            // Upgrade the user in the database
+            const normalizedEmail = email.toLowerCase().trim();
+            const renewal = dayjs().tz(TZ).add(1, 'month').toDate();
+            await User.updateOne(
+              { email: normalizedEmail },
+              { $set: { membershipLevel: newTier, membershipStatus: "active", renewalDate: renewal } }
+            );
+            console.log(`[Webhook Success] Upgraded ${normalizedEmail} to ${newTier} membership.`);
+         }
+      }
+    }
+  } catch (err) {
+    console.error("Square Webhook Processing Error:", err);
+  }
+});
+
+
 // =========================
 // AUTH ROUTES
 // =========================
@@ -335,7 +485,7 @@ app.get("/api/runs/active", async (_req, res) => {
 app.post("/api/estimator", (req, res) => { try { const effectiveMemberTier = getEffectiveMemberTierForUser(req.user, req.body?.memberTier || ""); res.json({ ok: true, effectiveMemberTier, breakdown: computeFeeBreakdown({ ...(req.body || {}), memberTier: effectiveMemberTier, applyPerk: "yes" }) }); } catch (e) { res.status(500).json({ ok: false, error: String(e) }); } });
 
 // =========================
-// ORDERS WITH SQUARE SDK
+// NEW PAYMENT ENGINE (FEES UPFRONT, GROCERIES ON FILE)
 // =========================
 app.post("/api/orders", requireLogin, requireProfileComplete, upload.single("groceryFile"), async (req, res) => {
   try {
@@ -360,29 +510,59 @@ app.post("/api/orders", requireLogin, requireProfileComplete, upload.single("gro
     if ((run.bookedPoints || 0) + spacePoints > (run.maxPoints || 10)) return res.status(409).json({ ok: false, error: `Vehicle capacity reached! This order requires ${spacePoints} space points, but the Jeep is too full.` });
 
     const orderId = await nextOrderId(runType, run.runKey); const effectiveMemberTier = getEffectiveMemberTierForUser(user, "");
-    const pricingSnapshot = computeFeeBreakdown({ orderClass, zone: b.zone, runType, extraStores: safeJsonArray(b.extraStores), grocerySubtotal: Number(b.grocerySubtotal || 0), addon_printing: b.addon_printing || "no", printPages: Number(b.printPages || 0), memberTier: effectiveMemberTier, applyPerk: "yes" }).totals;
+    
+    const pricingSnapshot = computeFeeBreakdown({ 
+      orderClass, zone: b.zone, runType, extraStores: safeJsonArray(b.extraStores), 
+      grocerySubtotal: Number(b.grocerySubtotal || 0), addon_printing: b.addon_printing || "no", 
+      printPages: Number(b.printPages || 0), addon_stockFridge: b.addon_stockFridge || "no", 
+      addon_empties: b.addon_empties || "no", addon_bulky: b.addon_bulky || "no", 
+      memberTier: effectiveMemberTier, applyPerk: "yes" 
+    }).totals;
 
-    let squarePaymentId = "";
-    let paymentStatus = "unpaid";
+    let squareCustomerId = "";
+    let squareCardId = "";
+    let feesPaymentId = "";
+    let feesStatus = "unpaid";
+
+    // CHARGE FEES INSTANTLY AND SAVE CARD ON FILE
     if (b.paymentSourceId && squareClient) {
-      let holdAmount = pricingSnapshot.totalFees;
-      if (orderClass === "grocery") {
-         const grocSub = Number(b.grocerySubtotal || 0);
-         holdAmount += (grocSub * 1.15); // 15% buffer
-      }
-      const holdCents = Math.round(holdAmount * 100);
+      const feeCents = Math.round(pricingSnapshot.totalFees * 100);
       try {
-        const sqRes = await squareClient.paymentsApi.createPayment({
-          sourceId: b.paymentSourceId,
+        // 1. Create a Square Customer
+        const custRes = await squareClient.customersApi.createCustomer({
           idempotencyKey: crypto.randomBytes(12).toString('hex'),
-          amountMoney: { amount: holdCents, currency: "CAD" },
-          autocomplete: false, 
-          locationId: SQUARE_LOCATION_ID
+          givenName: fullName.split(' ')[0],
+          familyName: fullName.split(' ').slice(1).join(' '),
+          emailAddress: String(user.email || "").trim().toLowerCase(),
+          phoneNumber: phone.replace(/\D/g, "")
         });
-        squarePaymentId = sqRes.result.payment.id;
-        paymentStatus = "authorized";
+        squareCustomerId = custRes.result.customer.id;
+
+        // 2. Save the card on file
+        const cardRes = await squareClient.cardsApi.createCard({
+          idempotencyKey: crypto.randomBytes(12).toString('hex'),
+          sourceId: b.paymentSourceId,
+          card: { cardholderName: fullName, customerId: squareCustomerId }
+        });
+        squareCardId = cardRes.result.card.id;
+
+        // 3. Instantly Charge the Service/Delivery Fees
+        if (feeCents > 0) {
+          const payRes = await squareClient.paymentsApi.createPayment({
+            idempotencyKey: crypto.randomBytes(12).toString('hex'),
+            sourceId: squareCardId,
+            customerId: squareCustomerId,
+            amountMoney: { amount: feeCents, currency: "CAD" },
+            autocomplete: true,
+            locationId: SQUARE_LOCATION_ID,
+            note: `TGR Fees - ${orderClass === 'ride' ? 'Ride' : 'Order'} ${orderId}`
+          });
+          feesPaymentId = payRes.result.payment.id;
+          feesStatus = "paid";
+        }
       } catch (err) {
-        return res.status(400).json({ ok: false, error: "Credit card authorization failed. Please try another card." });
+        console.error("Square Payment Error:", err);
+        return res.status(400).json({ ok: false, error: "Payment failed. Please ensure your card has sufficient funds for the service fees and supports being saved on file." });
       }
     }
 
@@ -394,11 +574,25 @@ app.post("/api/orders", requireLogin, requireProfileComplete, upload.single("gro
       customer: { fullName, email: String(user.email || "").trim().toLowerCase(), phone, altPhone: String(b.altPhone || "").trim(), dob: String(b.dob || "").trim() },
       address: { town: String(b.town || ""), streetAddress: String(b.streetAddress || ""), unit: String(b.unit || ""), postalCode: String(b.postalCode || ""), zone: String(b.zone || "") }, 
       stores: { primary: String(b.primaryStore || ""), extra: safeJsonArray(b.extraStores) }, preferences: { dropoffPref: String(b.dropoffPref || ""), subsPref: String(b.subsPref || ""), contactPref: String(b.contactPref || ""), contactAuth: true },
-      addOns: { prescription: { requested: yn(b.addon_prescription), pharmacyName: String(b.prescriptionPharmacy || ""), notes: String(b.prescriptionNotes || "") }, liquor: { requested: yn(b.addon_liquor), storeName: String(b.liquorStore || ""), notes: String(b.liquorNotes || ""), idRequired: true }, printing: { requested: yn(b.addon_printing), pages: Math.max(0, Number(b.printPages || 0)), notes: String(b.printingNotes || "") }, fastFood: { requested: yn(b.addon_fastfood), restaurant: String(b.fastFoodRestaurant || ""), orderDetails: String(b.fastFoodOrder || "") }, parcel: { requested: yn(b.addon_parcel), carrier: String(b.parcelCarrier || ""), details: String(b.parcelDetails || "") }, bulky: { requested: yn(b.addon_bulky), details: String(b.bulkyDetails || "") }, ride: { requested: orderClass === "ride", pickupAddress: String(b.ridePickup || ""), destination: String(b.rideDestination || ""), preferredWindow: String(b.rideWindow || ""), notes: String(b.rideNotes || "") }, generalNotes: String(b.optionalNotes || "") },
+      addOns: { 
+        prescription: { requested: yn(b.addon_prescription), pharmacyName: String(b.prescriptionPharmacy || ""), notes: String(b.prescriptionNotes || "") }, 
+        liquor: { requested: yn(b.addon_liquor), storeName: String(b.liquorStore || ""), notes: String(b.liquorNotes || ""), idRequired: true }, 
+        printing: { requested: yn(b.addon_printing), pages: Math.max(0, Number(b.printPages || 0)), notes: String(b.printingNotes || "") }, 
+        fastFood: { requested: yn(b.addon_fastfood), restaurant: String(b.fastFoodRestaurant || ""), orderDetails: String(b.fastFoodOrder || "") }, 
+        parcel: { requested: yn(b.addon_parcel), carrier: String(b.parcelCarrier || ""), details: String(b.parcelDetails || "") }, 
+        bulky: { requested: yn(b.addon_bulky), details: String(b.bulkyDetails || "") }, 
+        stockFridge: { requested: yn(b.addon_stockFridge) },
+        empties: { requested: yn(b.addon_empties) },
+        ride: { requested: orderClass === "ride", pickupAddress: String(b.ridePickup || ""), destination: String(b.rideDestination || ""), preferredWindow: String(b.rideWindow || ""), notes: String(b.rideNotes || "") }, 
+        generalNotes: String(b.optionalNotes || "") 
+      },
       deliveryMeta: { gateCode: String(b.gateCode || ""), buildingAccessNotes: String(b.buildingAccessNotes || ""), parkingNotes: String(b.parkingNotes || ""), budgetCap: Math.max(0, Number(b.budgetCap || 0)), receiptPreference: String(b.receiptPreference || ""), photoProofOk: yn(b.photoProofOk) },
       list: { groceryListText: String(b.groceryList || ""), attachment: req.file ? { originalName: req.file.originalname, mimeType: req.file.mimetype, size: req.file.size, path: req.file.path } : null }, 
       consents: { terms: true, accuracy: true, dropoff: yn(b.consent_dropoff) }, pricingSnapshot,
-      payments: { fees: { status: "unpaid" }, groceries: { status: paymentStatus, squarePaymentId } }, 
+      payments: { 
+        fees: { status: feesStatus, squarePaymentId: feesPaymentId, paidAt: feesStatus === "paid" ? new Date() : null }, 
+        groceries: { status: "unpaid", note: "Card successfully saved on file.", squareCustomerId, squareCardId } 
+      }, 
       status: { state: "submitted", note: "", updatedAt: new Date(), updatedBy: "customer" }, statusHistory: [{ state: "submitted", note: "", at: new Date(), by: "customer" }],
       adminLog: [{ at: new Date(), by: "system", action: "order_created", meta: { runKey: run.runKey, effectiveMemberTier, orderClass } }],
     });
@@ -415,9 +609,16 @@ app.post("/api/orders/:orderId/cancel", async (req, res) => {
     if (!verifyCancelToken(orderId, String(req.body?.token || "").trim()).ok) return res.status(403).json({ ok: false, error: "Invalid cancel token." });
     if (!nowTz().isBefore(dayjs(run.cutoffAt).tz(TZ))) return res.status(403).json({ ok: false, error: "Cancellation window closed." });
 
-    if (order.payments.groceries.squarePaymentId && order.payments.groceries.status === "authorized" && squareClient) {
-      try { await squareClient.paymentsApi.cancelPayment(order.payments.groceries.squarePaymentId); } catch(err) { console.error("Square void failed on cancel:", err); }
-      order.payments.groceries.status = "voided";
+    // REFUND THE FEES IF CANCELED BEFORE CUTOFF
+    if (order.payments.fees.squarePaymentId && order.payments.fees.status === "paid" && squareClient) {
+      try { 
+        await squareClient.refundsApi.refundPayment({
+          idempotencyKey: crypto.randomBytes(12).toString('hex'),
+          paymentId: order.payments.fees.squarePaymentId,
+          amountMoney: { amount: Math.round(order.pricingSnapshot.totalFees * 100), currency: "CAD" }
+        });
+        order.payments.fees.status = "refunded";
+      } catch(err) { console.error("Square refund failed on cancel:", err); }
     }
 
     await Run.updateOne({ runKey: order.runKey }, { $inc: { bookedOrdersCount: -1, bookedFeesTotal: -Number(order.pricingSnapshot?.totalFees || 0), bookedPoints: -Number(order.spacePoints || 1) }, $set: { lastRecalcAt: new Date() } });
@@ -469,7 +670,9 @@ app.get("/api/admin/orders/:orderId", requireLogin, requireAdmin, async (req, re
   }
 });
 
-// SQUARE FINAL CAPTURE (ADMIN ONLY)
+// =========================
+// ADMIN: CHARGE GROCERIES TO SAVED CARD
+// =========================
 app.post("/api/admin/orders/:orderId/capture", requireLogin, requireAdmin, async (req, res) => {
   try {
     const orderId = String(req.params.orderId || "").trim().toUpperCase();
@@ -477,17 +680,24 @@ app.post("/api/admin/orders/:orderId/capture", requireLogin, requireAdmin, async
     const order = await Order.findOne({ orderId });
     if (!order) return res.status(404).json({ ok: false, error: "Order not found" });
 
-    const finalAmount = finalGroceryTotal + Number(order.pricingSnapshot.totalFees || 0);
-    const finalCents = Math.round(finalAmount * 100);
+    const finalCents = Math.round(finalGroceryTotal * 100);
 
-    if (order.payments.groceries.squarePaymentId && order.payments.groceries.status === "authorized") {
+    if (finalCents > 0 && order.payments.groceries.squareCardId && order.payments.groceries.squareCustomerId) {
        if (!squareClient) throw new Error("Square client not configured on server.");
-       await squareClient.paymentsApi.completePayment(order.payments.groceries.squarePaymentId, {
-         amountMoney: { amount: finalCents, currency: "CAD" }
+       const payRes = await squareClient.paymentsApi.createPayment({
+         idempotencyKey: crypto.randomBytes(12).toString('hex'),
+         sourceId: order.payments.groceries.squareCardId,
+         customerId: order.payments.groceries.squareCustomerId,
+         amountMoney: { amount: finalCents, currency: "CAD" },
+         autocomplete: true,
+         locationId: SQUARE_LOCATION_ID,
+         note: `TGR Groceries - Order ${order.orderId}`
        });
+       order.payments.groceries.squarePaymentId = payRes.result.payment.id;
     }
 
-    order.payments.groceries.status = "paid"; order.payments.fees.status = "paid";
+    order.payments.groceries.status = "paid";
+    order.payments.groceries.paidAt = new Date();
     order.payments.groceries.note = "Exact grocery total: $" + finalGroceryTotal.toFixed(2);
     order.status.state = "out_for_delivery"; order.status.updatedAt = new Date(); order.status.updatedBy = adminBy(req);
     order.statusHistory.push({ state: "out_for_delivery", note: "Payment finalized, driver dispatched", at: new Date(), by: adminBy(req) });
@@ -497,7 +707,7 @@ app.post("/api/admin/orders/:orderId/capture", requireLogin, requireAdmin, async
     if (phone) {
        const run = await Run.findOne({ runKey: order.runKey }).lean(); let trackingLink = "";
        if (run) trackingLink = `${PUBLIC_SITE_URL}/member?trackRunKey=${encodeURIComponent(run.runKey)}&token=${encodeURIComponent(signTrackingToken(order.orderId, run.runKey, dayjs(run.cutoffAt).add(1, "day").valueOf()))}&orderId=${encodeURIComponent(order.orderId)}`;
-       const smsMessage = `Hi ${firstName}, your groceries are packed! The exact receipt total was $${finalGroceryTotal.toFixed(2)}. We have finalized your payment and released the remaining hold. I'm on my way to drop off your order! 🚙💨 Track live: ${trackingLink}`;
+       const smsMessage = `Hi ${firstName}, your groceries are packed! The exact receipt total was $${finalGroceryTotal.toFixed(2)}. We have successfully billed your saved card for the groceries. I'm on my way to drop off your order! 🚙💨 Track live: ${trackingLink}`;
        await sendSms(phone, smsMessage);
     }
     res.json({ ok: true });
@@ -591,7 +801,7 @@ app.get("/member", requireLogin, async (req, res) => {
     }).join("");
 
     res.setHeader("Content-Type", "text/html; charset=utf-8");
-    res.send(`<!doctype html><html lang="en-CA"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>TGR Member Portal</title><style>:root{--bg:#0b0b0b; --panel:rgba(255,255,255,.06); --line:rgba(255,255,255,.14); --text:#fff; --muted:rgba(255,255,255,.75); --red:#e3342f; --red2:#ff4a44; --radius:14px;} body{margin:0;background:var(--bg);color:var(--text);font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;} .wrap{max-width:1250px;margin:0 auto;padding:16px;} .card{border:1px solid var(--line);background:var(--panel);border-radius:var(--radius);padding:14px;} .row{display:flex;gap:10px;flex-wrap:wrap;align-items:center;} .btn{border:1px solid rgba(255,255,255,.18);background:rgba(255,255,255,.06);color:#fff;font-weight:900;border-radius:999px;padding:10px 14px;cursor:pointer;text-decoration:none;white-space:nowrap;} .btn.primary{background:linear-gradient(180deg,var(--red2),var(--red));border-color:rgba(0,0,0,.25);} .btn.ghost{background:transparent;} .muted{color:var(--muted);} .pill{display:inline-block;padding:4px 10px;border-radius:999px;border:1px solid rgba(255,255,255,.18);background:rgba(255,255,255,.06);font-weight:900;font-size:12px;} table{width:100%;border-collapse:collapse;} th,td{padding:10px 8px;border-bottom:1px solid rgba(255,255,255,.12);vertical-align:top;} th{font-size:12px;color:rgba(255,255,255,.72);text-transform:uppercase;letter-spacing:.08em;text-align:left;} .toast{margin-top:10px;padding:10px 12px;border-radius:12px;border:1px solid rgba(255,255,255,.18);background:rgba(0,0,0,.24);display:none;font-weight:900;} .toast.show{display:block;} .hr{height:1px;background:rgba(255,255,255,.12);margin:12px 0;} .grid{display:grid;grid-template-columns: 1fr 1fr; gap:12px;} @media (max-width: 980px){ .grid{grid-template-columns: 1fr;} } #mapWrap{display:none;} #map{height: 420px; border-radius: 14px; border:1px solid rgba(255,255,255,.14); overflow:hidden;} .small{font-size:13px;} .warn{border:1px solid rgba(227,52,47,.45);background:rgba(227,52,47,.12);border-radius:12px;padding:10px 12px;}</style></head><body><div class="wrap"><div class="card"><div class="row" style="justify-content:space-between;"><div><div style="font-weight:1000;font-size:22px;">Member Portal</div><div class="muted">Signed in as <strong>${escapeHtml(email)}</strong>${name ? ` • ${escapeHtml(name)}` : ""}</div></div><div class="row"><a class="btn ghost" href="${escapeHtml(PUBLIC_SITE_URL)}/">Back to site</a><a class="btn" href="${escapeHtml(SQUARE_PAY_GROCERIES_LINK)}" target="_blank" rel="noopener">Pay Grocery Total</a><a class="btn" href="${escapeHtml(SQUARE_PAY_FEES_LINK)}" target="_blank" rel="noopener">Pay Service & Delivery Fees</a><a class="btn ghost" href="/logout?returnTo=${encodeURIComponent(PUBLIC_SITE_URL + "/")}">Log out</a></div></div><div class="toast" id="toast"></div>
+    res.send(`<!doctype html><html lang="en-CA"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>TGR Member Portal</title><style>:root{--bg:#0b0b0b; --panel:rgba(255,255,255,.06); --line:rgba(255,255,255,.14); --text:#fff; --muted:rgba(255,255,255,.75); --red:#e3342f; --red2:#ff4a44; --radius:14px;} body{margin:0;background:var(--bg);color:var(--text);font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;} .wrap{max-width:1250px;margin:0 auto;padding:16px;} .card{border:1px solid var(--line);background:var(--panel);border-radius:var(--radius);padding:14px;} .row{display:flex;gap:10px;flex-wrap:wrap;align-items:center;} .btn{border:1px solid rgba(255,255,255,.18);background:rgba(255,255,255,.06);color:#fff;font-weight:900;border-radius:999px;padding:10px 14px;cursor:pointer;text-decoration:none;white-space:nowrap;} .btn.primary{background:linear-gradient(180deg,var(--red2),var(--red));border-color:rgba(0,0,0,.25);} .btn.ghost{background:transparent;} .muted{color:var(--muted);} .pill{display:inline-block;padding:4px 10px;border-radius:999px;border:1px solid rgba(255,255,255,.18);background:rgba(255,255,255,.06);font-weight:900;font-size:12px;} table{width:100%;border-collapse:collapse;} th,td{padding:10px 8px;border-bottom:1px solid rgba(255,255,255,.12);vertical-align:top;} th{font-size:12px;color:rgba(255,255,255,.72);text-transform:uppercase;letter-spacing:.08em;text-align:left;} .toast{margin-top:10px;padding:10px 12px;border-radius:12px;border:1px solid rgba(255,255,255,.18);background:rgba(0,0,0,.24);display:none;font-weight:900;} .toast.show{display:block;} .hr{height:1px;background:rgba(255,255,255,.12);margin:12px 0;} .grid{display:grid;grid-template-columns: 1fr 1fr; gap:12px;} @media (max-width: 980px){ .grid{grid-template-columns: 1fr;} } #mapWrap{display:none;} #map{height: 420px; border-radius: 14px; border:1px solid rgba(255,255,255,.14); overflow:hidden;} .small{font-size:13px;} .warn{border:1px solid rgba(227,52,47,.45);background:rgba(227,52,47,.12);border-radius:12px;padding:10px 12px;}</style></head><body><div class="wrap"><div class="card"><div class="row" style="justify-content:space-between;"><div><div style="font-weight:1000;font-size:22px;">Member Portal</div><div class="muted">Signed in as <strong>${escapeHtml(email)}</strong>${name ? ` • ${escapeHtml(name)}` : ""}</div></div><div class="row"><a class="btn ghost" href="${escapeHtml(PUBLIC_SITE_URL)}/">Back to site</a><a class="btn ghost" href="/logout?returnTo=${encodeURIComponent(PUBLIC_SITE_URL + "/")}">Log out</a></div></div><div class="toast" id="toast"></div>
 
 <div class="hr"></div>
 
@@ -640,6 +850,15 @@ app.get("/api/admin/runs/:runKey/master-list", requireLogin, requireAdmin, async
     res.json({ ok: true, runKey, items: Object.values(tally).sort((a, b) => a.name.localeCompare(b.name)), extraStops });
   } catch(e) { res.status(500).json({ ok: false, error: String(e) }); }
 });
+
+function buildAddonsText(o){
+  const lines = [];
+  if (o.addOns?.stockFridge?.requested) lines.push("PREMIUM: Stock the Fridge (+$25)");
+  if (o.addOns?.empties?.requested) lines.push("PREMIUM: Empties Return (+$15)");
+  if (o.addOns?.bulky?.requested) lines.push("OVERSIZE ITEM: " + (o.addOns.bulky.details || "Yes"));
+  if (o.addOns?.generalNotes) lines.push("General notes: " + o.addOns.generalNotes);
+  return lines.length ? lines.join("\n") : "—";
+}
 
 // =========================
 // ADMIN PAGE (Includes Magic Capture UI)
@@ -716,11 +935,11 @@ app.get("/admin", requireLogin, requireAdmin, async (_req, res) => {
         <div class="k">Square Payment Status</div><div class="v" id="m_groceriesCurrent">—</div><div class="hr"></div>
         
         <div class="card" style="box-shadow:none; border: 1px solid rgba(227,52,47,.45) !important; background: rgba(227,52,47,.1) !important; margin-bottom:14px;">
-          <div class="k" style="color: #ff4a44;">Finalize Payment (Delayed Capture)</div>
-          <div class="muted small" style="margin-bottom:8px;">Enter exact receipt total. This captures the exact amount via Square and texts the customer.</div>
+          <div class="k" style="color: #ff4a44;">Finalize Groceries (Charge Saved Card)</div>
+          <div class="muted small" style="margin-bottom:8px;">Enter exact receipt total. This automatically charges their saved card and texts the customer.</div>
           <div class="row">
             <input id="m_finalGroceryTotal" type="number" step="0.01" placeholder="Receipt total ($)" style="max-width:160px; background:rgba(0,0,0,.4);" />
-            <button class="btn primary" id="m_captureBtn">Finalize & Dispatch 🚙</button>
+            <button class="btn primary" id="m_captureBtn">Charge Card & Dispatch 🚙</button>
           </div>
         </div>
 
@@ -760,7 +979,16 @@ app.get("/admin", requireLogin, requireAdmin, async (_req, res) => {
   async function search(){ rowsEl.innerHTML = '<tr><td colspan="7" class="muted">Loading…</td></tr>'; try{ const r = await fetch("/api/admin/orders?" + buildQuery(), { credentials:"include" }); const d = await r.json(); render(d.items || []); } catch(e){ rowsEl.innerHTML = '<tr><td colspan="7" class="muted">Error: ' + esc(e) + '</td></tr>'; } }
 
   function openModal(show){ qs("modalBack").style.display = show ? "flex" : "none"; }
-  function buildAddonsText(o){ const lines = []; if (o.addOns?.generalNotes) lines.push("General notes: " + o.addOns.generalNotes); return lines.length ? lines.join("\\n") : "—"; }
+
+  // Admin formatting for the modal popup
+  function buildAddonsText(o){
+    const lines = [];
+    if (o.addOns?.stockFridge?.requested) lines.push("PREMIUM: Stock the Fridge (+$25)");
+    if (o.addOns?.empties?.requested) lines.push("PREMIUM: Empties Return (+$15)");
+    if (o.addOns?.bulky?.requested) lines.push("OVERSIZE ITEM: " + (o.addOns.bulky.details || "Yes"));
+    if (o.addOns?.generalNotes) lines.push("General notes: " + o.addOns.generalNotes);
+    return lines.length ? lines.join("\\n") : "—";
+  }
 
   async function openOrder(orderId){
     try{
@@ -776,7 +1004,7 @@ app.get("/admin", requireLogin, requireAdmin, async (_req, res) => {
     if(!modalOrder?.orderId) return;
     const finalGroc = qs("m_finalGroceryTotal").value;
     if(!finalGroc) return toast("Enter the exact grocery total from the receipt.");
-    if(!confirm("Capture exact payment and dispatch driver?")) return;
+    if(!confirm("Charge their saved card and dispatch driver?")) return;
     try {
       const r = await fetch("/api/admin/orders/" + encodeURIComponent(modalOrder.orderId) + "/capture", {
         method: "POST", headers:{ "Content-Type":"application/json" }, credentials: "include",
@@ -784,7 +1012,7 @@ app.get("/admin", requireLogin, requireAdmin, async (_req, res) => {
       });
       const d = await r.json();
       if(!r.ok || d.ok===false) throw new Error(d.error || "Capture failed");
-      toast("Payment captured & customer notified! ✅");
+      toast("Card charged & customer notified! ✅");
       await openOrder(modalOrder.orderId); await search();
     } catch(e) { toast(String(e.message||e)); }
   });
