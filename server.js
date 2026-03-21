@@ -138,7 +138,7 @@ app.use(passport.session());
 // PRICING BASELINE & LOGIC
 // =========================
 const PRICING = {
-  serviceFee: 27, 
+  serviceFee: 27, // UPGRADED TO $27
   zone: { A: 20, B: 15, C: 10, D: 25 }, 
   owenRunFeePerOrder: 15,
   addOns: { extraStore: 8, printingBase: 5, printingFirst10: 1.25, printingAfter10: 0.75, rideLocal: 15, rideOwen: 50, stockFridge: 25, empties: 15, bulky: 10 },
@@ -457,7 +457,6 @@ app.post("/api/profile", requireLogin, async (req, res) => {
   try {
     const b = req.body || {}; const u = await User.findById(req.user._id); if (!u) return res.status(404).json({ ok: false, error: "User not found" });
     const addresses = Array.isArray(b.addresses) ? b.addresses : [];
-    
     const savedList = Array.isArray(b.savedList) ? b.savedList.map(s => String(s).trim()).filter(Boolean) : [];
 
     const newProfile = {
@@ -528,6 +527,7 @@ app.post("/api/orders", requireLogin, requireProfileComplete, upload.single("gro
     let feesPaymentId = "";
     let feesStatus = "unpaid";
 
+    // CHARGE FEES INSTANTLY AND SAVE CARD ON FILE
     if (b.paymentSourceId && squareClient) {
       const feeCents = Math.round(pricingSnapshot.totalFees * 100);
       try {
@@ -631,10 +631,26 @@ app.post("/api/admin/orders/:orderId/capture", requireLogin, requireAdmin, async
   try {
     const orderId = String(req.params.orderId || "").trim().toUpperCase();
     const finalGroceryTotal = Number(req.body.finalGroceryTotal || 0);
+    const bagsUsed = Math.max(0, Number(req.body.bagsUsed || 0));
     const order = await Order.findOne({ orderId });
     if (!order) return res.status(404).json({ ok: false, error: "Order not found" });
 
-    const finalCents = Math.round(finalGroceryTotal * 100);
+    // Check user to see if they get free bags
+    const user = await User.findOne({ email: String(order.customer.email).toLowerCase() }).lean();
+    const effectiveMemberTier = getEffectiveMemberTierForUser(user);
+    
+    let bagFee = 0;
+    let bagNote = "";
+    if (bagsUsed > 0) {
+        if (!effectiveMemberTier || effectiveMemberTier === "none") {
+            bagFee = bagsUsed * 1.50; // $1.50 per bag for non-members
+            bagNote = `(+ $${bagFee.toFixed(2)} for ${bagsUsed} premium bags)`;
+        } else {
+            bagNote = `(${bagsUsed} premium bags provided FREE for Member)`;
+        }
+    }
+
+    const finalCents = Math.round((finalGroceryTotal + bagFee) * 100);
 
     if (finalCents > 0 && order.payments.groceries.squareCardId && order.payments.groceries.squareCustomerId) {
        if (!squareClient) throw new Error("Square client not configured on server.");
@@ -652,7 +668,7 @@ app.post("/api/admin/orders/:orderId/capture", requireLogin, requireAdmin, async
 
     order.payments.groceries.status = "paid";
     order.payments.groceries.paidAt = new Date();
-    order.payments.groceries.note = "Exact grocery total: $" + finalGroceryTotal.toFixed(2);
+    order.payments.groceries.note = "Exact grocery total: $" + finalGroceryTotal.toFixed(2) + " " + bagNote;
     order.status.state = "out_for_delivery"; order.status.updatedAt = new Date(); order.status.updatedBy = adminBy(req);
     order.statusHistory.push({ state: "out_for_delivery", note: "Payment finalized, driver dispatched", at: new Date(), by: adminBy(req) });
     await order.save();
@@ -661,7 +677,9 @@ app.post("/api/admin/orders/:orderId/capture", requireLogin, requireAdmin, async
     if (phone) {
        const run = await Run.findOne({ runKey: order.runKey }).lean(); let trackingLink = "";
        if (run) trackingLink = `${PUBLIC_SITE_URL}/member?trackRunKey=${encodeURIComponent(run.runKey)}&token=${encodeURIComponent(signTrackingToken(order.orderId, run.runKey, dayjs(run.cutoffAt).add(1, "day").valueOf()))}&orderId=${encodeURIComponent(order.orderId)}`;
-       const smsMessage = `The Patriot is rolling! 🚙💨 ${firstName}, your groceries are packed and your saved card was billed for the exact receipt total ($${finalGroceryTotal.toFixed(2)}). Watch my exact location live right here: ${trackingLink} - TGR`;
+       
+       // Build dynamic SMS message with bag notes
+       const smsMessage = `The Patriot is rolling! 🚙💨 ${firstName}, your groceries are packed and your saved card was billed for the exact receipt total ($${finalGroceryTotal.toFixed(2)}${bagNote ? ' ' + bagNote.trim() : ''}). Watch my exact location live right here: ${trackingLink} - TGR`;
        await sendSms(phone, smsMessage);
     }
     res.json({ ok: true });
@@ -729,36 +747,80 @@ app.delete("/api/admin/orders/:orderId", requireLogin, requireAdmin, async (req,
 app.post("/api/admin/tracking/:runKey/start", requireLogin, requireAdmin, async (req, res) => { try { const runKey = String(req.params.runKey || "").trim(); await ensureTrackingDoc(runKey); await Tracking.updateOne({ runKey }, { $set: { enabled: true, startedAt: new Date(), stoppedAt: null, updatedBy: adminBy(req) } }); res.json({ ok: true, runKey }); } catch (e) { res.status(500).json({ ok: false, error: String(e) }); } });
 app.post("/api/admin/tracking/:runKey/stop", requireLogin, requireAdmin, async (req, res) => { try { const runKey = String(req.params.runKey || "").trim(); await ensureTrackingDoc(runKey); await Tracking.updateOne({ runKey }, { $set: { enabled: false, stoppedAt: new Date(), updatedBy: adminBy(req) } }); res.json({ ok: true, runKey }); } catch (e) { res.status(500).json({ ok: false, error: String(e) }); } });
 app.post("/api/admin/tracking/:runKey/update", requireLogin, requireAdmin, async (req, res) => { try { const runKey = String(req.params.runKey || "").trim(); const lat = Number(req.body?.lat); const lng = Number(req.body?.lng); if (!Number.isFinite(lat) || !Number.isFinite(lng)) return res.status(400).json({ ok: false, error: "lat/lng required" }); await ensureTrackingDoc(runKey); await Tracking.updateOne({ runKey }, { $set: { lastLat: lat, lastLng: lng, lastHeading: Number.isFinite(Number(req.body?.heading)) ? Number(req.body?.heading) : null, lastSpeed: Number.isFinite(Number(req.body?.speed)) ? Number(req.body?.speed) : null, lastAccuracy: Number.isFinite(Number(req.body?.accuracy)) ? Number(req.body?.accuracy) : null, lastAt: new Date(), updatedBy: adminBy(req) } }); res.json({ ok: true }); } catch (e) { res.status(500).json({ ok: false, error: String(e) }); } });
-app.get("/api/admin/orders/:orderId/tracking-link", requireLogin, requireAdmin, async (req, res) => { try { const orderId = String(req.params.orderId || "").trim().toUpperCase(); const o = await Order.findOne({ orderId }).lean(); if (!o) return res.status(404).json({ ok: false, error: "Order not found" }); const run = await Run.findOne({ runKey: o.runKey }).lean(); if (!run) return res.status(404).json({ ok: false, error: "Run not found" }); res.json({ ok: true, url: `${PUBLIC_SITE_URL}/member?trackRunKey=${encodeURIComponent(run.runKey)}&token=${encodeURIComponent(signTrackingToken(o.orderId, run.runKey, dayjs(run.cutoffAt).add(1, "day").valueOf()))}&orderId=${encodeURIComponent(o.orderId)}` }); } catch (e) { res.status(500).json({ ok: false, error: String(e) }); } });
+
+function renderPublicTracking(res, orderId, runKey, token) {
+  res.setHeader("Content-Type", "text/html; charset=utf-8");
+  res.send(`<!doctype html><html lang="en-CA"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>TGR Live Tracking</title>
+  <style>body{background:#0b0b0b;color:#fff;font-family:system-ui,-apple-system,sans-serif;margin:0;padding:20px;} .card{background:rgba(255,255,255,.05);border:1px solid rgba(255,255,255,.1);border-radius:14px;padding:16px;max-width:600px;margin:0 auto;} #map{height:400px;border-radius:10px;margin:14px 0;background:#1a1a1a; overflow:hidden;} .pill{background:rgba(255,255,255,.1);padding:6px 12px;border-radius:999px;font-size:13px; font-weight:bold;}</style>
+  </head><body>
+  <div class="card">
+    <h2 style="margin-top:0;">Live Tracking: ${escapeHtml(orderId)}</h2>
+    <p style="color:rgba(255,255,255,.7);font-size:14px; margin-top:0;">Keep this page open to watch the Jeep approach your location.</p>
+    <div id="map"></div>
+    <div style="display:flex;gap:10px;align-items:center;">
+      <span class="pill" id="mapStatus">Connecting...</span>
+      <span class="pill" id="mapLast">Last: —</span>
+    </div>
+  </div>
+  <script>
+    let MAPBOX_TOKEN = ""; let map, marker, pollTimer;
+    async function init(){
+       const r = await fetch("/api/public/config"); const d = await r.json(); MAPBOX_TOKEN = d.mapboxPublicToken;
+       if(!window.mapboxgl) {
+          const css = document.createElement("link"); css.rel="stylesheet"; css.href="https://api.mapbox.com/mapbox-gl-js/v2.15.0/mapbox-gl.css"; document.head.appendChild(css);
+          const s = document.createElement("script"); s.src="https://api.mapbox.com/mapbox-gl-js/v2.15.0/mapbox-gl.js";
+          s.onload = start; document.head.appendChild(s);
+       } else { start(); }
+    }
+    async function start(){
+       if (!MAPBOX_TOKEN) { document.getElementById("mapStatus").textContent = "Mapbox token missing."; return; }
+       mapboxgl.accessToken = MAPBOX_TOKEN;
+       map = new mapboxgl.Map({container: "map", style: "mapbox://styles/mapbox/dark-v11", center: [-81.7, 45.25], zoom: 9});
+       marker = new mapboxgl.Marker({ color: "#ff4a44" }).setLngLat([-81.7, 45.25]).addTo(map);
+       poll(); pollTimer = setInterval(poll, 2500);
+    }
+    async function poll(){
+       try{
+         const r = await fetch("/api/public/tracking/${encodeURIComponent(runKey)}?token=${encodeURIComponent(token)}");
+         const d = await r.json();
+         if(!d.ok){ document.getElementById("mapStatus").textContent = "Error"; return; }
+         if(!d.enabled){ document.getElementById("mapStatus").textContent = "Tracking off"; return; }
+         if(!d.hasFix){ document.getElementById("mapStatus").textContent = "Waiting for GPS"; return; }
+         document.getElementById("mapStatus").textContent = "Live ✅";
+         document.getElementById("mapLast").textContent = "Last: " + new Date(d.last.at).toLocaleTimeString();
+         marker.setLngLat([d.last.lng, d.last.lat]);
+         map.easeTo({ center: [d.last.lng, d.last.lat], zoom: 12, duration: 900 });
+       }catch(e){}
+    }
+    init();
+  </script>
+  </body></html>`);
+}
 
 // =========================
-// MEMBER PORTAL (With Rating, Tipping & Tracking Bypass)
+// MEMBER PORTAL (With Rating & Tipping)
 // =========================
 app.get("/member", async (req, res) => {
   try {
-    const tokenStr = String(req.query.token || "").trim();
-    const vt = tokenStr ? verifyTrackingToken(tokenStr) : { ok: false };
-    
-    // If they aren't logged in AND they don't have a tracking token, kick them to login
-    if (!req.user && !vt.ok) {
-        return res.redirect(PUBLIC_SITE_URL + "/?tab=account");
+    const trackRunKey = String(req.query.trackRunKey || "").trim();
+    const token = String(req.query.token || "").trim();
+    const orderId = String(req.query.orderId || "").trim();
+
+    // 1. If valid tracking link, bypass login and serve standalone tracking map
+    if (trackRunKey && token && orderId) {
+       const vt = verifyTrackingToken(token);
+       if (vt.ok && vt.orderId === orderId && vt.runKey === trackRunKey) {
+          return renderPublicTracking(res, orderId, trackRunKey, token);
+       }
     }
 
-    const email = req.user ? String(req.user.email || "").toLowerCase().trim() : ""; 
-    const name = req.user ? String(req.user.name || "").trim() : "Guest";
-    
-    let orders = [];
-    if (req.user) {
-        orders = await Order.find({ "customer.email": email }).sort({ createdAt: -1 }).limit(80).lean();
-    } else if (vt.ok && vt.orderId) {
-        // They are just tracking an order via SMS link
-        const o = await Order.findOne({ orderId: vt.orderId }).lean();
-        if (o) orders = [o];
-    }
-    
+    // 2. Otherwise, enforce login for the normal Member Portal
+    if (!req.user) return res.redirect(PUBLIC_SITE_URL + "/?tab=account");
+
+    const email = String(req.user?.email || "").toLowerCase().trim(); const name = String(req.user?.name || "").trim();
+    const orders = await Order.find({ "customer.email": email }).sort({ createdAt: -1 }).limit(80).lean();
     const runKeys = Array.from(new Set(orders.map(o => o.runKey).filter(Boolean)));
-    const runs = await Run.find({ runKey: { $in: runKeys } }).lean(); 
-    const runByKey = new Map(runs.map(r => [r.runKey, r]));
+    const runs = await Run.find({ runKey: { $in: runKeys } }).lean(); const runByKey = new Map(runs.map(r => [r.runKey, r]));
     const now = nowTz(); const trackables = [];
     for (const o of orders) {
       const status = o.status?.state || "submitted"; if (!ACTIVE_STATES.has(status)) continue;
@@ -786,13 +848,8 @@ app.get("/member", async (req, res) => {
       return `<tr><td><div style="font-weight:1000;">${escapeHtml(o.orderId)}</div><div class="muted" style="font-size:12px;">${escapeHtml(fmtLocal(o.createdAt))}</div></td><td><div style="font-weight:900;">${escapeHtml(addr)}</div><div class="muted" style="font-size:12px;">Zone ${escapeHtml(o.address?.zone || "")}</div></td><td><span class="pill">${escapeHtml(o.runType || "")}</span><div class="muted" style="font-size:12px;margin-top:4px;">${escapeHtml(o.runKey || "")}</div></td><td><span class="pill">${escapeHtml(status)}</span><div class="muted" style="font-size:12px;margin-top:4px;">${escapeHtml(o.status?.note || "")}</div></td><td>$${escapeHtml(fees)}</td><td>${trackHtml}</td><td>${cancelHtml}</td></tr>`;
     }).join("");
 
-    const memLevel = req.user && req.user.membershipLevel && req.user.membershipLevel !== 'none' ? req.user.membershipLevel : 'No active plan';
-    const memStatus = req.user && req.user.membershipStatus ? req.user.membershipStatus : 'Inactive';
-    const memRenew = req.user && req.user.renewalDate ? new Date(req.user.renewalDate).toLocaleDateString() : '—';
-    const userEmail = req.user ? email : "Guest Tracker";
-
     res.setHeader("Content-Type", "text/html; charset=utf-8");
-    res.send(`<!doctype html><html lang="en-CA"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>TGR Member Portal</title><style>:root{--bg:#0b0b0b; --panel:rgba(255,255,255,.06); --line:rgba(255,255,255,.14); --text:#fff; --muted:rgba(255,255,255,.75); --red:#e3342f; --red2:#ff4a44; --radius:14px;} body{margin:0;background:var(--bg);color:var(--text);font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;} .wrap{max-width:1250px;margin:0 auto;padding:16px;} .card{border:1px solid var(--line);background:var(--panel);border-radius:var(--radius);padding:14px;} .row{display:flex;gap:10px;flex-wrap:wrap;align-items:center;} .btn{border:1px solid rgba(255,255,255,.18);background:rgba(255,255,255,.06);color:#fff;font-weight:900;border-radius:999px;padding:10px 14px;cursor:pointer;text-decoration:none;white-space:nowrap;} .btn.primary{background:linear-gradient(180deg,var(--red2),var(--red));border-color:rgba(0,0,0,.25);} .btn.secondary{background:rgba(217,217,217,.10);border-color:rgba(217,217,217,.22);color:var(--white);} .btn.ghost{background:transparent;} .muted{color:var(--muted);} .pill{display:inline-block;padding:4px 10px;border-radius:999px;border:1px solid rgba(255,255,255,.18);background:rgba(255,255,255,.06);font-weight:900;font-size:12px;} table{width:100%;border-collapse:collapse;} th,td{padding:10px 8px;border-bottom:1px solid rgba(255,255,255,.12);vertical-align:top;} th{font-size:12px;color:rgba(255,255,255,.72);text-transform:uppercase;letter-spacing:.08em;text-align:left;} .toast{margin-top:10px;padding:10px 12px;border-radius:12px;border:1px solid rgba(255,255,255,.18);background:rgba(0,0,0,.24);display:none;font-weight:900;} .toast.show{display:block;} .hr{height:1px;background:rgba(255,255,255,.12);margin:12px 0;} .grid{display:grid;grid-template-columns: 1fr 1fr; gap:12px;} @media (max-width: 980px){ .grid{grid-template-columns: 1fr;} } #mapWrap{display:none;} #map{height: 420px; border-radius: 14px; border:1px solid rgba(255,255,255,.14); overflow:hidden;} .small{font-size:13px;} .warn{border:1px solid rgba(227,52,47,.45);background:rgba(227,52,47,.12);border-radius:12px;padding:10px 12px;}</style></head><body><div class="wrap"><div class="card"><div class="row" style="justify-content:space-between;"><div><div style="font-weight:1000;font-size:22px;">Member Portal</div><div class="muted">Signed in as <strong>${escapeHtml(userEmail)}</strong>${name ? ` • ${escapeHtml(name)}` : ""}</div></div><div class="row"><a class="btn ghost" href="${escapeHtml(PUBLIC_SITE_URL)}/">Back to site</a><a class="btn ghost" href="/logout?returnTo=${encodeURIComponent(PUBLIC_SITE_URL + "/")}">Log out</a></div></div><div class="toast" id="toast"></div>
+    res.send(`<!doctype html><html lang="en-CA"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>TGR Member Portal</title><style>:root{--bg:#0b0b0b; --panel:rgba(255,255,255,.06); --line:rgba(255,255,255,.14); --text:#fff; --muted:rgba(255,255,255,.75); --red:#e3342f; --red2:#ff4a44; --radius:14px;} body{margin:0;background:var(--bg);color:var(--text);font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;} .wrap{max-width:1250px;margin:0 auto;padding:16px;} .card{border:1px solid var(--line);background:var(--panel);border-radius:var(--radius);padding:14px;} .row{display:flex;gap:10px;flex-wrap:wrap;align-items:center;} .btn{border:1px solid rgba(255,255,255,.18);background:rgba(255,255,255,.06);color:#fff;font-weight:900;border-radius:999px;padding:10px 14px;cursor:pointer;text-decoration:none;white-space:nowrap;} .btn.primary{background:linear-gradient(180deg,var(--red2),var(--red));border-color:rgba(0,0,0,.25);} .btn.secondary{background:rgba(217,217,217,.10);border-color:rgba(217,217,217,.22);color:var(--white);} .btn.ghost{background:transparent;} .muted{color:var(--muted);} .pill{display:inline-block;padding:4px 10px;border-radius:999px;border:1px solid rgba(255,255,255,.18);background:rgba(255,255,255,.06);font-weight:900;font-size:12px;} table{width:100%;border-collapse:collapse;} th,td{padding:10px 8px;border-bottom:1px solid rgba(255,255,255,.12);vertical-align:top;} th{font-size:12px;color:rgba(255,255,255,.72);text-transform:uppercase;letter-spacing:.08em;text-align:left;} .toast{margin-top:10px;padding:10px 12px;border-radius:12px;border:1px solid rgba(255,255,255,.18);background:rgba(0,0,0,.24);display:none;font-weight:900;} .toast.show{display:block;} .hr{height:1px;background:rgba(255,255,255,.12);margin:12px 0;} .grid{display:grid;grid-template-columns: 1fr 1fr; gap:12px;} @media (max-width: 980px){ .grid{grid-template-columns: 1fr;} } #mapWrap{display:none;} #map{height: 420px; border-radius: 14px; border:1px solid rgba(255,255,255,.14); overflow:hidden;} .small{font-size:13px;} .warn{border:1px solid rgba(227,52,47,.45);background:rgba(227,52,47,.12);border-radius:12px;padding:10px 12px;}</style></head><body><div class="wrap"><div class="card"><div class="row" style="justify-content:space-between;"><div><div style="font-weight:1000;font-size:22px;">Member Portal</div><div class="muted">Signed in as <strong>${escapeHtml(email)}</strong>${name ? ` • ${escapeHtml(name)}` : ""}</div></div><div class="row"><a class="btn ghost" href="${escapeHtml(PUBLIC_SITE_URL)}/">Back to site</a><a class="btn ghost" href="/logout?returnTo=${encodeURIComponent(PUBLIC_SITE_URL + "/")}">Log out</a></div></div><div class="toast" id="toast"></div>
 
 <div class="hr"></div>
 
@@ -803,15 +860,15 @@ app.get("/member", async (req, res) => {
     <div class="row">
       <div style="flex:1 1 120px;">
          <div class="muted small">Current Tier</div>
-         <div style="font-size:20px; font-weight:900; text-transform:capitalize;">${escapeHtml(memLevel)}</div>
+         <div style="font-size:20px; font-weight:900; text-transform:capitalize;">${escapeHtml(req.user?.membershipLevel && req.user.membershipLevel !== 'none' ? req.user.membershipLevel : 'No active plan')}</div>
       </div>
       <div style="flex:1 1 120px;">
          <div class="muted small">Status</div>
-         <div style="font-size:20px; font-weight:900; text-transform:capitalize;">${escapeHtml(memStatus)}</div>
+         <div style="font-size:20px; font-weight:900; text-transform:capitalize;">${escapeHtml(req.user?.membershipStatus || 'Inactive')}</div>
       </div>
       <div style="flex:1 1 150px;">
          <div class="muted small">Renews On</div>
-         <div style="font-size:20px; font-weight:900;">${memRenew}</div>
+         <div style="font-size:20px; font-weight:900;">${req.user?.renewalDate ? new Date(req.user.renewalDate).toLocaleDateString() : '—'}</div>
       </div>
     </div>
     <div class="row" style="margin-top:14px;">
@@ -975,9 +1032,10 @@ app.get("/admin", requireLogin, requireAdmin, async (_req, res) => {
         
         <div class="card" style="box-shadow:none; border: 1px solid rgba(227,52,47,.45) !important; background: rgba(227,52,47,.1) !important; margin-bottom:14px;">
           <div class="k" style="color: #ff4a44;">Finalize Groceries (Charge Saved Card)</div>
-          <div class="muted small" style="margin-bottom:8px;">Enter exact receipt total. This automatically charges their saved card and texts the customer.</div>
+          <div class="muted small" style="margin-bottom:8px;">Enter exact receipt total and bags used. Non-members are billed $1.50/bag.</div>
           <div class="row">
             <input id="m_finalGroceryTotal" type="number" step="0.01" placeholder="Receipt total ($)" style="max-width:160px; background:rgba(0,0,0,.4);" />
+            <input id="m_bagsUsed" type="number" min="0" placeholder="Bags used" style="max-width:120px; background:rgba(0,0,0,.4);" />
             <button class="btn primary" id="m_captureBtn">Charge Card & Dispatch 🚙</button>
           </div>
         </div>
@@ -1025,6 +1083,7 @@ app.get("/admin", requireLogin, requireAdmin, async (_req, res) => {
       qs("m_orderId").textContent = modalOrder.orderId || "—"; qs("m_customer").textContent = modalOrder.customer?.fullName || "—"; qs("m_phone").textContent = modalOrder.customer?.phone || "—"; 
       qs("m_addr").textContent = (modalOrder.address?.streetAddress || "") + ", " + (modalOrder.address?.town || ""); qs("m_run").textContent = (modalOrder.runKey||""); qs("m_fees").textContent = "$" + money(modalOrder.pricingSnapshot?.totalFees || 0); qs("m_groceriesCurrent").textContent = modalOrder.payments?.groceries?.status || "—"; qs("m_state").value = (modalOrder.status?.state || "submitted"); qs("m_list").textContent = modalOrder.list?.groceryListText || "—"; qs("m_addons").textContent = buildAddonsText(modalOrder);
       qs("m_finalGroceryTotal").value = "";
+      qs("m_bagsUsed").value = "";
       openModal(true);
     } catch(e){ toast(String(e)); }
   }
@@ -1032,12 +1091,13 @@ app.get("/admin", requireLogin, requireAdmin, async (_req, res) => {
   qs("m_captureBtn").addEventListener("click", async () => {
     if(!modalOrder?.orderId) return;
     const finalGroc = qs("m_finalGroceryTotal").value;
+    const bagsUsed = qs("m_bagsUsed").value || 0;
     if(!finalGroc) return toast("Enter the exact grocery total from the receipt.");
     if(!confirm("Charge their saved card and dispatch driver?")) return;
     try {
       const r = await fetch("/api/admin/orders/" + encodeURIComponent(modalOrder.orderId) + "/capture", {
         method: "POST", headers:{ "Content-Type":"application/json" }, credentials: "include",
-        body: JSON.stringify({ finalGroceryTotal: Number(finalGroc) })
+        body: JSON.stringify({ finalGroceryTotal: Number(finalGroc), bagsUsed: Number(bagsUsed) })
       });
       const d = await r.json();
       if(!r.ok || d.ok===false) throw new Error(d.error || "Capture failed");
