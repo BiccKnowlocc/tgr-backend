@@ -126,7 +126,7 @@ if (GOOGLE_CLIENT_ID && GOOGLE_CLIENT_SECRET && GOOGLE_CALLBACK_URL) {
     try {
       const email = (profile.emails && profile.emails[0] && profile.emails[0].value) || ""; const normalized = String(email).toLowerCase().trim(); if (!normalized) return done(null, false);
       const update = { googleId: profile.id, email: normalized, name: profile.displayName || "", photo: (profile.photos && profile.photos[0] && profile.photos[0].value) || "" };
-      const u = await User.findOneAndUpdate({ email: normalized }, { $set: update, $setOnInsert: { membershipLevel: "none", membershipStatus: "inactive", renewalDate: null, discounts: [], perks: [], profile: { version: 1, complete: false, defaultId: "", addresses: [] } } }, { upsert: true, new: true });
+      const u = await User.findOneAndUpdate({ email: normalized }, { $set: update, $setOnInsert: { membershipLevel: "none", membershipStatus: "inactive", renewalDate: null, discounts: [], perks: [], profile: { version: 1, complete: false, defaultId: "", addresses: [], savedList: [] } } }, { upsert: true, new: true });
       return done(null, u);
     } catch (e) { return done(e); }
   }));
@@ -452,21 +452,43 @@ app.get("/logout", (req, res) => { req.session.destroy(() => res.redirect(String
 // =========================
 app.get("/api/me", (req, res) => { const u = req.user; res.json({ ok: true, loggedIn: !!u, email: u?.email || null, name: u?.name || "", photo: u?.photo || "", membershipLevel: u?.membershipLevel || "none", membershipStatus: u?.membershipStatus || "inactive", effectiveMembershipTier: getEffectiveMemberTierForUser(u) || "", renewalDate: u?.renewalDate || null, profileComplete: isProfileComplete(u?.profile || {}), isAdmin: !!u?.email && isAdminEmail(u.email) }); });
 app.get("/api/profile", requireLogin, async (req, res) => { const u = await User.findById(req.user._id).lean(); res.json({ ok: true, profile: u?.profile || {}, profileComplete: isProfileComplete(u?.profile || {}), email: u?.email || "", name: u?.name || "", photo: u?.photo || "" }); });
+
+// UPGRADED: Handles the new 'savedList' array for members
 app.post("/api/profile", requireLogin, async (req, res) => {
   try {
     const b = req.body || {}; const u = await User.findById(req.user._id); if (!u) return res.status(404).json({ ok: false, error: "User not found" });
     const addresses = Array.isArray(b.addresses) ? b.addresses : [];
+    
+    // Parse the saved shopping list sent from the frontend
+    const savedList = Array.isArray(b.savedList) ? b.savedList.map(s => String(s).trim()).filter(Boolean) : [];
+
     const newProfile = {
       version: 1, fullName: String(b.fullName || "").trim(), preferredName: String(b.preferredName || "").trim(), phone: String(b.phone || "").trim(), altPhone: String(b.altPhone || "").trim(), contactPref: String(b.contactPref || "").trim(), contactAuth: yn(b.contactAuth),
       subsDefault: String(b.subsDefault || "").trim(), dropoffDefault: String(b.dropoffDefault || "").trim(), customerType: "", accessibility: "", dietary: "", notes: String(b.notes || "").trim(),
       addresses: addresses.map((a) => ({ id: String(a.id || "").trim() || String(Math.random()).slice(2), label: String(a.label || "").trim(), town: String(a.town || "").trim(), zone: String(a.zone || "").trim(), streetAddress: String(a.streetAddress || "").trim(), unit: String(a.unit || "").trim(), postalCode: String(a.postalCode || "").trim(), instructions: String(a.instructions || "").trim(), gateCode: String(a.gateCode || "").trim() })),
       defaultId: String(b.defaultId || "").trim(), consentTerms: yn(b.consentTerms), consentPrivacy: yn(b.consentPrivacy), consentMarketing: yn(b.consentMarketing),
+      savedList: savedList
     };
     if (!newProfile.defaultId && newProfile.addresses.length) newProfile.defaultId = newProfile.addresses[0].id;
     newProfile.complete = isProfileComplete(newProfile); newProfile.completedAt = newProfile.complete ? new Date().toISOString() : null;
     u.profile = newProfile; u.markModified("profile"); await u.save(); res.json({ ok: true, profileComplete: newProfile.complete === true, profile: newProfile });
   } catch (e) { res.status(500).json({ ok: false, error: String(e) }); }
 });
+
+// =========================
+// RUNS + ESTIMATOR
+// =========================
+app.get("/api/runs/active", async (_req, res) => {
+  try {
+    const runs = await ensureUpcomingRuns(); const now = nowTz(); const out = {};
+    for (const type of ["local", "owen"]) {
+      const run = runs[type]; const opensAt = dayjs(run.opensAt).tz(TZ); const cutoffAt = dayjs(run.cutoffAt).tz(TZ); const windowOpen = now.isAfter(opensAt) && now.isBefore(cutoffAt); const pointsRemaining = Math.max(0, (run.maxPoints || 10) - (run.bookedPoints || 0));
+      out[type] = { runKey: run.runKey, type: run.type, maxPoints: run.maxPoints || 10, bookedPoints: run.bookedPoints || 0, bookedOrdersCount: run.bookedOrdersCount || 0, bookedFeesTotal: run.bookedFeesTotal || 0, pointsRemaining, isOpen: windowOpen && pointsRemaining > 0, opensAtLocal: fmtLocal(run.opensAt), cutoffAtLocal: fmtLocal(run.cutoffAt), meetsMinimums: meetsMinimums(run), minimumText: runMinimumConfig(type).minimumText, cutoffAtISO: run.cutoffAt, opensAtISO: run.opensAt };
+    }
+    res.json({ ok: true, runs: out });
+  } catch (e) { res.status(500).json({ ok: false, error: String(e) }); }
+});
+app.post("/api/estimator", (req, res) => { try { const effectiveMemberTier = getEffectiveMemberTierForUser(req.user, req.body?.memberTier || ""); res.json({ ok: true, effectiveMemberTier, breakdown: computeFeeBreakdown({ ...(req.body || {}), memberTier: effectiveMemberTier, applyPerk: "yes" }) }); } catch (e) { res.status(500).json({ ok: false, error: String(e) }); } });
 
 // =========================
 // NEW PAYMENT ENGINE (FEES UPFRONT, GROCERIES ON FILE)
@@ -642,12 +664,75 @@ app.post("/api/admin/orders/:orderId/capture", requireLogin, requireAdmin, async
     if (phone) {
        const run = await Run.findOne({ runKey: order.runKey }).lean(); let trackingLink = "";
        if (run) trackingLink = `${PUBLIC_SITE_URL}/member?trackRunKey=${encodeURIComponent(run.runKey)}&token=${encodeURIComponent(signTrackingToken(order.orderId, run.runKey, dayjs(run.cutoffAt).add(1, "day").valueOf()))}&orderId=${encodeURIComponent(order.orderId)}`;
-       const smsMessage = `Hi ${firstName}, your groceries are packed! The exact receipt total was $${finalGroceryTotal.toFixed(2)}. We have successfully billed your saved card for the groceries. I'm on my way to drop off your order! 🚙💨 Track live: ${trackingLink}`;
+       const smsMessage = `The Patriot is rolling! 🚙💨 ${firstName}, your groceries are packed and your saved card was billed for the exact receipt total ($${finalGroceryTotal.toFixed(2)}). Watch my exact location live right here: ${trackingLink} - TGR`;
        await sendSms(phone, smsMessage);
     }
     res.json({ ok: true });
   } catch(e) { res.status(500).json({ ok: false, error: String(e) }); }
 });
+
+// =========================
+// AUTOMATED SMS FUNNEL & STATUS UPDATES
+// =========================
+app.post("/api/admin/orders/:orderId/status", requireLogin, requireAdmin, async (req, res) => {
+  try {
+    const orderId = String(req.params.orderId || "").trim().toUpperCase(); const state = String(req.body?.state || "").trim(); const note = String(req.body?.note || "").trim(); const by = adminBy(req);
+    if (!AllowedStates.includes(state)) return res.status(400).json({ ok: false, error: "Invalid state" });
+    const order = await Order.findOne({ orderId }); if (!order) return res.status(404).json({ ok: false, error: "Order not found" });
+    const oldState = order.status.state; order.status.state = state; order.status.note = note; order.status.updatedAt = new Date(); order.status.updatedBy = by; order.statusHistory.push({ state, note, at: new Date(), by });
+    await order.save(); 
+
+    if (oldState !== state) {
+      const phone = order.customer?.phone; const firstName = order.customer?.fullName?.split(' ')[0] || 'there';
+      if (phone) {
+        let smsMessage = "";
+        const portalLink = `${PUBLIC_SITE_URL}/member`;
+        
+        if (state === "shopping") {
+          smsMessage = `Hi ${firstName}! Nick & Lillian here. We're firing up the Jeep and officially starting your grocery run. May the grocery gods bless us with ripe produce and fully stocked shelves! 🥑🚙 - TGR`;
+        } 
+        else if (state === "packed") {
+          smsMessage = `Great news, ${firstName}! Your order is officially bagged, tagged, and packed. We successfully survived the aisles. Stand by for dispatch! 🛒✨ - TGR`;
+        }
+        else if (state === "out_for_delivery") {
+          const run = await Run.findOne({ runKey: order.runKey }).lean(); let trackingLink = "";
+          if (run) trackingLink = `${PUBLIC_SITE_URL}/member?trackRunKey=${encodeURIComponent(run.runKey)}&token=${encodeURIComponent(signTrackingToken(order.orderId, run.runKey, dayjs(run.cutoffAt).add(1, "day").valueOf()))}&orderId=${encodeURIComponent(order.orderId)}`;
+          smsMessage = `The Patriot is rolling! 🚙💨 ${firstName}, your groceries are on the move. Watch my exact location live right here: ${trackingLink} - TGR`;
+        } 
+        else if (state === "delivered") {
+          smsMessage = `Mission accomplished, ${firstName}! 🥦 Your groceries have safely landed. If we saved your day (or just your gas tank), a 5-star review or a quick tip for the driver keeps our local 2-person team fueled up! ⭐ Drop a review or tip in your Member Portal here: ${portalLink} - Nick & Lillian @ TGR`;
+        }
+        
+        if (smsMessage) await sendSms(phone, smsMessage);
+      }
+    }
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ ok: false, error: String(e) }); }
+});
+
+app.post("/api/admin/orders/:orderId/payments", requireLogin, requireAdmin, async (req, res) => {
+  try {
+    const order = await Order.findOne({ orderId: String(req.params.orderId || "").trim().toUpperCase() }); if (!order) return res.status(404).json({ ok: false, error: "Order not found" });
+    const fs = String(req.body?.feesStatus || "").trim(); const gs = String(req.body?.groceriesStatus || "").trim();
+    if (fs) { order.payments.fees.status = fs; order.payments.fees.paidAt = fs === "paid" ? new Date() : null; }
+    if (gs) { order.payments.groceries.status = gs; order.payments.groceries.paidAt = (gs === "paid" || gs === "deposit_paid") ? new Date() : null; }
+    if (req.body?.note) { order.payments.fees.note = String(req.body.note).trim(); order.payments.groceries.note = String(req.body.note).trim(); }
+    await order.save(); res.json({ ok: true });
+  } catch (e) { res.status(500).json({ ok: false, error: String(e) }); }
+});
+
+app.delete("/api/admin/orders/:orderId", requireLogin, requireAdmin, async (req, res) => {
+  try {
+    const orderId = String(req.params.orderId || "").trim().toUpperCase(); const order = await Order.findOne({ orderId }).lean(); if (!order) return res.status(404).json({ ok: false, error: "Order not found" });
+    if (ACTIVE_STATES.has(order.status?.state || "submitted")) await Run.updateOne({ runKey: order.runKey }, { $inc: { bookedOrdersCount: -1, bookedFeesTotal: -Number(order.pricingSnapshot?.totalFees || 0), bookedPoints: -Number(order.spacePoints || 1) }, $set: { lastRecalcAt: new Date() } });
+    await Order.deleteOne({ orderId }); res.json({ ok: true });
+  } catch (e) { res.status(500).json({ ok: false, error: String(e) }); }
+});
+
+app.post("/api/admin/tracking/:runKey/start", requireLogin, requireAdmin, async (req, res) => { try { const runKey = String(req.params.runKey || "").trim(); await ensureTrackingDoc(runKey); await Tracking.updateOne({ runKey }, { $set: { enabled: true, startedAt: new Date(), stoppedAt: null, updatedBy: adminBy(req) } }); res.json({ ok: true, runKey }); } catch (e) { res.status(500).json({ ok: false, error: String(e) }); } });
+app.post("/api/admin/tracking/:runKey/stop", requireLogin, requireAdmin, async (req, res) => { try { const runKey = String(req.params.runKey || "").trim(); await ensureTrackingDoc(runKey); await Tracking.updateOne({ runKey }, { $set: { enabled: false, stoppedAt: new Date(), updatedBy: adminBy(req) } }); res.json({ ok: true, runKey }); } catch (e) { res.status(500).json({ ok: false, error: String(e) }); } });
+app.post("/api/admin/tracking/:runKey/update", requireLogin, requireAdmin, async (req, res) => { try { const runKey = String(req.params.runKey || "").trim(); const lat = Number(req.body?.lat); const lng = Number(req.body?.lng); if (!Number.isFinite(lat) || !Number.isFinite(lng)) return res.status(400).json({ ok: false, error: "lat/lng required" }); await ensureTrackingDoc(runKey); await Tracking.updateOne({ runKey }, { $set: { lastLat: lat, lastLng: lng, lastHeading: Number.isFinite(Number(req.body?.heading)) ? Number(req.body?.heading) : null, lastSpeed: Number.isFinite(Number(req.body?.speed)) ? Number(req.body?.speed) : null, lastAccuracy: Number.isFinite(Number(req.body?.accuracy)) ? Number(req.body?.accuracy) : null, lastAt: new Date(), updatedBy: adminBy(req) } }); res.json({ ok: true }); } catch (e) { res.status(500).json({ ok: false, error: String(e) }); } });
+app.get("/api/admin/orders/:orderId/tracking-link", requireLogin, requireAdmin, async (req, res) => { try { const orderId = String(req.params.orderId || "").trim().toUpperCase(); const o = await Order.findOne({ orderId }).lean(); if (!o) return res.status(404).json({ ok: false, error: "Order not found" }); const run = await Run.findOne({ runKey: o.runKey }).lean(); if (!run) return res.status(404).json({ ok: false, error: "Run not found" }); res.json({ ok: true, url: `${PUBLIC_SITE_URL}/member?trackRunKey=${encodeURIComponent(run.runKey)}&token=${encodeURIComponent(signTrackingToken(o.orderId, run.runKey, dayjs(run.cutoffAt).add(1, "day").valueOf()))}&orderId=${encodeURIComponent(o.orderId)}` }); } catch (e) { res.status(500).json({ ok: false, error: String(e) }); } });
 
 // =========================
 // MEMBER PORTAL (With Rating & Tipping)
@@ -786,44 +871,6 @@ app.get("/api/admin/orders/:orderId", requireLogin, requireAdmin, async (req, re
     res.json({ ok: true, order });
   } catch (e) { res.status(500).json({ ok: false, error: String(e) }); }
 });
-
-app.post("/api/admin/orders/:orderId/status", requireLogin, requireAdmin, async (req, res) => {
-  try {
-    const orderId = String(req.params.orderId || "").trim().toUpperCase(); const state = String(req.body?.state || "").trim(); const note = String(req.body?.note || "").trim(); const by = adminBy(req);
-    if (!AllowedStates.includes(state)) return res.status(400).json({ ok: false, error: "Invalid state" });
-    const order = await Order.findOne({ orderId }); if (!order) return res.status(404).json({ ok: false, error: "Order not found" });
-    const oldState = order.status.state; order.status.state = state; order.status.note = note; order.status.updatedAt = new Date(); order.status.updatedBy = by; order.statusHistory.push({ state, note, at: new Date(), by });
-    await order.save(); 
-
-    if (oldState !== state) {
-      const phone = order.customer?.phone; const firstName = order.customer?.fullName?.split(' ')[0] || 'there';
-      if (phone) {
-        let smsMessage = "";
-        if (state === "shopping") smsMessage = `Hi ${firstName}! I've grabbed a cart and I'm officially picking your groceries. Let's hope the avocados are cooperating today. 🥑 - Tobermory Grocery Run`;
-        else if (state === "out_for_delivery") {
-          const run = await Run.findOne({ runKey: order.runKey }).lean(); let trackingLink = "";
-          if (run) trackingLink = `${PUBLIC_SITE_URL}/member?trackRunKey=${encodeURIComponent(run.runKey)}&token=${encodeURIComponent(signTrackingToken(order.orderId, run.runKey, dayjs(run.cutoffAt).add(1, "day").valueOf()))}&orderId=${encodeURIComponent(order.orderId)}`;
-          smsMessage = `Hi ${firstName}, the Jeep is loaded and I'm on the road! Track your delivery live right here: ${trackingLink} 🚙💨 - TGR`;
-        } 
-        else if (state === "delivered") smsMessage = `Mission accomplished! Your order has been dropped off. Enjoy the goodies, and thanks for trusting Tobermory Grocery Run! 🛒✨`;
-        if (smsMessage) await sendSms(phone, smsMessage);
-      }
-    }
-    res.json({ ok: true });
-  } catch (e) { res.status(500).json({ ok: false, error: String(e) }); }
-});
-
-app.delete("/api/admin/orders/:orderId", requireLogin, requireAdmin, async (req, res) => {
-  try {
-    const orderId = String(req.params.orderId || "").trim().toUpperCase(); const order = await Order.findOne({ orderId }).lean(); if (!order) return res.status(404).json({ ok: false, error: "Order not found" });
-    if (ACTIVE_STATES.has(order.status?.state || "submitted")) await Run.updateOne({ runKey: order.runKey }, { $inc: { bookedOrdersCount: -1, bookedFeesTotal: -Number(order.pricingSnapshot?.totalFees || 0), bookedPoints: -Number(order.spacePoints || 1) }, $set: { lastRecalcAt: new Date() } });
-    await Order.deleteOne({ orderId }); res.json({ ok: true });
-  } catch (e) { res.status(500).json({ ok: false, error: String(e) }); }
-});
-
-app.post("/api/admin/tracking/:runKey/start", requireLogin, requireAdmin, async (req, res) => { try { const runKey = String(req.params.runKey || "").trim(); await ensureTrackingDoc(runKey); await Tracking.updateOne({ runKey }, { $set: { enabled: true, startedAt: new Date(), stoppedAt: null, updatedBy: adminBy(req) } }); res.json({ ok: true, runKey }); } catch (e) { res.status(500).json({ ok: false, error: String(e) }); } });
-app.post("/api/admin/tracking/:runKey/stop", requireLogin, requireAdmin, async (req, res) => { try { const runKey = String(req.params.runKey || "").trim(); await ensureTrackingDoc(runKey); await Tracking.updateOne({ runKey }, { $set: { enabled: false, stoppedAt: new Date(), updatedBy: adminBy(req) } }); res.json({ ok: true, runKey }); } catch (e) { res.status(500).json({ ok: false, error: String(e) }); } });
-app.post("/api/admin/tracking/:runKey/update", requireLogin, requireAdmin, async (req, res) => { try { const runKey = String(req.params.runKey || "").trim(); const lat = Number(req.body?.lat); const lng = Number(req.body?.lng); if (!Number.isFinite(lat) || !Number.isFinite(lng)) return res.status(400).json({ ok: false, error: "lat/lng required" }); await ensureTrackingDoc(runKey); await Tracking.updateOne({ runKey }, { $set: { lastLat: lat, lastLng: lng, lastHeading: Number.isFinite(Number(req.body?.heading)) ? Number(req.body?.heading) : null, lastSpeed: Number.isFinite(Number(req.body?.speed)) ? Number(req.body?.speed) : null, lastAccuracy: Number.isFinite(Number(req.body?.accuracy)) ? Number(req.body?.accuracy) : null, lastAt: new Date(), updatedBy: adminBy(req) } }); res.json({ ok: true }); } catch (e) { res.status(500).json({ ok: false, error: String(e) }); } });
 
 function buildAddonsText(o){
   const lines = [];
