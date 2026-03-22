@@ -7,6 +7,8 @@ const session = require("express-session");
 const cors = require("cors");
 const crypto = require("crypto");
 const https = require("https");
+const path = require("path");
+const rateLimit = require("express-rate-limit");
 
 const MongoStorePkg = require("connect-mongo");
 const MongoStore = MongoStorePkg.default || MongoStorePkg;
@@ -112,8 +114,17 @@ app.use(express.urlencoded({ extended: true }));
 app.use(cookieParser());
 app.set("trust proxy", 1);
 app.use(session({ name: "tgr.sid", secret: SESSION_SECRET, resave: false, saveUninitialized: false, rolling: true, proxy: true, store: MongoStore.create({ mongoUrl: MONGODB_URI, ttl: 60 * 60 * 24 * 14 }), cookie: { httpOnly: true, secure: SESSION_COOKIE_SECURE, sameSite: "lax", maxAge: 1000 * 60 * 60 * 24 * 14 } }));
-app.get("/favicon.ico", (_req, res) => res.status(204).end());
+
+// Serve static frontend files from the /public folder
+app.use(express.static(path.join(__dirname, "public")));
 const upload = multer({ dest: "uploads/", limits: { fileSize: 15 * 1024 * 1024 } });
+
+// Rate Limiter for Order Submissions
+const orderLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, 
+  max: 10, 
+  message: { ok: false, error: "Too many order attempts from this IP. Please try again later to protect our system." }
+});
 
 // =========================
 // PASSPORT
@@ -138,7 +149,7 @@ app.use(passport.session());
 // PRICING BASELINE & LOGIC
 // =========================
 const PRICING = {
-  serviceFee: 27, // UPGRADED TO $27
+  serviceFee: 27, 
   zone: { A: 20, B: 15, C: 10, D: 25 }, 
   owenRunFeePerOrder: 15,
   addOns: { extraStore: 8, printingBase: 5, printingFirst10: 1.25, printingAfter10: 0.75, rideLocal: 15, rideOwen: 50, stockFridge: 25, empties: 15, bulky: 10 },
@@ -490,9 +501,15 @@ app.post("/api/estimator", (req, res) => { try { const effectiveMemberTier = get
 // =========================
 // NEW PAYMENT ENGINE (FEES UPFRONT, GROCERIES ON FILE)
 // =========================
-app.post("/api/orders", requireLogin, requireProfileComplete, upload.single("groceryFile"), async (req, res) => {
+// ADDED orderLimiter to prevent bot spam
+app.post("/api/orders", requireLogin, requireProfileComplete, upload.single("groceryFile"), orderLimiter, async (req, res) => {
   try {
     const b = req.body || {}; const user = await User.findById(req.user._id).lean(); const profile = user?.profile || {}; const orderClass = String(b.orderClass || "grocery");
+    
+    // Front-end Idempotency Key check to prevent double charges
+    const clientIdempotencyKey = String(b.idempotencyKey || "").trim();
+    if (!clientIdempotencyKey) return res.status(400).json({ ok: false, error: "Missing required payment security key. Please refresh the page." });
+
     if (!yn(b.consent_terms) || !yn(b.consent_accuracy) || (orderClass === "grocery" && !yn(b.consent_dropoff))) return res.status(400).json({ ok: false, error: "All required consents must be accepted." });
 
     const runs = await ensureUpcomingRuns(); const runType = String(b.runType || ""); const run = runs[runType]; if (!run) return res.status(400).json({ ok: false, error: "Invalid runType." });
@@ -527,12 +544,11 @@ app.post("/api/orders", requireLogin, requireProfileComplete, upload.single("gro
     let feesPaymentId = "";
     let feesStatus = "unpaid";
 
-    // CHARGE FEES INSTANTLY AND SAVE CARD ON FILE
     if (b.paymentSourceId && squareClient) {
       const feeCents = Math.round(pricingSnapshot.totalFees * 100);
       try {
         const custRes = await squareClient.customersApi.createCustomer({
-          idempotencyKey: crypto.randomBytes(12).toString('hex'),
+          idempotencyKey: crypto.createHash('md5').update(clientIdempotencyKey + "_cust").digest('hex'),
           givenName: fullName.split(' ')[0],
           familyName: fullName.split(' ').slice(1).join(' '),
           emailAddress: String(user.email || "").trim().toLowerCase(),
@@ -541,7 +557,7 @@ app.post("/api/orders", requireLogin, requireProfileComplete, upload.single("gro
         squareCustomerId = custRes.result.customer.id;
 
         const cardRes = await squareClient.cardsApi.createCard({
-          idempotencyKey: crypto.randomBytes(12).toString('hex'),
+          idempotencyKey: crypto.createHash('md5').update(clientIdempotencyKey + "_card").digest('hex'),
           sourceId: b.paymentSourceId,
           card: { cardholderName: fullName, customerId: squareCustomerId }
         });
@@ -549,7 +565,7 @@ app.post("/api/orders", requireLogin, requireProfileComplete, upload.single("gro
 
         if (feeCents > 0) {
           const payRes = await squareClient.paymentsApi.createPayment({
-            idempotencyKey: crypto.randomBytes(12).toString('hex'),
+            idempotencyKey: clientIdempotencyKey,
             sourceId: squareCardId,
             customerId: squareCustomerId,
             amountMoney: { amount: feeCents, currency: "CAD" },
@@ -635,7 +651,6 @@ app.post("/api/admin/orders/:orderId/capture", requireLogin, requireAdmin, async
     const order = await Order.findOne({ orderId });
     if (!order) return res.status(404).json({ ok: false, error: "Order not found" });
 
-    // Check user to see if they get free bags
     const user = await User.findOne({ email: String(order.customer.email).toLowerCase() }).lean();
     const effectiveMemberTier = getEffectiveMemberTierForUser(user);
     
@@ -643,7 +658,7 @@ app.post("/api/admin/orders/:orderId/capture", requireLogin, requireAdmin, async
     let bagNote = "";
     if (bagsUsed > 0) {
         if (!effectiveMemberTier || effectiveMemberTier === "none") {
-            bagFee = bagsUsed * 1.50; // $1.50 per bag for non-members
+            bagFee = bagsUsed * 1.50; 
             bagNote = `(+ $${bagFee.toFixed(2)} for ${bagsUsed} premium bags)`;
         } else {
             bagNote = `(${bagsUsed} premium bags provided FREE for Member)`;
@@ -652,18 +667,34 @@ app.post("/api/admin/orders/:orderId/capture", requireLogin, requireAdmin, async
 
     const finalCents = Math.round((finalGroceryTotal + bagFee) * 100);
 
+    // Declined Card Automation
     if (finalCents > 0 && order.payments.groceries.squareCardId && order.payments.groceries.squareCustomerId) {
        if (!squareClient) throw new Error("Square client not configured on server.");
-       const payRes = await squareClient.paymentsApi.createPayment({
-         idempotencyKey: crypto.randomBytes(12).toString('hex'),
-         sourceId: order.payments.groceries.squareCardId,
-         customerId: order.payments.groceries.squareCustomerId,
-         amountMoney: { amount: finalCents, currency: "CAD" },
-         autocomplete: true,
-         locationId: SQUARE_LOCATION_ID,
-         note: `TGR Groceries - Order ${order.orderId}`
-       });
-       order.payments.groceries.squarePaymentId = payRes.result.payment.id;
+       try {
+           const payRes = await squareClient.paymentsApi.createPayment({
+             idempotencyKey: crypto.randomBytes(12).toString('hex'),
+             sourceId: order.payments.groceries.squareCardId,
+             customerId: order.payments.groceries.squareCustomerId,
+             amountMoney: { amount: finalCents, currency: "CAD" },
+             autocomplete: true,
+             locationId: SQUARE_LOCATION_ID,
+             note: `TGR Groceries - Order ${order.orderId}`
+           });
+           order.payments.groceries.squarePaymentId = payRes.result.payment.id;
+       } catch (err) {
+           console.error("Square Capture Failed:", err);
+           // Put order in issue status and text customer
+           order.status.state = "issue"; 
+           order.status.note = "Card on file declined."; 
+           order.status.updatedAt = new Date(); order.status.updatedBy = adminBy(req);
+           order.statusHistory.push({ state: "issue", note: "Card on file declined during capture attempt.", at: new Date(), by: adminBy(req) });
+           await order.save();
+           
+           if (order.customer?.phone) {
+               await sendSms(order.customer.phone, `TGR Alert: Your saved card was declined for your $${(finalGroceryTotal + bagFee).toFixed(2)} grocery total. We have paused your delivery. Please contact us immediately to update your payment so we can dispatch your order. - TGR`);
+           }
+           return res.status(400).json({ ok: false, error: "Payment declined by Square. The order has been marked as 'Issue' and the customer was texted." });
+       }
     }
 
     order.payments.groceries.status = "paid";
@@ -674,11 +705,30 @@ app.post("/api/admin/orders/:orderId/capture", requireLogin, requireAdmin, async
     await order.save();
 
     const phone = order.customer?.phone; const firstName = order.customer?.fullName?.split(' ')[0] || 'there';
+    const email = order.customer?.email;
+
+    // Send the Postmark Email Receipt
+    if (email) {
+        const receiptHtml = `
+            <div style="font-family: sans-serif; max-width: 600px; margin: 0 auto; padding: 20px; border: 1px solid #e0e0e0; border-radius: 8px;">
+                <h1 style="color: #e3342f;">TGR E-Receipt</h1>
+                <p>Hi ${firstName},</p>
+                <p>Your order (<strong>${order.orderId}</strong>) has been finalized and dispatched. Here is your final breakdown:</p>
+                <table style="width: 100%; border-collapse: collapse; margin-top: 20px;">
+                    <tr style="border-bottom: 1px solid #eee;"><td style="padding: 8px 0;"><strong>Exact Grocery Cost:</strong></td><td style="text-align: right;">$${finalGroceryTotal.toFixed(2)}</td></tr>
+                    ${bagFee > 0 ? `<tr style="border-bottom: 1px solid #eee;"><td style="padding: 8px 0;"><strong>Premium Paper Bags (${bagsUsed}):</strong></td><td style="text-align: right;">$${bagFee.toFixed(2)}</td></tr>` : ''}
+                    <tr style="background: #f9f9f9; font-weight: bold;"><td style="padding: 8px;">TOTAL BILLED TO SAVED CARD:</td><td style="padding: 8px; text-align: right; color: #e3342f;">$${(finalGroceryTotal + bagFee).toFixed(2)}</td></tr>
+                </table>
+                <p style="margin-top: 20px; font-size: 12px; color: #666;">Note: Service and Delivery fees were billed previously when your slot was booked. ${bagNote}</p>
+                <p>Thank you for choosing Tobermory Grocery Run!</p>
+            </div>
+        `;
+        await pmSend(email, `Your TGR Receipt - Order ${order.orderId}`, receiptHtml);
+    }
+
     if (phone) {
        const run = await Run.findOne({ runKey: order.runKey }).lean(); let trackingLink = "";
        if (run) trackingLink = `${PUBLIC_SITE_URL}/member?trackRunKey=${encodeURIComponent(run.runKey)}&token=${encodeURIComponent(signTrackingToken(order.orderId, run.runKey, dayjs(run.cutoffAt).add(1, "day").valueOf()))}&orderId=${encodeURIComponent(order.orderId)}`;
-       
-       // Build dynamic SMS message with bag notes
        const smsMessage = `The Patriot is rolling! 🚙💨 ${firstName}, your groceries are packed and your saved card was billed for the exact receipt total ($${finalGroceryTotal.toFixed(2)}${bagNote ? ' ' + bagNote.trim() : ''}). Watch my exact location live right here: ${trackingLink} - TGR`;
        await sendSms(phone, smsMessage);
     }
@@ -781,7 +831,7 @@ function renderPublicTracking(res, orderId, runKey, token) {
     }
     async function poll(){
        try{
-         const r = await fetch("/api/public/tracking/${encodeURIComponent(runKey)}?token=${encodeURIComponent(token)}");
+         const r = await fetch("/api/public/tracking/" + encodeURIComponent("${runKey}") + "?token=" + encodeURIComponent("${token}"));
          const d = await r.json();
          if(!d.ok){ document.getElementById("mapStatus").textContent = "Error"; return; }
          if(!d.enabled){ document.getElementById("mapStatus").textContent = "Tracking off"; return; }
@@ -798,7 +848,7 @@ function renderPublicTracking(res, orderId, runKey, token) {
 }
 
 // =========================
-// MEMBER PORTAL (With Rating & Tipping)
+// MEMBER PORTAL
 // =========================
 app.get("/member", async (req, res) => {
   try {
@@ -806,7 +856,7 @@ app.get("/member", async (req, res) => {
     const token = String(req.query.token || "").trim();
     const orderId = String(req.query.orderId || "").trim();
 
-    // 1. If valid tracking link, bypass login and serve standalone tracking map
+    // 1. BYPASS LOGIN FOR STANDALONE TRACKING MAP
     if (trackRunKey && token && orderId) {
        const vt = verifyTrackingToken(token);
        if (vt.ok && vt.orderId === orderId && vt.runKey === trackRunKey) {
@@ -814,7 +864,7 @@ app.get("/member", async (req, res) => {
        }
     }
 
-    // 2. Otherwise, enforce login for the normal Member Portal
+    // 2. ENFORCE LOGIN FOR NORMAL PORTAL
     if (!req.user) return res.redirect(PUBLIC_SITE_URL + "/?tab=account");
 
     const email = String(req.user?.email || "").toLowerCase().trim(); const name = String(req.user?.name || "").trim();
@@ -959,96 +1009,137 @@ function buildAddonsText(o){
   return lines.length ? lines.join("\n") : "—";
 }
 
+// FULL SCREEN ADMIN GOD MODE
 app.get("/admin", requireLogin, requireAdmin, async (_req, res) => {
   res.setHeader("Content-Type", "text/html; charset=utf-8");
   res.send(`<!doctype html>
 <html lang="en-CA">
 <head>
-<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>TGR Admin</title>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>TGR Admin God Mode</title>
 <style>
   :root{ --bg:#0b0b0b; --panel:rgba(255,255,255,.06); --line:rgba(255,255,255,.14); --text:#fff; --muted:rgba(255,255,255,.75); --red:#e3342f; --red2:#ff4a44; --radius:14px; }
-  body{margin:0;background:var(--bg);color:var(--text);font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;}
-  .wrap{max-width:1400px;margin:0 auto;padding:16px;}
-  .card{border:1px solid var(--line);background:var(--panel);border-radius:var(--radius);padding:14px;}
+  body{margin:0;background:var(--bg);color:var(--text);font-family:system-ui,-apple-system,sans-serif;}
+  .sidebar { width: 250px; background: rgba(15,15,16,0.95); border-right: 1px solid var(--line); position: fixed; height: 100vh; overflow-y: auto; padding: 20px;}
+  .main-content { margin-left: 250px; padding: 20px; }
+  .card{border:1px solid var(--line);background:var(--panel);border-radius:var(--radius);padding:14px; margin-bottom: 14px;}
   .row{display:flex;gap:10px;flex-wrap:wrap;align-items:center;}
-  .btn{border:1px solid rgba(255,255,255,.18);background:rgba(255,255,255,.06);color:#fff;font-weight:900;border-radius:999px;padding:10px 14px;cursor:pointer;text-decoration:none;white-space:nowrap;}
+  .btn{border:1px solid rgba(255,255,255,.18);background:rgba(255,255,255,.06);color:#fff;font-weight:900;border-radius:999px;padding:10px 14px;cursor:pointer;text-decoration:none;white-space:nowrap; display: inline-block; text-align: center;}
   .btn.primary{background:linear-gradient(180deg,var(--red2),var(--red));border-color:rgba(0,0,0,.25);}
   .btn.ghost{background:transparent;} .muted{color:var(--muted);}
   .pill{display:inline-block;padding:4px 10px;border-radius:999px;border:1px solid rgba(255,255,255,.18);background:rgba(255,255,255,.06);font-weight:900;font-size:12px;}
   .hr{height:1px;background:rgba(255,255,255,.12);margin:12px 0;}
-  input,select,textarea{width:100%;padding:12px 12px;border-radius:12px;border:1px solid rgba(255,255,255,.18);background:rgba(0,0,0,.22);color:#fff;font-size:15px;outline:none;}
-  table{width:100%;border-collapse:collapse;} th,td{padding:10px 8px;border-bottom:1px solid rgba(255,255,255,.12);vertical-align:top;} th{font-size:12px;color:rgba(255,255,255,.72);text-transform:uppercase;text-align:left;}
-  .grid{display:grid;grid-template-columns: 1.1fr .9fr; gap:12px;} @media (max-width: 980px){ .grid{grid-template-columns: 1fr;} }
-  .toast{margin-top:10px;padding:10px 12px;border-radius:12px;border:1px solid rgba(255,255,255,.18);background:rgba(0,0,0,.24);display:none;font-weight:900;} .toast.show{display:block;}
-  .modalBack{position:fixed; inset:0; background:rgba(0,0,0,.55); display:none; align-items:center; justify-content:center; padding:16px; z-index:100;}
-  .modal{width:min(980px, 100%); max-height:92vh; overflow:auto; border:1px solid rgba(255,255,255,.16); background:#0b0b0b; border-radius:16px; padding:14px;}
-  .k{font-size:12px;color:rgba(255,255,255,.7);text-transform:uppercase;letter-spacing:.08em;} .v{font-weight:900;} .two{display:grid;grid-template-columns:1fr 1fr; gap:10px;}
-  @media print { body * { visibility: hidden; } #masterListModalBack, #masterListModalBack * { visibility: visible; } #masterListModalBack { position: absolute; left: 0; top: 0; background: white; color: black; align-items: flex-start; } .modal { border: none; background: white; box-shadow: none; overflow: visible; max-height: none; } .btn, .toast { display: none !important; } .card { background: white !important; border: none !important; color: black !important; } pre { color: black !important; font-family: monospace; font-size: 14pt; } }
+  input,select,textarea{width:100%;padding:12px 12px;border-radius:12px;border:1px solid rgba(255,255,255,.18);background:rgba(0,0,0,.22);color:#fff;font-size:15px;outline:none; box-sizing: border-box;}
+  table{width:100%;border-collapse:collapse;} th,td{padding:10px 8px;border-bottom:1px solid rgba(255,255,255,.12);vertical-align:top; text-align:left;} th{font-size:12px;color:rgba(255,255,255,.72);text-transform:uppercase;}
+  .grid{display:grid;grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap:12px;} 
+  .toast{position: fixed; bottom: 20px; right: 20px; padding:12px 20px; border-radius:12px; border:1px solid rgba(255,255,255,.18); background:rgba(0,0,0,.8); display:none; font-weight:900; z-index: 99999;} .toast.show{display:block;}
+  .modalBack{position:fixed; inset:0; background:rgba(0,0,0,.7); display:none; align-items:center; justify-content:center; padding:16px; z-index:1000;}
+  .modal{width:min(1000px, 100%); max-height:92vh; overflow:auto; border:1px solid rgba(255,255,255,.16); background:#0b0b0b; border-radius:16px; padding:20px;}
+  .k{font-size:12px;color:rgba(255,255,255,.7);text-transform:uppercase;letter-spacing:.08em;} .v{font-weight:900; margin-bottom: 8px;}
+  .nav-btn { width: 100%; text-align: left; background: transparent; border: none; color: var(--muted); padding: 12px; font-size: 16px; font-weight: bold; border-radius: 8px; cursor: pointer; transition: background 0.2s;}
+  .nav-btn:hover, .nav-btn.active { background: rgba(255,255,255,0.1); color: #fff;}
+  .stat-box { background: rgba(227,52,47,.1); border: 1px solid rgba(227,52,47,.3); padding: 20px; border-radius: 14px; text-align: center; }
+  .stat-num { font-size: 36px; font-weight: 900; color: #fff; margin-bottom: 4px; }
+  @media (max-width: 768px) { .sidebar { display: none; } .main-content { margin-left: 0; } }
 </style>
 </head>
 <body>
-<div class="wrap">
-  <div class="card">
-    <div class="row" style="justify-content:space-between;">
-      <div><div style="font-weight:1000;font-size:22px;">Admin Command Center</div><div class="muted">Manage orders, tracking, and grocery catalogue.</div></div>
-      <div class="row"><a class="btn ghost" href="${escapeHtml(PUBLIC_SITE_URL)}/">Back to site</a><a class="btn" href="/admin/tracking-control">Tracking Control</a><a class="btn ghost" href="/logout?returnTo=${encodeURIComponent(PUBLIC_SITE_URL + "/")}">Log out</a></div>
-    </div>
-    <div class="toast" id="toast"></div><div class="hr" style="margin-top:16px; margin-bottom:16px;"></div>
-    <div class="row" style="margin-bottom:14px;"><button class="btn primary" id="tabBtnOrders" onclick="switchTab('orders')">Orders Management</button><button class="btn" id="tabBtnCatalogue" onclick="switchTab('catalogue')">Catalogue / Inventory</button></div>
 
-    <div id="tabContentOrders">
+<div class="sidebar">
+   <div style="font-weight: 1000; font-size: 20px; margin-bottom: 30px; color: var(--red-2);">TGR GOD MODE</div>
+   <button class="nav-btn active" onclick="switchTab('dashboard')">📊 Live Dashboard</button>
+   <button class="nav-btn" onclick="switchTab('orders')">🛒 Order Management</button>
+   <button class="nav-btn" onclick="switchTab('catalogue')">📖 Grocery Catalogue</button>
+   <div class="hr" style="margin: 20px 0;"></div>
+   <a class="nav-btn" href="/admin/tracking-control" style="display:block;">📍 Tracking Control</a>
+   <a class="nav-btn" href="${escapeHtml(PUBLIC_SITE_URL)}/" style="display:block;">🌐 Back to Site</a>
+   <a class="nav-btn" href="/logout?returnTo=${encodeURIComponent(PUBLIC_SITE_URL + "/")}" style="display:block; color: var(--red-2);">🚪 Log Out</a>
+</div>
+
+<div class="main-content">
+    <div class="toast" id="toast"></div>
+
+    <div id="tab_dashboard">
+        <h2 style="margin-top:0;">Live Operations Metrics</h2>
+        <div class="muted" style="margin-bottom: 20px;">Real-time view of current capacity and revenue across all active runs.</div>
+        <div class="grid" id="runMetricsGrid">Loading...</div>
+    </div>
+
+    <div id="tab_orders" style="display:none;">
+      <h2 style="margin-top:0;">Order Management</h2>
       <div class="grid">
         <div class="card" style="box-shadow:none;">
-          <div style="font-weight:1000;">Search / Filters</div><div class="hr"></div>
-          <div class="row"><div style="flex: 2 1 320px;"><label class="muted" style="font-weight:900;">Search</label><input id="q" placeholder="orderId, name, email, phone, address" /></div><div style="flex: 1 1 180px;"><label class="muted" style="font-weight:900;">State</label><select id="state"><option value="">Any</option><option>submitted</option><option>confirmed</option><option>shopping</option><option>packed</option><option>out_for_delivery</option><option>delivered</option><option>issue</option><option>cancelled</option></select></div><div style="flex: 1 1 180px;"><label class="muted" style="font-weight:900;">Run Key</label><input id="runKey" placeholder="YYYY-MM-DD-local" /></div></div>
-          <div class="row" style="margin-top:8px;"><button class="btn primary" id="searchBtn">Search</button><button class="btn ghost" id="clearBtn">Clear</button><span class="pill" id="countPill">—</span></div>
+          <div style="font-weight:1000;">Search & Filters</div><div class="hr"></div>
+          <div class="row">
+            <div style="flex: 2 1 300px;"><label class="muted">Search</label><input id="q" placeholder="orderId, name, email, phone, address" /></div>
+            <div style="flex: 1 1 150px;"><label class="muted">State</label><select id="state"><option value="">Any</option><option>submitted</option><option>confirmed</option><option>shopping</option><option>packed</option><option>out_for_delivery</option><option>delivered</option><option>issue</option><option>cancelled</option></select></div>
+            <div style="flex: 1 1 150px;"><label class="muted">Run Key</label><input id="runKey" placeholder="YYYY-MM-DD-local" /></div>
+          </div>
+          <div class="row" style="margin-top:14px;"><button class="btn primary" id="searchBtn">Search Database</button><button class="btn ghost" id="clearBtn">Clear Filters</button><span class="pill" id="countPill">—</span></div>
         </div>
         <div class="card" style="box-shadow:none;">
-          <div style="font-weight:1000;">Quick Tools</div><div class="hr"></div>
-          <div class="row" style="margin-top:10px;"><div style="flex:1 1 200px;"><input id="toolRunKey" placeholder="YYYY-MM-DD-local" /></div><button class="btn" id="exportBtn">Download CSV</button><button class="btn primary" id="masterListBtn">Master Shopping List</button></div>
+          <div style="font-weight:1000;">Export & Logistics Tools</div><div class="hr"></div>
+          <div style="margin-top:10px;">
+             <label class="muted">Target Run Key</label>
+             <input id="toolRunKey" placeholder="YYYY-MM-DD-local" style="margin-bottom: 10px;" />
+             <div class="row">
+                <button class="btn" id="exportBtn">Download CSV</button>
+                <button class="btn primary" id="masterListBtn">Generate Master List</button>
+             </div>
+          </div>
         </div>
       </div>
-      <div class="hr"></div>
-      <div style="overflow:auto;"><table><thead><tr><th>Order</th><th>Customer</th><th>Address</th><th>Run</th><th>Status</th><th>Fees</th><th>Actions</th></tr></thead><tbody id="rows"><tr><td colspan="7" class="muted">Loading…</td></tr></tbody></table></div>
+      <div class="card" style="padding: 0; overflow-x: auto;">
+        <table style="margin: 0;">
+          <thead style="background: rgba(255,255,255,.05);"><tr><th>Order</th><th>Customer</th><th>Address</th><th>Run</th><th>Status</th><th>Fees Paid</th><th>Actions</th></tr></thead>
+          <tbody id="rows"><tr><td colspan="7" class="muted" style="padding: 20px; text-align:center;">Loading...</td></tr></tbody>
+        </table>
+      </div>
     </div>
-  </div>
+
+    <div id="tab_catalogue" style="display:none;">
+       <h2 style="margin-top:0;">Inventory & Catalogue</h2>
+       <p class="muted">Currently managed via frontend add functionality. Full CRUD coming soon.</p>
+    </div>
 </div>
 
 <div class="modalBack" id="modalBack">
   <div class="modal">
-    <div class="row" style="justify-content:space-between;"><div style="font-weight:1000;font-size:20px;">Order Details</div><button class="btn ghost" id="closeModal">Close</button></div>
+    <div class="row" style="justify-content:space-between;"><div style="font-weight:1000;font-size:24px;">Order Details</div><button class="btn ghost" id="closeModal">Close</button></div>
     <div class="hr"></div>
-    <div class="two">
-      <div class="card" style="box-shadow:none;">
-        <div class="k">Order ID</div><div class="v" id="m_orderId">—</div><div class="hr"></div>
+    <div class="grid">
+      <div class="card" style="box-shadow:none; border: none; background: rgba(0,0,0,0.2);">
+        <div class="k">Order ID</div><div class="v" id="m_orderId" style="font-size: 18px; color: var(--red-2);">—</div>
         <div class="k">Customer</div><div class="v" id="m_customer">—</div>
         <div class="k">Phone</div><div class="v" id="m_phone">—</div>
         <div class="k">Address</div><div class="v" id="m_addr">—</div>
-        <div class="k">Run</div><div class="v" id="m_run">—</div>
+        <div class="k">Run Key</div><div class="v" id="m_run">—</div>
       </div>
-      <div class="card" style="box-shadow:none;">
-        <div class="k">Fees total</div><div class="v" id="m_fees">—</div>
-        <div class="k">Square Payment Status</div><div class="v" id="m_groceriesCurrent">—</div><div class="hr"></div>
+      <div class="card" style="box-shadow:none; border: none; background: rgba(0,0,0,0.2);">
+        <div class="k">Upfront Fees Status</div><div class="v" id="m_fees">—</div>
+        <div class="k">Grocery Charge Status</div><div class="v" id="m_groceriesCurrent">—</div>
         
-        <div class="card" style="box-shadow:none; border: 1px solid rgba(227,52,47,.45) !important; background: rgba(227,52,47,.1) !important; margin-bottom:14px;">
+        <div class="card" style="border: 1px solid rgba(227,52,47,.45); background: rgba(227,52,47,.1); margin-top: 10px;">
           <div class="k" style="color: #ff4a44;">Finalize Groceries (Charge Saved Card)</div>
-          <div class="muted small" style="margin-bottom:8px;">Enter exact receipt total and bags used. Non-members are billed $1.50/bag.</div>
+          <div class="muted" style="font-size:12px; margin-bottom:8px;">Charge exact receipt total and premium bags used.</div>
           <div class="row">
-            <input id="m_finalGroceryTotal" type="number" step="0.01" placeholder="Receipt total ($)" style="max-width:160px; background:rgba(0,0,0,.4);" />
-            <input id="m_bagsUsed" type="number" min="0" placeholder="Bags used" style="max-width:120px; background:rgba(0,0,0,.4);" />
-            <button class="btn primary" id="m_captureBtn">Charge Card & Dispatch 🚙</button>
+            <input id="m_finalGroceryTotal" type="number" step="0.01" placeholder="Receipt total ($)" style="max-width:140px; background:rgba(0,0,0,.5);" />
+            <input id="m_bagsUsed" type="number" min="0" placeholder="Bags used" style="max-width:110px; background:rgba(0,0,0,.5);" />
+            <button class="btn primary" id="m_captureBtn">Charge Card</button>
           </div>
         </div>
 
-        <label class="muted" style="font-weight:900;">Manual Status Override</label>
-        <div class="row"><select id="m_state" style="max-width:180px;"><option>submitted</option><option>confirmed</option><option>shopping</option><option>packed</option><option>out_for_delivery</option><option>delivered</option><option>issue</option><option>cancelled</option></select><button class="btn ghost" id="m_saveState">Save override</button></div>
-        <div class="row" style="margin-top:10px;"><button class="btn ghost" id="m_cancelAdmin">Cancel order</button><button class="btn ghost" id="m_deleteOrder">Delete order</button></div>
+        <div class="k" style="margin-top: 14px;">Manual Status Override</div>
+        <div class="row">
+           <select id="m_state" style="max-width:180px;"><option>submitted</option><option>confirmed</option><option>shopping</option><option>packed</option><option>out_for_delivery</option><option>delivered</option><option>issue</option><option>cancelled</option></select>
+           <button class="btn ghost" id="m_saveState">Save override</button>
+        </div>
+        <div class="row" style="margin-top:10px;"><button class="btn ghost small" id="m_cancelAdmin" style="color:var(--muted);">Cancel order</button><button class="btn ghost small" id="m_deleteOrder" style="color:var(--red-2);">Delete order</button></div>
       </div>
     </div>
     <div class="hr"></div>
-    <div class="two">
-      <div class="card" style="box-shadow:none;"><div style="font-weight:1000;">Grocery list</div><div class="hr"></div><pre id="m_list"></pre></div>
-      <div class="card" style="box-shadow:none;"><div style="font-weight:1000;">Add-ons / notes</div><div class="hr"></div><pre id="m_addons"></pre></div>
+    <div class="grid">
+      <div class="card" style="box-shadow:none; background: rgba(0,0,0,0.2);"><div style="font-weight:1000;">Grocery list</div><div class="hr"></div><pre id="m_list" style="font-family: inherit; font-size: 15px; white-space: pre-wrap;"></pre></div>
+      <div class="card" style="box-shadow:none; background: rgba(0,0,0,0.2);"><div style="font-weight:1000;">Premium Add-ons / Notes</div><div class="hr"></div><pre id="m_addons" style="font-family: inherit; font-size: 15px; white-space: pre-wrap; color: #ffc107;"></pre></div>
     </div>
   </div>
 </div>
@@ -1056,24 +1147,73 @@ app.get("/admin", requireLogin, requireAdmin, async (_req, res) => {
 <script>
   const toast = (msg)=>{ const el = document.getElementById("toast"); el.textContent = msg; el.classList.add("show"); setTimeout(()=>el.classList.remove("show"), 3500); };
   const qs = (k)=> document.getElementById(k);
-  function switchTab(tab) { qs('tabContentOrders').style.display = tab === 'orders' ? 'block' : 'none'; }
+  
+  function switchTab(tabId) { 
+      document.querySelectorAll('.nav-btn').forEach(b => b.classList.remove('active'));
+      event.target.classList.add('active');
+      qs('tab_dashboard').style.display = tabId === 'dashboard' ? 'block' : 'none'; 
+      qs('tab_orders').style.display = tabId === 'orders' ? 'block' : 'none'; 
+      qs('tab_catalogue').style.display = tabId === 'catalogue' ? 'block' : 'none'; 
+      if(tabId === 'dashboard') loadDashboardMetrics();
+      if(tabId === 'orders') search();
+  }
 
-  const rowsEl = qs("rows"); let modalOrder = null;
-  function buildQuery(){ const p = new URLSearchParams(); const q = qs("q").value.trim(); const state = qs("state").value.trim(); const runKey = qs("runKey").value.trim(); if(q) p.set("q", q); if(state) p.set("state", state); if(runKey) p.set("runKey", runKey); p.set("limit","200"); return p.toString(); }
+  // Formatting helpers
   function esc(s){ return String(s||"").replaceAll("&","&amp;").replaceAll("<","&lt;").replaceAll(">","&gt;").replaceAll('"',"&quot;"); }
   function money(n){ return Number(n||0).toFixed(2); }
 
+  // Dashboard Logic
+  async function loadDashboardMetrics() {
+     try {
+         const r = await fetch("/api/runs/active");
+         const d = await r.json();
+         const grid = qs("runMetricsGrid");
+         grid.innerHTML = "";
+         
+         for (const key in d.runs) {
+             const run = d.runs[key];
+             const html = \`<div class="stat-box">
+                <div style="text-transform: uppercase; font-weight: 900; letter-spacing: 1px;">\${run.type} Run</div>
+                <div class="muted small">\${run.runKey}</div>
+                <div class="hr"></div>
+                <div class="row" style="justify-content: space-around;">
+                   <div>
+                      <div class="stat-num">\${run.bookedOrdersCount}</div>
+                      <div class="muted small">Orders</div>
+                   </div>
+                   <div>
+                      <div class="stat-num" style="color: \${run.pointsRemaining === 0 ? 'var(--red-2)' : '#4caf50'};">\${run.bookedPoints}/\${run.maxPoints}</div>
+                      <div class="muted small">Points Used</div>
+                   </div>
+                   <div>
+                      <div class="stat-num" style="color: #ffc107;">$\${money(run.bookedFeesTotal)}</div>
+                      <div class="muted small">Upfront Fees Collected</div>
+                   </div>
+                </div>
+             </div>\`;
+             grid.insertAdjacentHTML('beforeend', html);
+         }
+     } catch (e) {
+         qs("runMetricsGrid").innerHTML = "<p>Failed to load metrics.</p>";
+     }
+  }
+
+  // Orders Logic
+  const rowsEl = qs("rows"); let modalOrder = null;
+  function buildQuery(){ const p = new URLSearchParams(); const q = qs("q").value.trim(); const state = qs("state").value.trim(); const runKey = qs("runKey").value.trim(); if(q) p.set("q", q); if(state) p.set("state", state); if(runKey) p.set("runKey", runKey); p.set("limit","200"); return p.toString(); }
+
   function render(items){
     const list = items || []; qs("countPill").textContent = "Results: " + list.length;
-    if(!list.length){ rowsEl.innerHTML = '<tr><td colspan="7" class="muted">No results.</td></tr>'; return; }
+    if(!list.length){ rowsEl.innerHTML = '<tr><td colspan="7" class="muted" style="text-align:center; padding: 20px;">No results found.</td></tr>'; return; }
     rowsEl.innerHTML = list.map(o=>{
       const id = esc(o.orderId); const cust = esc(o.customer?.fullName || ""); const phone = esc(o.customer?.phone || ""); const email = esc(o.customer?.email || ""); const addr = esc((o.address?.streetAddress||"") + ", " + (o.address?.town||"")); const run = esc(o.runKey || ""); const rt = esc(o.runType || ""); const st = esc(o.status?.state || ""); const fees = money(o.pricingSnapshot?.totalFees || 0);
-      return \`<tr><td><div style="font-weight:1000;">\${id}</div><div class="muted" style="font-size:12px;">\${email}</div></td><td><div style="font-weight:900;">\${cust}</div><div class="muted" style="font-size:12px;">\${phone}</div></td><td>\${addr}</td><td><span class="pill">\${rt}</span><div class="muted" style="font-size:12px;margin-top:4px;">\${run}</div></td><td><span class="pill">\${st}</span></td><td>$\${fees}</td><td><button class="btn" data-open="\${id}">Open</button></td></tr>\`;
+      const isPaid = o.payments?.fees?.status === "paid";
+      return \`<tr><td><div style="font-weight:1000;">\${id}</div><div class="muted" style="font-size:12px;">\${email}</div></td><td><div style="font-weight:900;">\${cust}</div><div class="muted" style="font-size:12px;">\${phone}</div></td><td>\${addr}</td><td><span class="pill">\${rt}</span><div class="muted" style="font-size:12px;margin-top:4px;">\${run}</div></td><td><span class="pill">\${st}</span></td><td><span style="color: \${isPaid ? '#4caf50' : 'var(--red-2)'}; font-weight: bold;">$\${fees}</span></td><td><button class="btn small" data-open="\${id}">Manage</button></td></tr>\`;
     }).join("");
     document.querySelectorAll("[data-open]").forEach(btn=>{ btn.addEventListener("click", ()=> openOrder(btn.getAttribute("data-open"))); });
   }
 
-  async function search(){ rowsEl.innerHTML = '<tr><td colspan="7" class="muted">Loading…</td></tr>'; try{ const r = await fetch("/api/admin/orders?" + buildQuery(), { credentials:"include" }); const d = await r.json(); render(d.items || []); } catch(e){ rowsEl.innerHTML = '<tr><td colspan="7" class="muted">Error: ' + esc(e) + '</td></tr>'; } }
+  async function search(){ rowsEl.innerHTML = '<tr><td colspan="7" class="muted" style="text-align:center; padding: 20px;">Loading database...</td></tr>'; try{ const r = await fetch("/api/admin/orders?" + buildQuery(), { credentials:"include" }); const d = await r.json(); render(d.items || []); } catch(e){ rowsEl.innerHTML = '<tr><td colspan="7" class="muted" style="text-align:center; padding: 20px;">Error: ' + esc(e) + '</td></tr>'; } }
 
   function openModal(show){ qs("modalBack").style.display = show ? "flex" : "none"; }
 
@@ -1081,7 +1221,7 @@ app.get("/admin", requireLogin, requireAdmin, async (_req, res) => {
     try{
       const r = await fetch("/api/admin/orders/" + encodeURIComponent(orderId), { credentials:"include" }); const d = await r.json(); modalOrder = d.order;
       qs("m_orderId").textContent = modalOrder.orderId || "—"; qs("m_customer").textContent = modalOrder.customer?.fullName || "—"; qs("m_phone").textContent = modalOrder.customer?.phone || "—"; 
-      qs("m_addr").textContent = (modalOrder.address?.streetAddress || "") + ", " + (modalOrder.address?.town || ""); qs("m_run").textContent = (modalOrder.runKey||""); qs("m_fees").textContent = "$" + money(modalOrder.pricingSnapshot?.totalFees || 0); qs("m_groceriesCurrent").textContent = modalOrder.payments?.groceries?.status || "—"; qs("m_state").value = (modalOrder.status?.state || "submitted"); qs("m_list").textContent = modalOrder.list?.groceryListText || "—"; qs("m_addons").textContent = buildAddonsText(modalOrder);
+      qs("m_addr").textContent = (modalOrder.address?.streetAddress || "") + ", " + (modalOrder.address?.town || ""); qs("m_run").textContent = (modalOrder.runKey||""); qs("m_fees").textContent = "$" + money(modalOrder.pricingSnapshot?.totalFees || 0) + " (" + (modalOrder.payments?.fees?.status || "—") + ")"; qs("m_groceriesCurrent").textContent = modalOrder.payments?.groceries?.status || "—"; qs("m_state").value = (modalOrder.status?.state || "submitted"); qs("m_list").textContent = modalOrder.list?.groceryListText || "—"; qs("m_addons").textContent = buildAddonsText(modalOrder);
       qs("m_finalGroceryTotal").value = "";
       qs("m_bagsUsed").value = "";
       openModal(true);
@@ -1101,19 +1241,27 @@ app.get("/admin", requireLogin, requireAdmin, async (_req, res) => {
       });
       const d = await r.json();
       if(!r.ok || d.ok===false) throw new Error(d.error || "Capture failed");
-      toast("Card charged & customer notified! ✅");
+      toast("Card charged, receipt emailed, & customer texted! ✅");
       await openOrder(modalOrder.orderId); await search();
     } catch(e) { toast(String(e.message||e)); }
   });
 
   async function saveStatus(){ if(!modalOrder?.orderId) return; try{ await fetch("/api/admin/orders/" + encodeURIComponent(modalOrder.orderId) + "/status", { method:"POST", headers:{ "Content-Type":"application/json" }, credentials:"include", body: JSON.stringify({ state: qs("m_state").value }) }); toast("Status saved ✅"); await search(); } catch(e){ toast(String(e)); } }
-  qs("closeModal").addEventListener("click", ()=> openModal(false)); qs("searchBtn").addEventListener("click", search); qs("clearBtn").addEventListener("click", ()=>{ qs("q").value=""; qs("runKey").value=""; search(); }); qs("m_saveState").addEventListener("click", saveStatus);
-  search();
+  
+  // Event Bindings
+  qs("closeModal").addEventListener("click", ()=> openModal(false)); 
+  qs("searchBtn").addEventListener("click", search); 
+  qs("clearBtn").addEventListener("click", ()=>{ qs("q").value=""; qs("runKey").value=""; search(); }); 
+  qs("m_saveState").addEventListener("click", saveStatus);
+  
+  // Boot
+  loadDashboardMetrics();
 </script>
 </body>
 </html>`);
 });
 
+// ROUTIFIC EXPORT
 app.get("/api/admin/routific/export-csv", requireLogin, requireAdmin, async (req, res) => {
   try {
     const runKey = String(req.query.runKey || "").trim();
@@ -1131,11 +1279,16 @@ app.get("/api/admin/routific/export-csv", requireLogin, requireAdmin, async (req
   } catch (e) { res.status(500).send(String(e)); }
 });
 
-app.get("/", (_req, res) => res.send("TGR backend up"));
-
+// START
 async function main() {
-  await mongoose.connect(MONGODB_URI);
-  console.log("Connected to MongoDB");
+  await mongoose.connect(MONGODB_URI, { serverSelectionTimeoutMS: 5000 })
+    .then(() => console.log("Connected to MongoDB"))
+    .catch(err => console.error("MongoDB initial connection error:", err));
+
+  mongoose.connection.on('disconnected', () => {
+    console.warn('Lost MongoDB connection. Retrying automatically...');
+  });
+
   app.listen(PORT, () => console.log("Server running on port", PORT));
 }
 
