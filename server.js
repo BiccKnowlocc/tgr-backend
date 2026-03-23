@@ -353,8 +353,173 @@ async function ensureUpcomingRuns() {
 }
 
 // =========================
-// CATALOGUE API
+// CATALOGUE API & DB SEEDER
 // =========================
+
+const DEFAULT_CATALOGUE = [
+  // Produce
+  { name: "Bananas (Bunch)", category: "Produce", estimatedPrice: 2.99 },
+  { name: "Apples (Bag)", category: "Produce", estimatedPrice: 5.99 },
+  { name: "Oranges (Bag)", category: "Produce", estimatedPrice: 6.49 },
+  { name: "Grapes (Seedless)", category: "Produce", estimatedPrice: 4.99 },
+  { name: "Strawberries (Clamshell)", category: "Produce", estimatedPrice: 5.49 },
+  { name: "Potatoes (10lb Bag)", category: "Produce", estimatedPrice: 6.99 },
+  { name: "Yellow Onions (3lb Bag)", category: "Produce", estimatedPrice: 3.49 },
+  { name: "Carrots (2lb Bag)", category: "Produce", estimatedPrice: 2.49 },
+  { name: "Tomatoes (On the Vine)", category: "Produce", estimatedPrice: 3.99 },
+  { name: "Iceberg Lettuce", category: "Produce", estimatedPrice: 2.99 },
+  { name: "Romaine Lettuce", category: "Produce", estimatedPrice: 3.49 },
+  { name: "Baby Spinach (Clamshell)", category: "Produce", estimatedPrice: 4.99 },
+  { name: "Broccoli Crowns", category: "Produce", estimatedPrice: 3.49 },
+  { name: "English Cucumber", category: "Produce", estimatedPrice: 1.99 },
+  { name: "Bell Peppers (Assorted 3pk)", category: "Produce", estimatedPrice: 4.99 },
+  { name: "White Mushrooms (Whole)", category: "Produce", estimatedPrice: 3.49 },
+  { name: "Garlic (3pk)", category: "Produce", estimatedPrice: 1.99 },
+  { name: "Lemons (Bag)", category: "Produce", estimatedPrice: 4.99 },
+  { name: "Avocados (Bag of 5)", category: "Produce", estimatedPrice: 6.99 },
+  { name: "Celery (Stalk)", category: "Produce", estimatedPrice: 2.99 },
+  { name: "Zucchini", category: "Produce", estimatedPrice: 2.49 },
+
+  // Dairy & Eggs
+  { name: "Milk 2% (4L Bag)", category: "Dairy & Eggs", estimatedPrice: 5.89 },
+  { name: "Milk Skim (4L Bag)", category: "Dairy & Eggs", estimatedPrice: 5.89 },
+  { name: "Milk Whole 3.25% (4L Bag)", category: "Dairy & Eggs", estimatedPrice: 6.49 },
+  { name: "Butter (Salted, 454g)", category: "Dairy & Eggs", estimatedPrice: 6.99 },
+  { name: "Butter (Unsalted, 454g)", category: "Dairy & Eggs", estimatedPrice: 6.99 },
+  { name: "Large White Eggs (1 Dozen)", category: "Dairy & Eggs", estimatedPrice: 3.99 },
+  { name: "Large Brown Eggs (1 Dozen)", category: "Dairy & Eggs", estimatedPrice: 4.49 },
+  { name: "Cheddar Cheese (Block, 400g)", category: "Dairy & Eggs", estimatedPrice: 7.99 },
+  { name: "Mozzarella Cheese (Block, 400g)", category: "Dairy & Eggs", estimatedPrice: 7.99 },
+  { name: "Yogurt (Vanilla Tub, 650g)", category: "Dairy & Eggs", estimatedPrice: 4.49 },
+  { name: "Greek Yogurt (Plain, 500g)", category: "Dairy & Eggs", estimatedPrice: 5.99 },
+  { name: "Sour Cream (500ml)", category: "Dairy & Eggs", estimatedPrice: 3.49 },
+  { name: "Cream Cheese (Brick, 250g)", category: "Dairy & Eggs", estimatedPrice: 4.49 },
+  { name: "Cottage Cheese (500g)", category: "Dairy & Eggs", estimatedPrice: 4.99 },
+  { name: "Heavy Whipping Cream (473ml)", category: "Dairy & Eggs", estimatedPrice: 5.49 },
+  { name: "Margarine (Tub, 850g)", category: "Dairy & Eggs", estimatedPrice: 5.99 },
+  { name: "Almond Milk (Unsweetened, 1.89L)", category: "Dairy & Eggs", estimatedPrice: 4.49 },
+  { name: "Oat Milk (1.89L)", category: "Dairy & Eggs", estimatedPrice: 4.99 },
+
+  // Meat & Seafood
+  { name: "Lean Ground Beef (1lb)", category: "Meat & Seafood", estimatedPrice: 6.99 },
+  { name: "Chicken Breasts (Boneless Skinless)", category: "Meat & Seafood", estimatedPrice: 12.99 },
+  { name: "Chicken Thighs (Bone-in)", category: "Meat & Seafood", estimatedPrice: 9.99 },
+  { name: "Pork Chops (Bone-in)", category: "Meat & Seafood", estimatedPrice: 8.99 },
+  { name: "Bacon (500g)", category: "Meat & Seafood", estimatedPrice: 6.99 },
+  { name: "Breakfast Sausage (Package)", category: "Meat & Seafood", estimatedPrice: 5.99 },
+  { name: "Hot Dogs (Package of 12)", category: "Meat & Seafood", estimatedPrice: 4.99 },
+  { name: "Deli Ham (Sliced, 175g)", category: "Meat & Seafood", estimatedPrice: 5.49 },
+  { name: "Deli Turkey Breast (Sliced, 175g)", category: "Meat & Seafood", estimatedPrice: 5.99 },
+  { name: "Salmon Fillets (Frozen, 400g)", category: "Meat & Seafood", estimatedPrice: 14.99 },
+  { name: "Canned Tuna (Flaked Light)", category: "Meat & Seafood", estimatedPrice: 1.99 },
+  { name: "Pepperoni Slices (Package)", category: "Meat & Seafood", estimatedPrice: 6.49 },
+  { name: "Salami Slices (Package)", category: "Meat & Seafood", estimatedPrice: 6.49 },
+
+  // Bakery
+  { name: "White Bread (Sliced Loaf)", category: "Bakery", estimatedPrice: 3.49 },
+  { name: "Whole Wheat Bread (Sliced Loaf)", category: "Bakery", estimatedPrice: 3.49 },
+  { name: "Everything Bagels (6pk)", category: "Bakery", estimatedPrice: 4.49 },
+  { name: "Plain Bagels (6pk)", category: "Bakery", estimatedPrice: 4.49 },
+  { name: "Hamburger Buns (8pk)", category: "Bakery", estimatedPrice: 3.99 },
+  { name: "Hot Dog Buns (8pk)", category: "Bakery", estimatedPrice: 3.99 },
+  { name: "English Muffins (6pk)", category: "Bakery", estimatedPrice: 3.49 },
+  { name: "Croissants (Package of 6)", category: "Bakery", estimatedPrice: 5.99 },
+  { name: "Flour Tortillas (Large 10pk)", category: "Bakery", estimatedPrice: 4.99 },
+  { name: "Pita Bread (6pk)", category: "Bakery", estimatedPrice: 3.99 },
+  { name: "French Baguette", category: "Bakery", estimatedPrice: 2.99 },
+
+  // Pantry (Dry Goods & Canned)
+  { name: "Spaghetti Pasta (500g)", category: "Pantry", estimatedPrice: 2.49 },
+  { name: "Macaroni Pasta (500g)", category: "Pantry", estimatedPrice: 2.49 },
+  { name: "White Rice (Long Grain, 2kg)", category: "Pantry", estimatedPrice: 5.99 },
+  { name: "Brown Rice (2kg)", category: "Pantry", estimatedPrice: 6.49 },
+  { name: "All-Purpose Flour (2.5kg)", category: "Pantry", estimatedPrice: 5.49 },
+  { name: "White Sugar (2kg)", category: "Pantry", estimatedPrice: 3.99 },
+  { name: "Brown Sugar (1kg)", category: "Pantry", estimatedPrice: 3.49 },
+  { name: "Baking Powder", category: "Pantry", estimatedPrice: 3.99 },
+  { name: "Baking Soda", category: "Pantry", estimatedPrice: 2.49 },
+  { name: "Olive Oil (Extra Virgin, 1L)", category: "Pantry", estimatedPrice: 12.99 },
+  { name: "Vegetable Oil (3L)", category: "Pantry", estimatedPrice: 9.99 },
+  { name: "Canola Oil (3L)", category: "Pantry", estimatedPrice: 9.99 },
+  { name: "Table Salt (Box)", category: "Pantry", estimatedPrice: 1.99 },
+  { name: "Black Pepper (Ground)", category: "Pantry", estimatedPrice: 4.99 },
+  { name: "Ketchup (1L)", category: "Pantry", estimatedPrice: 4.99 },
+  { name: "Yellow Mustard", category: "Pantry", estimatedPrice: 2.99 },
+  { name: "Mayonnaise (890ml)", category: "Pantry", estimatedPrice: 5.99 },
+  { name: "Soy Sauce", category: "Pantry", estimatedPrice: 3.49 },
+  { name: "White Vinegar (1L)", category: "Pantry", estimatedPrice: 2.49 },
+  { name: "Peanut Butter (Smooth, 1kg)", category: "Pantry", estimatedPrice: 6.99 },
+  { name: "Strawberry Jam (500ml)", category: "Pantry", estimatedPrice: 4.99 },
+  { name: "Liquid Honey", category: "Pantry", estimatedPrice: 7.99 },
+  { name: "Cheerios Cereal (Family Size)", category: "Pantry", estimatedPrice: 6.99 },
+  { name: "Oats (Large Flake, 1kg)", category: "Pantry", estimatedPrice: 3.99 },
+  { name: "Pancake Mix (Original)", category: "Pantry", estimatedPrice: 4.49 },
+  { name: "Maple Syrup (Pure, 500ml)", category: "Pantry", estimatedPrice: 11.99 },
+  { name: "Coffee Beans (Medium Roast, 340g)", category: "Pantry", estimatedPrice: 14.99 },
+  { name: "Ground Coffee (Dark Roast, 340g)", category: "Pantry", estimatedPrice: 14.99 },
+  { name: "Black Tea Bags (72pk)", category: "Pantry", estimatedPrice: 5.49 },
+  { name: "Canned Diced Tomatoes (796ml)", category: "Pantry", estimatedPrice: 2.49 },
+  { name: "Canned Black Beans (540ml)", category: "Pantry", estimatedPrice: 1.99 },
+  { name: "Canned Sweet Corn (341ml)", category: "Pantry", estimatedPrice: 1.99 },
+  { name: "Chicken Broth (Carton, 900ml)", category: "Pantry", estimatedPrice: 2.99 },
+  { name: "Beef Broth (Carton, 900ml)", category: "Pantry", estimatedPrice: 2.99 },
+  { name: "Chicken Noodle Soup (Canned)", category: "Pantry", estimatedPrice: 2.49 },
+  { name: "Tomato Soup (Canned)", category: "Pantry", estimatedPrice: 1.99 },
+  { name: "Kraft Dinner (Mac & Cheese Box)", category: "Pantry", estimatedPrice: 1.99 },
+  { name: "Pasta Sauce (Tomato & Basil, Jar)", category: "Pantry", estimatedPrice: 3.49 },
+
+  // Snacks & Sweets
+  { name: "Potato Chips (Regular Family Size)", category: "Snacks & Sweets", estimatedPrice: 4.49 },
+  { name: "Tortilla Chips (Family Size)", category: "Snacks & Sweets", estimatedPrice: 4.49 },
+  { name: "Pretzels (Bag)", category: "Snacks & Sweets", estimatedPrice: 3.99 },
+  { name: "Microwave Popcorn (6pk)", category: "Snacks & Sweets", estimatedPrice: 5.99 },
+  { name: "Ritz Crackers", category: "Snacks & Sweets", estimatedPrice: 3.99 },
+  { name: "Chocolate Chip Cookies (Bag)", category: "Snacks & Sweets", estimatedPrice: 4.49 },
+  { name: "Graham Crackers", category: "Snacks & Sweets", estimatedPrice: 4.99 },
+  { name: "Milk Chocolate Bar", category: "Snacks & Sweets", estimatedPrice: 1.99 },
+  { name: "Gummy Bears (Bag)", category: "Snacks & Sweets", estimatedPrice: 2.99 },
+  { name: "Vanilla Ice Cream (1.5L Tub)", category: "Snacks & Sweets", estimatedPrice: 5.99 },
+
+  // Beverages
+  { name: "Bottled Water (24 Pack)", category: "Beverages", estimatedPrice: 4.99 },
+  { name: "Sparkling Water (12 Pack Cans)", category: "Beverages", estimatedPrice: 6.99 },
+  { name: "Orange Juice (Carton, 1.75L)", category: "Beverages", estimatedPrice: 5.49 },
+  { name: "Apple Juice (Jug, 1.89L)", category: "Beverages", estimatedPrice: 4.49 },
+  { name: "Coca-Cola (12 Pack Cans)", category: "Beverages", estimatedPrice: 7.99 },
+  { name: "Pepsi (12 Pack Cans)", category: "Beverages", estimatedPrice: 7.99 },
+  { name: "Sprite (12 Pack Cans)", category: "Beverages", estimatedPrice: 7.99 },
+  { name: "Ginger Ale (12 Pack Cans)", category: "Beverages", estimatedPrice: 7.99 },
+  { name: "Gatorade (6 Pack Bottles)", category: "Beverages", estimatedPrice: 6.99 },
+
+  // Household & Paper
+  { name: "Toilet Paper (12 Double Rolls)", category: "Household & Paper", estimatedPrice: 12.99 },
+  { name: "Paper Towels (6 Rolls)", category: "Household & Paper", estimatedPrice: 10.99 },
+  { name: "Facial Tissue (6 Boxes)", category: "Household & Paper", estimatedPrice: 8.99 },
+  { name: "Tall Kitchen Garbage Bags (40pk)", category: "Household & Paper", estimatedPrice: 9.99 },
+  { name: "Large Black Garbage Bags (20pk)", category: "Household & Paper", estimatedPrice: 8.99 },
+  { name: "Liquid Dish Soap (800ml)", category: "Household & Paper", estimatedPrice: 3.49 },
+  { name: "Laundry Detergent (Liquid, 40 Loads)", category: "Household & Paper", estimatedPrice: 14.99 },
+  { name: "Cleaning Sponges (3pk)", category: "Household & Paper", estimatedPrice: 3.99 },
+  { name: "Aluminum Foil (Roll)", category: "Household & Paper", estimatedPrice: 4.99 },
+  { name: "Plastic Wrap (Roll)", category: "Household & Paper", estimatedPrice: 3.99 },
+  { name: "Ziploc Sandwich Bags (100pk)", category: "Household & Paper", estimatedPrice: 5.49 },
+  { name: "Ziploc Large Freezer Bags (30pk)", category: "Household & Paper", estimatedPrice: 6.49 }
+];
+
+async function seedDatabaseIfEmpty() {
+    try {
+        const count = await CatalogueItem.countDocuments();
+        if (count === 0) {
+            console.log("Database is empty. Seeding 120+ default grocery items...");
+            await CatalogueItem.insertMany(DEFAULT_CATALOGUE);
+            console.log("✅ Seed complete! The catalogue is ready.");
+        }
+    } catch (e) {
+        console.error("⚠️ Failed to seed catalogue:", e);
+    }
+}
+
+
 app.get("/api/public/catalogue/search", async (req, res) => { try { const q = String(req.query.q || "").trim().toLowerCase(); if (!q || q.length < 2) return res.json({ ok: true, items: [] }); const re = new RegExp(q.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i"); res.json({ ok: true, items: await CatalogueItem.find({ $or: [{ name: re }, { category: re }] }).limit(15).lean() }); } catch (e) { res.status(500).json({ ok: false, error: String(e) }); } });
 app.get("/api/admin/catalogue", requireLogin, requireAdmin, async (req, res) => { res.json({ ok: true, items: await CatalogueItem.find().sort({ category: 1, name: 1 }).lean() }); });
 app.post("/api/admin/catalogue", requireLogin, requireAdmin, async (req, res) => { try { const { name, category, estimatedPrice } = req.body; if (!name) return res.status(400).json({ ok: false, error: "Name is required" }); res.json({ ok: true, item: await CatalogueItem.findOneAndUpdate({ name: String(name).trim() }, { $set: { category: String(category || "General").trim(), estimatedPrice: Number(estimatedPrice || 0) } }, { upsert: true, new: true }) }); } catch (e) { res.status(500).json({ ok: false, error: String(e) }); } });
@@ -684,6 +849,36 @@ app.post("/api/orders/:orderId/cancel", async (req, res) => {
   } catch (e) { return res.status(500).json({ ok: false, error: String(e) }); }
 });
 
+// ADMIN API ENDPOINTS (USERS & RUNS)
+app.get("/api/admin/users", requireLogin, requireAdmin, async (req, res) => {
+  try {
+    const users = await User.find().sort({ createdAt: -1 }).limit(150).lean();
+    res.json({ ok: true, users });
+  } catch (e) { res.status(500).json({ ok: false, error: String(e) }); }
+});
+app.post("/api/admin/users/:id/tier", requireLogin, requireAdmin, async (req, res) => {
+  try {
+    const { tier, status } = req.body;
+    await User.findByIdAndUpdate(req.params.id, { $set: { membershipLevel: tier, membershipStatus: status }});
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ ok: false, error: String(e) }); }
+});
+
+app.get("/api/admin/runs", requireLogin, requireAdmin, async (req, res) => {
+  try {
+    const runs = await Run.find().sort({ opensAt: -1 }).limit(30).lean();
+    res.json({ ok: true, runs });
+  } catch (e) { res.status(500).json({ ok: false, error: String(e) }); }
+});
+app.post("/api/admin/runs/:runKey", requireLogin, requireAdmin, async (req, res) => {
+  try {
+    const { maxPoints, maxSlots } = req.body;
+    await Run.findOneAndUpdate({ runKey: req.params.runKey }, { $set: { maxPoints: Number(maxPoints), maxSlots: Number(maxSlots) }});
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ ok: false, error: String(e) }); }
+});
+
+
 app.post("/api/admin/orders/:orderId/capture", requireLogin, requireAdmin, async (req, res) => {
   try {
     const orderId = String(req.params.orderId || "").trim().toUpperCase();
@@ -985,6 +1180,38 @@ app.get("/member", async (req, res) => {
   } catch (e) { res.status(500).send("Member portal error: " + String(e)); }
 });
 
+// =========================
+// ADMIN API ENDPOINTS (USERS & RUNS)
+// =========================
+app.get("/api/admin/users", requireLogin, requireAdmin, async (req, res) => {
+  try {
+    const users = await User.find().sort({ createdAt: -1 }).limit(150).lean();
+    res.json({ ok: true, users });
+  } catch (e) { res.status(500).json({ ok: false, error: String(e) }); }
+});
+app.post("/api/admin/users/:id/tier", requireLogin, requireAdmin, async (req, res) => {
+  try {
+    const { tier, status } = req.body;
+    await User.findByIdAndUpdate(req.params.id, { $set: { membershipLevel: tier, membershipStatus: status }});
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ ok: false, error: String(e) }); }
+});
+
+app.get("/api/admin/runs", requireLogin, requireAdmin, async (req, res) => {
+  try {
+    const runs = await Run.find().sort({ opensAt: -1 }).limit(30).lean();
+    res.json({ ok: true, runs });
+  } catch (e) { res.status(500).json({ ok: false, error: String(e) }); }
+});
+app.post("/api/admin/runs/:runKey", requireLogin, requireAdmin, async (req, res) => {
+  try {
+    const { maxPoints, maxSlots } = req.body;
+    await Run.findOneAndUpdate({ runKey: req.params.runKey }, { $set: { maxPoints: Number(maxPoints), maxSlots: Number(maxSlots) }});
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ ok: false, error: String(e) }); }
+});
+
+
 // ADMIN API & UI
 app.get("/api/admin/runs/:runKey/master-list", requireLogin, requireAdmin, async (req, res) => {
   try {
@@ -1059,117 +1286,177 @@ app.get("/admin", requireLogin, requireAdmin, async (_req, res) => {
 <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>TGR Admin God Mode</title>
 <style>
   :root{ --bg:#0b0b0b; --panel:rgba(255,255,255,.06); --line:rgba(255,255,255,.14); --text:#fff; --muted:rgba(255,255,255,.75); --red:#e3342f; --red2:#ff4a44; --radius:14px; }
-  body{margin:0;background:var(--bg);color:var(--text);font-family:system-ui,-apple-system,sans-serif;}
-  .sidebar { width: 250px; background: rgba(15,15,16,0.95); border-right: 1px solid var(--line); position: fixed; height: 100vh; overflow-y: auto; padding: 20px; box-sizing: border-box;}
-  .main-content { margin-left: 250px; padding: 20px; }
-  .card{border:1px solid var(--line);background:var(--panel);border-radius:var(--radius);padding:14px; margin-bottom: 14px;}
-  .row{display:flex;gap:10px;flex-wrap:wrap;align-items:center;}
-  .btn{border:1px solid rgba(255,255,255,.18);background:rgba(255,255,255,.06);color:#fff;font-weight:900;border-radius:999px;padding:10px 14px;cursor:pointer;text-decoration:none;white-space:nowrap; display: inline-block; text-align: center;}
-  .btn.primary{background:linear-gradient(180deg,var(--red2),var(--red));border-color:rgba(0,0,0,.25);}
-  .btn.ghost{background:transparent;} .muted{color:var(--muted);}
-  .pill{display:inline-block;padding:4px 10px;border-radius:999px;border:1px solid rgba(255,255,255,.18);background:rgba(255,255,255,.06);font-weight:900;font-size:12px;}
-  .hr{height:1px;background:rgba(255,255,255,.12);margin:12px 0;}
-  input,select,textarea{width:100%;padding:12px 12px;border-radius:12px;border:1px solid rgba(255,255,255,.18);background:rgba(0,0,0,.22);color:#fff;font-size:15px;outline:none; box-sizing: border-box;}
-  table{width:100%;border-collapse:collapse;} th,td{padding:10px 8px;border-bottom:1px solid rgba(255,255,255,.12);vertical-align:middle; text-align:left;} th{font-size:12px;color:rgba(255,255,255,.72);text-transform:uppercase;}
-  .grid{display:grid;grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap:12px;} 
-  .toast{position: fixed; bottom: 20px; right: 20px; padding:12px 20px; border-radius:12px; border:1px solid rgba(255,255,255,.18); background:rgba(0,0,0,.8); display:none; font-weight:900; z-index: 99999;} .toast.show{display:block;}
-  .modalBack{position:fixed; inset:0; background:rgba(0,0,0,.7); display:none; align-items:center; justify-content:center; padding:16px; z-index:1000;}
-  .modal{width:min(1000px, 100%); max-height:92vh; overflow:auto; border:1px solid rgba(255,255,255,.16); background:#0b0b0b; border-radius:16px; padding:20px;}
-  .k{font-size:12px;color:rgba(255,255,255,.7);text-transform:uppercase;letter-spacing:.08em;} .v{font-weight:900; margin-bottom: 8px;}
-  .nav-btn { width: 100%; text-align: left; background: transparent; border: none; color: var(--muted); padding: 12px; font-size: 16px; font-weight: bold; border-radius: 8px; cursor: pointer; transition: background 0.2s;}
-  .nav-btn:hover, .nav-btn.active { background: rgba(255,255,255,0.1); color: #fff;}
-  .stat-box { background: rgba(227,52,47,.1); border: 1px solid rgba(227,52,47,.3); padding: 20px; border-radius: 14px; text-align: center; }
-  .stat-num { font-size: 36px; font-weight: 900; color: #fff; margin-bottom: 4px; }
-  @media (max-width: 768px) { .sidebar { display: none; } .main-content { margin-left: 0; } }
+  body { margin:0; background:var(--bg); color:var(--text); font-family:system-ui,-apple-system,sans-serif; }
+  .dashboard-layout { display: flex; min-height: 100vh; }
+  .sidebar { flex: 0 0 280px; background: rgba(15,15,16,0.95); border-right: 1px solid var(--line); padding: 24px; box-sizing: border-box; display: flex; flex-direction: column; gap: 8px; position: sticky; top: 0; height: 100vh; overflow-y: auto; }
+  .main-content { flex: 1; min-width: 0; padding: 30px; box-sizing: border-box; }
+  .card { border:1px solid var(--line); background:var(--panel); border-radius:var(--radius); padding:20px; margin-bottom: 20px; box-sizing: border-box; overflow-x: auto; }
+  .row { display:flex; gap:10px; flex-wrap:wrap; align-items:center; }
+  .btn { border:1px solid rgba(255,255,255,.18); background:rgba(255,255,255,.06); color:#fff; font-weight:900; border-radius:999px; padding:10px 16px; cursor:pointer; text-decoration:none; white-space:nowrap; display: inline-block; text-align: center; transition: background 0.2s; }
+  .btn.primary { background:linear-gradient(180deg,var(--red2),var(--red)); border-color:rgba(0,0,0,.25); }
+  .btn.ghost { background:transparent; } 
+  .btn:hover { background:rgba(255,255,255,.12); }
+  .muted { color:var(--muted); }
+  .pill { display:inline-block; padding:4px 10px; border-radius:999px; border:1px solid rgba(255,255,255,.18); background:rgba(255,255,255,.06); font-weight:900; font-size:12px; }
+  .hr { height:1px; background:rgba(255,255,255,.12); margin:16px 0; }
+  input, select, textarea { width:100%; padding:12px; border-radius:12px; border:1px solid rgba(255,255,255,.18); background:rgba(0,0,0,.22); color:#fff; font-size:15px; outline:none; box-sizing: border-box; }
+  table { width:100%; border-collapse:collapse; min-width: 600px; } 
+  th, td { padding:14px 10px; border-bottom:1px solid rgba(255,255,255,.12); vertical-align:middle; text-align:left; } 
+  th { font-size:12px; color:rgba(255,255,255,.72); text-transform:uppercase; letter-spacing:1px; }
+  .grid { display:grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap:16px; } 
+  .toast { position: fixed; bottom: 20px; right: 20px; padding:12px 20px; border-radius:12px; border:1px solid rgba(255,255,255,.18); background:rgba(0,0,0,.9); display:none; font-weight:900; z-index: 99999; box-shadow: 0 10px 30px rgba(0,0,0,0.5); } 
+  .toast.show { display:block; }
+  .modalBack { position:fixed; inset:0; background:rgba(0,0,0,.8); display:none; align-items:center; justify-content:center; padding:16px; z-index:1000; backdrop-filter: blur(5px); }
+  .modal { width:min(1100px, 100%); max-height:92vh; overflow-y:auto; border:1px solid rgba(255,255,255,.16); background:#151517; border-radius:16px; padding:24px; box-sizing: border-box; }
+  .k { font-size:12px; color:rgba(255,255,255,.7); text-transform:uppercase; letter-spacing:.08em; } 
+  .v { font-weight:900; margin-bottom: 12px; font-size: 15px; }
+  .nav-btn { width: 100%; text-align: left; background: transparent; border: none; color: var(--muted); padding: 14px 16px; font-size: 16px; font-weight: 800; border-radius: 10px; cursor: pointer; transition: all 0.2s; display: flex; align-items: center; gap: 10px; word-wrap: break-word; white-space: normal; line-height: 1.3; }
+  .nav-btn:hover { background: rgba(255,255,255,0.08); color: #fff; }
+  .nav-btn.active { background: rgba(227,52,47,.15); border: 1px solid rgba(227,52,47,.4); color: #fff; }
+  .stat-box { background: rgba(227,52,47,.1); border: 1px solid rgba(227,52,47,.3); padding: 24px; border-radius: 14px; text-align: center; }
+  .stat-num { font-size: 42px; font-weight: 900; color: #fff; margin-bottom: 4px; line-height: 1; }
+  .mobile-menu-btn { display: none; background: transparent; border: 1px solid var(--line); color: #fff; padding: 10px; border-radius: 8px; margin-bottom: 10px; cursor: pointer; font-weight: bold; width: 100%;}
+  @media (max-width: 900px) { 
+      .dashboard-layout { flex-direction: column; } 
+      .sidebar { width: 100%; height: auto; position: relative; border-right: none; border-bottom: 1px solid var(--line); display: none; } 
+      .sidebar.show { display: flex; }
+      .mobile-menu-btn { display: block; }
+      .main-content { padding: 16px; } 
+  }
 </style>
 </head>
 <body>
 
-<div class="sidebar">
-   <div style="font-weight: 1000; font-size: 20px; margin-bottom: 30px; color: var(--red-2);">TGR GOD MODE</div>
-   <button class="nav-btn active" onclick="switchTab('dashboard')">📊 Live Dashboard</button>
-   <button class="nav-btn" onclick="switchTab('orders')">🛒 Order Management</button>
-   <button class="nav-btn" onclick="switchTab('catalogue')">📖 Grocery Catalogue</button>
-   <div class="hr" style="margin: 20px 0;"></div>
-   <button class="nav-btn" onclick="switchTab('tracking')">📍 Tracking Control</button>
-   <a class="nav-btn" href="${escapeHtml(PUBLIC_SITE_URL)}/" style="display:block;">🌐 Back to Site</a>
-   <a class="nav-btn" href="/logout?returnTo=${encodeURIComponent(PUBLIC_SITE_URL + "/")}" style="display:block; color: var(--red-2);">🚪 Log Out</a>
+<div style="padding: 10px 16px; background: #0b0b0b; border-bottom: 1px solid var(--line);">
+    <button class="mobile-menu-btn" onclick="document.getElementById('sidebar').classList.toggle('show')">☰ Menu</button>
 </div>
 
-<div class="main-content">
-    <div class="toast" id="toast"></div>
-
-    <div id="tab_dashboard">
-        <h2 style="margin-top:0;">Live Operations Metrics</h2>
-        <div class="muted" style="margin-bottom: 20px;">Real-time view of current capacity and revenue across all active runs.</div>
-        <div class="grid" id="runMetricsGrid">Loading...</div>
+<div class="dashboard-layout">
+    <div class="sidebar" id="sidebar">
+       <div style="font-weight: 1000; font-size: 22px; margin-bottom: 20px; color: var(--red-2); text-align: center; padding-bottom: 20px; border-bottom: 1px solid var(--line);">TGR GOD MODE</div>
+       <button class="nav-btn active" onclick="switchTab('dashboard')">📊 Live Dashboard</button>
+       <button class="nav-btn" onclick="switchTab('orders')">🛒 Order Management</button>
+       <button class="nav-btn" onclick="switchTab('runs')">🚚 Run Capacity Control</button>
+       <button class="nav-btn" onclick="switchTab('users')">👥 Customer Database</button>
+       <button class="nav-btn" onclick="switchTab('catalogue')">📖 Grocery Catalogue</button>
+       <button class="nav-btn" onclick="switchTab('tracking')">📍 GPS Broadcasting</button>
+       <div class="hr" style="margin: 10px 0;"></div>
+       <a class="nav-btn" href="${escapeHtml(PUBLIC_SITE_URL)}/">🌐 Back to Live Site</a>
+       <a class="nav-btn" href="/logout?returnTo=${encodeURIComponent(PUBLIC_SITE_URL + "/")}" style="color: var(--red-2);">🚪 Secure Log Out</a>
     </div>
 
-    <div id="tab_orders" style="display:none;">
-      <h2 style="margin-top:0;">Order Management</h2>
-      <div class="grid">
-        <div class="card" style="box-shadow:none;">
-          <div style="font-weight:1000;">Search & Filters</div><div class="hr"></div>
-          <div class="row">
-            <div style="flex: 2 1 300px;"><label class="muted">Search</label><input id="q" placeholder="orderId, name, email, phone, address" /></div>
-            <div style="flex: 1 1 150px;"><label class="muted">State</label><select id="state"><option value="">Any</option><option>submitted</option><option>confirmed</option><option>shopping</option><option>packed</option><option>out_for_delivery</option><option>delivered</option><option>issue</option><option>cancelled</option></select></div>
-            <div style="flex: 1 1 150px;"><label class="muted">Run Key</label><input id="runKey" placeholder="YYYY-MM-DD-local" /></div>
-          </div>
-          <div class="row" style="margin-top:14px;"><button class="btn primary" id="searchBtn">Search Database</button><button class="btn ghost" id="clearBtn">Clear Filters</button><span class="pill" id="countPill">—</span></div>
+    <div class="main-content">
+        <div class="toast" id="toast"></div>
+
+        <div id="tab_dashboard" class="tab-pane">
+            <h2 style="margin-top:0; font-size: 28px;">Live Operations Metrics</h2>
+            <div class="muted" style="margin-bottom: 24px;">Real-time view of current capacity and revenue across all active runs.</div>
+            <div class="grid" id="runMetricsGrid">Loading...</div>
         </div>
-        <div class="card" style="box-shadow:none;">
-          <div style="font-weight:1000;">Export & Logistics Tools</div><div class="hr"></div>
-          <div style="margin-top:10px;">
-             <label class="muted">Target Run Key</label>
-             <input id="toolRunKey" placeholder="YYYY-MM-DD-local" style="margin-bottom: 10px;" />
+
+        <div id="tab_orders" class="tab-pane" style="display:none;">
+          <h2 style="margin-top:0; font-size: 28px;">Order Management</h2>
+          <div class="grid">
+            <div class="card" style="box-shadow:none; padding: 20px;">
+              <div style="font-weight:1000; font-size: 16px;">Search & Filters</div><div class="hr"></div>
+              <div class="row">
+                <div style="flex: 2 1 200px;"><label class="muted">Search</label><input id="q" placeholder="Order ID, name, email..." /></div>
+                <div style="flex: 1 1 120px;"><label class="muted">Status</label><select id="state"><option value="">Any</option><option>submitted</option><option>confirmed</option><option>shopping</option><option>packed</option><option>out_for_delivery</option><option>delivered</option><option>issue</option><option>cancelled</option></select></div>
+                <div style="flex: 1 1 120px;"><label class="muted">Run Key</label><input id="runKey" placeholder="YYYY-MM-DD-local" /></div>
+              </div>
+              <div class="row" style="margin-top:16px;">
+                 <button class="btn primary" id="searchBtn">Search Database</button>
+                 <button class="btn ghost" id="clearBtn">Clear Filters</button>
+                 <span class="pill" id="countPill" style="margin-left: auto;">—</span>
+              </div>
+            </div>
+            <div class="card" style="box-shadow:none; padding: 20px;">
+              <div style="font-weight:1000; font-size: 16px;">Export & Logistics Tools</div><div class="hr"></div>
+              <div style="margin-top:10px;">
+                 <label class="muted">Target Run Key (For CSV/Master List)</label>
+                 <input id="toolRunKey" placeholder="YYYY-MM-DD-local" style="margin-bottom: 14px;" />
+                 <div class="row">
+                    <button class="btn secondary" id="exportBtn">Download Routific CSV</button>
+                    <button class="btn primary" id="masterListBtn">Generate Master List</button>
+                 </div>
+              </div>
+            </div>
+          </div>
+          <div class="card" style="padding: 0;">
+            <table>
+              <thead style="background: rgba(255,255,255,.05);"><tr><th>Order</th><th>Customer</th><th>Address</th><th>Run</th><th>Status</th><th>Fees Paid</th><th>Actions</th></tr></thead>
+              <tbody id="rows"><tr><td colspan="7" class="muted" style="padding: 30px; text-align:center;">Loading database...</td></tr></tbody>
+            </table>
+          </div>
+        </div>
+
+        <div id="tab_runs" class="tab-pane" style="display:none;">
+           <h2 style="margin-top:0; font-size: 28px;">Run Capacity Control</h2>
+           <p class="muted" style="margin-bottom: 24px;">Manually override max points for upcoming runs to handle large trailers or limit capacity.</p>
+           <div class="card" style="padding: 0;">
+             <table>
+               <thead style="background: rgba(255,255,255,.05);"><tr><th>Run Key</th><th>Type</th><th>Cutoff Date</th><th>Current Capacity</th><th>Actions</th></tr></thead>
+               <tbody id="runs_rows"><tr><td colspan="5" class="muted" style="padding: 30px; text-align:center;">Loading runs...</td></tr></tbody>
+             </table>
+           </div>
+        </div>
+
+        <div id="tab_users" class="tab-pane" style="display:none;">
+           <h2 style="margin-top:0; font-size: 28px;">Customer Database</h2>
+           <p class="muted" style="margin-bottom: 24px;">View registered users and manually assign or revoke Membership Tiers.</p>
+           <div class="card" style="padding: 0;">
+             <table>
+               <thead style="background: rgba(255,255,255,.05);"><tr><th>Name / Email</th><th>Phone</th><th>Current Tier</th><th>Status</th><th>Actions</th></tr></thead>
+               <tbody id="users_rows"><tr><td colspan="5" class="muted" style="padding: 30px; text-align:center;">Loading users...</td></tr></tbody>
+             </table>
+           </div>
+        </div>
+
+        <div id="tab_catalogue" class="tab-pane" style="display:none;">
+           <h2 style="margin-top:0; font-size: 28px;">Inventory & Catalogue</h2>
+           <p class="muted" style="margin-bottom: 24px;">Manage the global database of grocery items and their estimated prices.</p>
+           
+           <div class="card" style="box-shadow:none; border: 1px solid var(--red-2); background: rgba(227,52,47,.08); padding: 20px;">
+               <div style="font-weight:1000; margin-bottom:12px; font-size: 16px;">➕ Add New Item</div>
+               <div class="row">
+                   <input id="newCatName" placeholder="Item Name (e.g., Milk 2% 4L)" style="flex:2;" />
+                   <input id="newCatCat" placeholder="Category (e.g., Dairy)" style="flex:1;" />
+                   <input id="newCatPrice" type="number" step="0.01" placeholder="Price ($)" style="flex:1;" />
+                   <button class="btn primary" onclick="addCatItem()">Add to Database</button>
+               </div>
+           </div>
+
+           <div class="card" style="padding: 0;">
+             <table>
+               <thead style="background: rgba(255,255,255,.05);"><tr><th>Item Name</th><th>Category</th><th>Price ($)</th><th>Actions</th></tr></thead>
+               <tbody id="cat_rows"><tr><td colspan="4" class="muted" style="padding: 30px; text-align:center;">Loading catalogue...</td></tr></tbody>
+             </table>
+           </div>
+        </div>
+
+        <div id="tab_tracking" class="tab-pane" style="display:none;">
+           <h2 style="margin-top:0; font-size: 28px;">📍 GPS Broadcasting</h2>
+           <div class="muted" style="margin-bottom: 24px;">Use this on your phone while driving to broadcast your live location to customers.</div>
+           <div class="card" style="box-shadow:none; max-width: 600px;">
+             <label>Active Run Key</label>
+             <input id="track_runKey" placeholder="YYYY-MM-DD-local" style="margin-bottom: 16px; font-size: 18px;" />
              <div class="row">
-                <button class="btn" id="exportBtn">Download CSV</button>
-                <button class="btn primary" id="masterListBtn">Generate Master List</button>
+               <button class="btn primary" onclick="startDriverTracking()" style="flex:1; padding: 14px; font-size: 16px;">▶ Start Broadcasting</button>
+               <button class="btn secondary" onclick="stopDriverTracking()" style="flex:1; padding: 14px; font-size: 16px;">🛑 Stop</button>
              </div>
-          </div>
+             <div class="card" style="margin-top:20px; background: rgba(0,0,0,0.4); border: 1px solid rgba(255,255,255,0.1);" id="track_status">⚪ GPS is currently inactive.</div>
+           </div>
         </div>
-      </div>
-      <div class="card" style="padding: 0; overflow-x: auto;">
-        <table style="margin: 0;">
-          <thead style="background: rgba(255,255,255,.05);"><tr><th>Order</th><th>Customer</th><th>Address</th><th>Run</th><th>Status</th><th>Fees Paid</th><th>Actions</th></tr></thead>
-          <tbody id="rows"><tr><td colspan="7" class="muted" style="padding: 20px; text-align:center;">Loading...</td></tr></tbody>
-        </table>
-      </div>
-    </div>
-
-    <div id="tab_catalogue" style="display:none;">
-       <h2 style="margin-top:0;">Inventory & Catalogue</h2>
-       <p class="muted">Manage the global database of grocery items and their estimated prices.</p>
-       <div class="card" style="padding: 0; overflow-x: auto;">
-         <table style="margin: 0;">
-           <thead style="background: rgba(255,255,255,.05);"><tr><th>Item Name</th><th>Category</th><th>Price ($)</th><th>Actions</th></tr></thead>
-           <tbody id="cat_rows"><tr><td colspan="4" class="muted" style="padding: 20px; text-align:center;">Loading catalogue...</td></tr></tbody>
-         </table>
-       </div>
-    </div>
-
-    <div id="tab_tracking" style="display:none;">
-       <h2 style="margin-top:0;">📍 Driver GPS Broadcasting</h2>
-       <div class="muted" style="margin-bottom: 20px;">Use this on your phone while driving to broadcast your live location to customers.</div>
-       <div class="card" style="box-shadow:none;">
-         <label>Active Run Key (e.g., 2026-03-24-local)</label>
-         <input id="track_runKey" placeholder="YYYY-MM-DD-local" style="margin-bottom: 14px;" />
-         <div class="row">
-           <button class="btn primary" onclick="startDriverTracking()" style="flex:1;">▶ Start Broadcasting</button>
-           <button class="btn ghost" onclick="stopDriverTracking()" style="flex:1; border-color: var(--red-2); color: var(--red-2);">🛑 Stop</button>
-         </div>
-         <div class="card" style="margin-top:14px; background: rgba(0,0,0,0.4);" id="track_status">⚪ GPS is currently inactive.</div>
-       </div>
     </div>
 </div>
 
 <div class="modalBack" id="modalBack">
   <div class="modal">
-    <div class="row" style="justify-content:space-between;"><div style="font-weight:1000;font-size:24px;">Order Details</div><button class="btn ghost" id="closeModal">Close</button></div>
+    <div class="row" style="justify-content:space-between;"><div style="font-weight:1000;font-size:26px;">Order Details</div><button class="btn ghost" id="closeModal">Close</button></div>
     <div class="hr"></div>
     <div class="grid">
       <div class="card" style="box-shadow:none; border: none; background: rgba(0,0,0,0.2);">
-        <div class="k">Order ID</div><div class="v" id="m_orderId" style="font-size: 18px; color: var(--red-2);">—</div>
+        <div class="k">Order ID</div><div class="v" id="m_orderId" style="font-size: 20px; color: var(--red-2);">—</div>
         <div class="k">Customer</div><div class="v" id="m_customer">—</div>
         <div class="k">Phone</div><div class="v" id="m_phone">—</div>
         <div class="k">Address</div><div class="v" id="m_addr">—</div>
@@ -1179,28 +1466,31 @@ app.get("/admin", requireLogin, requireAdmin, async (_req, res) => {
         <div class="k">Upfront Fees Status</div><div class="v" id="m_fees">—</div>
         <div class="k">Grocery Charge Status</div><div class="v" id="m_groceriesCurrent">—</div>
         
-        <div class="card" style="border: 1px solid rgba(227,52,47,.45); background: rgba(227,52,47,.1); margin-top: 10px;">
-          <div class="k" style="color: #ff4a44;">Finalize Groceries (Charge Saved Card)</div>
-          <div class="muted" style="font-size:12px; margin-bottom:8px;">Charge exact receipt total and premium bags used.</div>
+        <div class="card" style="border: 1px solid rgba(227,52,47,.45); background: rgba(227,52,47,.1); margin-top: 14px; padding: 16px;">
+          <div class="k" style="color: #ff4a44; font-size: 14px;">Finalize Groceries (Charge Saved Card)</div>
+          <div class="muted" style="font-size:13px; margin-bottom:10px;">Charge exact receipt total and premium bags used.</div>
           <div class="row">
-            <input id="m_finalGroceryTotal" type="number" step="0.01" placeholder="Receipt total ($)" style="max-width:140px; background:rgba(0,0,0,.5);" />
-            <input id="m_bagsUsed" type="number" min="0" placeholder="Bags used" style="max-width:110px; background:rgba(0,0,0,.5);" />
+            <input id="m_finalGroceryTotal" type="number" step="0.01" placeholder="Receipt total ($)" style="max-width:150px; background:rgba(0,0,0,.5);" />
+            <input id="m_bagsUsed" type="number" min="0" placeholder="Bags used" style="max-width:120px; background:rgba(0,0,0,.5);" />
             <button class="btn primary" id="m_captureBtn">Charge Card</button>
           </div>
         </div>
 
-        <div class="k" style="margin-top: 14px;">Manual Status Override</div>
+        <div class="k" style="margin-top: 20px;">Manual Status Override</div>
         <div class="row">
-           <select id="m_state" style="max-width:180px;"><option>submitted</option><option>confirmed</option><option>shopping</option><option>packed</option><option>out_for_delivery</option><option>delivered</option><option>issue</option><option>cancelled</option></select>
-           <button class="btn ghost" id="m_saveState">Save override</button>
+           <select id="m_state" style="max-width:200px;"><option>submitted</option><option>confirmed</option><option>shopping</option><option>packed</option><option>out_for_delivery</option><option>delivered</option><option>issue</option><option>cancelled</option></select>
+           <button class="btn secondary" id="m_saveState">Save override</button>
         </div>
-        <div class="row" style="margin-top:10px;"><button class="btn ghost small" id="m_cancelAdmin" style="color:var(--muted);">Cancel order</button><button class="btn ghost small" id="m_deleteOrder" style="color:var(--red-2);">Delete order</button></div>
+        <div class="row" style="margin-top:20px; border-top: 1px solid rgba(255,255,255,0.1); padding-top: 14px;">
+           <button class="btn ghost small" id="m_cancelAdmin" style="color:var(--muted);">Cancel order</button>
+           <button class="btn ghost small" id="m_deleteOrder" style="color:var(--red-2);">Delete order entirely</button>
+        </div>
       </div>
     </div>
     <div class="hr"></div>
     <div class="grid">
-      <div class="card" style="box-shadow:none; background: rgba(0,0,0,0.2);"><div style="font-weight:1000;">Grocery list</div><div class="hr"></div><pre id="m_list" style="font-family: inherit; font-size: 15px; white-space: pre-wrap;"></pre></div>
-      <div class="card" style="box-shadow:none; background: rgba(0,0,0,0.2);"><div style="font-weight:1000;">Premium Add-ons / Notes</div><div class="hr"></div><pre id="m_addons" style="font-family: inherit; font-size: 15px; white-space: pre-wrap; color: #ffc107;"></pre></div>
+      <div class="card" style="box-shadow:none; background: rgba(0,0,0,0.2);"><div style="font-weight:1000; font-size: 16px;">Grocery List</div><div class="hr"></div><pre id="m_list" style="font-family: inherit; font-size: 16px; white-space: pre-wrap; line-height: 1.4;"></pre></div>
+      <div class="card" style="box-shadow:none; background: rgba(0,0,0,0.2);"><div style="font-weight:1000; font-size: 16px;">Premium Add-ons / Notes</div><div class="hr"></div><pre id="m_addons" style="font-family: inherit; font-size: 16px; white-space: pre-wrap; color: #ffc107; line-height: 1.4;"></pre></div>
     </div>
   </div>
 </div>
@@ -1211,15 +1501,22 @@ app.get("/admin", requireLogin, requireAdmin, async (_req, res) => {
   
   function switchTab(tabId) { 
       document.querySelectorAll('.nav-btn').forEach(b => b.classList.remove('active'));
-      if(event && event.target) event.target.classList.add('active');
-      qs('tab_dashboard').style.display = tabId === 'dashboard' ? 'block' : 'none'; 
-      qs('tab_orders').style.display = tabId === 'orders' ? 'block' : 'none'; 
-      qs('tab_catalogue').style.display = tabId === 'catalogue' ? 'block' : 'none'; 
-      qs('tab_tracking').style.display = tabId === 'tracking' ? 'block' : 'none'; 
+      if(event && event.currentTarget) event.currentTarget.classList.add('active');
+      
+      document.querySelectorAll('.tab-pane').forEach(el => el.style.display = 'none');
+      const target = qs('tab_' + tabId);
+      if(target) target.style.display = 'block';
       
       if(tabId === 'dashboard') loadDashboardMetrics();
       if(tabId === 'orders') search();
       if(tabId === 'catalogue') loadCatalogue();
+      if(tabId === 'users') loadUsersAdmin();
+      if(tabId === 'runs') loadRunsAdmin();
+
+      // Auto-hide mobile menu if clicking a link
+      if (window.innerWidth <= 900) {
+          qs('sidebar').classList.remove('show');
+      }
   }
 
   // Formatting helpers
@@ -1238,7 +1535,7 @@ app.get("/admin", requireLogin, requireAdmin, async (_req, res) => {
              const run = d.runs[key];
              const html = \`<div class="stat-box">
                 <div style="text-transform: uppercase; font-weight: 900; letter-spacing: 1px;">\${run.type} Run</div>
-                <div class="muted small">\${run.runKey}</div>
+                <div class="muted small" style="margin-top:4px;">\${run.runKey}</div>
                 <div class="hr"></div>
                 <div class="row" style="justify-content: space-around;">
                    <div>
@@ -1251,7 +1548,7 @@ app.get("/admin", requireLogin, requireAdmin, async (_req, res) => {
                    </div>
                    <div>
                       <div class="stat-num" style="color: #ffc107;">$\${money(run.bookedFeesTotal)}</div>
-                      <div class="muted small">Upfront Fees Collected</div>
+                      <div class="muted small">Fees Collected</div>
                    </div>
                 </div>
              </div>\`;
@@ -1268,16 +1565,16 @@ app.get("/admin", requireLogin, requireAdmin, async (_req, res) => {
 
   function render(items){
     const list = items || []; qs("countPill").textContent = "Results: " + list.length;
-    if(!list.length){ rowsEl.innerHTML = '<tr><td colspan="7" class="muted" style="text-align:center; padding: 20px;">No results found.</td></tr>'; return; }
+    if(!list.length){ rowsEl.innerHTML = '<tr><td colspan="7" class="muted" style="text-align:center; padding: 30px;">No results found.</td></tr>'; return; }
     rowsEl.innerHTML = list.map(o=>{
       const id = esc(o.orderId); const cust = esc(o.customer?.fullName || ""); const phone = esc(o.customer?.phone || ""); const email = esc(o.customer?.email || ""); const addr = esc((o.address?.streetAddress||"") + ", " + (o.address?.town||"")); const run = esc(o.runKey || ""); const rt = esc(o.runType || ""); const st = esc(o.status?.state || ""); const fees = money(o.pricingSnapshot?.totalFees || 0);
       const isPaid = o.payments?.fees?.status === "paid";
-      return \`<tr><td><div style="font-weight:1000;">\${id}</div><div class="muted" style="font-size:12px;">\${email}</div></td><td><div style="font-weight:900;">\${cust}</div><div class="muted" style="font-size:12px;">\${phone}</div></td><td>\${addr}</td><td><span class="pill">\${rt}</span><div class="muted" style="font-size:12px;margin-top:4px;">\${run}</div></td><td><span class="pill">\${st}</span></td><td><span style="color: \${isPaid ? '#4caf50' : 'var(--red-2)'}; font-weight: bold;">$\${fees}</span></td><td><button class="btn small" data-open="\${id}">Manage</button></td></tr>\`;
+      return \`<tr><td><div style="font-weight:1000;">\${id}</div><div class="muted" style="font-size:12px;">\${email}</div></td><td><div style="font-weight:900;">\${cust}</div><div class="muted" style="font-size:12px;">\${phone}</div></td><td>\${addr}</td><td><span class="pill">\${rt}</span><div class="muted" style="font-size:12px;margin-top:4px;">\${run}</div></td><td><span class="pill">\${st}</span></td><td><span style="color: \${isPaid ? '#4caf50' : 'var(--red-2)'}; font-weight: bold; font-size:16px;">$\${fees}</span></td><td><button class="btn secondary small" data-open="\${id}">Manage</button></td></tr>\`;
     }).join("");
     document.querySelectorAll("[data-open]").forEach(btn=>{ btn.addEventListener("click", ()=> openOrder(btn.getAttribute("data-open"))); });
   }
 
-  async function search(){ rowsEl.innerHTML = '<tr><td colspan="7" class="muted" style="text-align:center; padding: 20px;">Loading database...</td></tr>'; try{ const r = await fetch("/api/admin/orders?" + buildQuery(), { credentials:"include" }); const d = await r.json(); render(d.items || []); } catch(e){ rowsEl.innerHTML = '<tr><td colspan="7" class="muted" style="text-align:center; padding: 20px;">Error: ' + esc(e) + '</td></tr>'; } }
+  async function search(){ rowsEl.innerHTML = '<tr><td colspan="7" class="muted" style="text-align:center; padding: 30px;">Loading database...</td></tr>'; try{ const r = await fetch("/api/admin/orders?" + buildQuery(), { credentials:"include" }); const d = await r.json(); render(d.items || []); } catch(e){ rowsEl.innerHTML = '<tr><td colspan="7" class="muted" style="text-align:center; padding: 30px;">Error: ' + esc(e) + '</td></tr>'; } }
 
   function openModal(show){ qs("modalBack").style.display = show ? "flex" : "none"; }
 
@@ -1312,15 +1609,116 @@ app.get("/admin", requireLogin, requireAdmin, async (_req, res) => {
 
   async function saveStatus(){ if(!modalOrder?.orderId) return; try{ await fetch("/api/admin/orders/" + encodeURIComponent(modalOrder.orderId) + "/status", { method:"POST", headers:{ "Content-Type":"application/json" }, credentials:"include", body: JSON.stringify({ state: qs("m_state").value }) }); toast("Status saved ✅"); await search(); } catch(e){ toast(String(e)); } }
   
+  // ===================================
+  // NEW GOD MODE FEATURES (USERS & RUNS)
+  // ===================================
+  async function loadUsersAdmin(){
+      const tbody = qs("users_rows");
+      tbody.innerHTML = '<tr><td colspan="5" class="muted" style="text-align:center; padding: 30px;">Loading users...</td></tr>';
+      try {
+          const r = await fetch("/api/admin/users", { credentials:"include" });
+          const d = await r.json();
+          if(!d.users || !d.users.length) { tbody.innerHTML = '<tr><td colspan="5" class="muted" style="text-align:center; padding: 30px;">No users found.</td></tr>'; return; }
+          
+          tbody.innerHTML = d.users.map(u => \`<tr>
+              <td><div style="font-weight:900;">\${esc(u.name || "No Name")}</div><div class="muted small">\${esc(u.email)}</div></td>
+              <td>\${esc(u.profile?.phone || "—")}</td>
+              <td>
+                  <select id="utier_\${u._id}" style="width:140px; padding:6px;">
+                      <option value="none" \${u.membershipLevel==='none'?'selected':''}>None</option>
+                      <option value="standard" \${u.membershipLevel==='standard'?'selected':''}>Standard</option>
+                      <option value="route" \${u.membershipLevel==='route'?'selected':''}>Route</option>
+                      <option value="access" \${u.membershipLevel==='access'?'selected':''}>Access</option>
+                      <option value="accesspro" \${u.membershipLevel==='accesspro'?'selected':''}>Access Pro</option>
+                  </select>
+              </td>
+              <td>
+                  <select id="ustat_\${u._id}" style="width:100px; padding:6px;">
+                      <option value="inactive" \${u.membershipStatus==='inactive'?'selected':''}>Inactive</option>
+                      <option value="active" \${u.membershipStatus==='active'?'selected':''}>Active</option>
+                  </select>
+              </td>
+              <td><button class="btn secondary small" onclick="updateUser('\${u._id}')">Save</button></td>
+          </tr>\`).join("");
+      } catch(e) { tbody.innerHTML = '<tr><td colspan="5" style="color:var(--red-2); text-align:center; padding: 30px;">Error loading users.</td></tr>'; }
+  }
+
+  async function updateUser(id) {
+      const tier = qs("utier_"+id).value;
+      const status = qs("ustat_"+id).value;
+      try {
+          await fetch("/api/admin/users/"+id+"/tier", {
+              method:"POST", headers:{"Content-Type":"application/json"}, credentials:"include",
+              body: JSON.stringify({ tier, status })
+          });
+          toast("User Updated ✅");
+      } catch(e) { toast("Error updating user"); }
+  }
+
+  async function loadRunsAdmin(){
+      const tbody = qs("runs_rows");
+      tbody.innerHTML = '<tr><td colspan="5" class="muted" style="text-align:center; padding: 30px;">Loading runs...</td></tr>';
+      try {
+          const r = await fetch("/api/admin/runs", { credentials:"include" });
+          const d = await r.json();
+          if(!d.runs || !d.runs.length) { tbody.innerHTML = '<tr><td colspan="5" class="muted" style="text-align:center; padding: 30px;">No runs found.</td></tr>'; return; }
+          
+          tbody.innerHTML = d.runs.map(r => \`<tr>
+              <td><div style="font-weight:900;">\${esc(r.runKey)}</div></td>
+              <td><span class="pill">\${esc(r.type)}</span></td>
+              <td class="muted">\${new Date(r.cutoffAt).toLocaleString()}</td>
+              <td>
+                  <div class="row">
+                     <span class="muted small">Max Pts:</span> <input type="number" id="rmax_\${r.runKey}" value="\${r.maxPoints}" style="width:80px; padding:6px;" />
+                     <span class="muted small">Slots:</span> <input type="number" id="rslots_\${r.runKey}" value="\${r.maxSlots}" style="width:80px; padding:6px;" />
+                  </div>
+              </td>
+              <td><button class="btn secondary small" onclick="updateRun('\${r.runKey}')">Override</button></td>
+          </tr>\`).join("");
+      } catch(e) { tbody.innerHTML = '<tr><td colspan="5" style="color:var(--red-2); text-align:center; padding: 30px;">Error loading runs.</td></tr>'; }
+  }
+
+  async function updateRun(runKey) {
+      const maxPoints = qs("rmax_"+runKey).value;
+      const maxSlots = qs("rslots_"+runKey).value;
+      try {
+          await fetch("/api/admin/runs/"+runKey, {
+              method:"POST", headers:{"Content-Type":"application/json"}, credentials:"include",
+              body: JSON.stringify({ maxPoints, maxSlots })
+          });
+          toast("Capacity Updated ✅");
+      } catch(e) { toast("Error updating run"); }
+  }
+
   // Catalogue Logic
   async function loadCatalogue(){
-      qs("cat_rows").innerHTML = '<tr><td colspan="4" class="muted" style="text-align:center; padding: 20px;">Loading database...</td></tr>';
+      qs("cat_rows").innerHTML = '<tr><td colspan="4" class="muted" style="text-align:center; padding: 30px;">Loading database...</td></tr>';
       try{
         const r = await fetch("/api/admin/catalogue", {credentials:"include"});
         const d = await r.json();
-        if(!d.items || !d.items.length){ qs("cat_rows").innerHTML = '<tr><td colspan="4" class="muted" style="text-align:center; padding: 20px;">Catalogue is empty.</td></tr>'; return; }
-        qs("cat_rows").innerHTML = d.items.map(i=> \`<tr><td><div style="font-weight:900;">\${esc(i.name)}</div></td><td><span class="pill">\${esc(i.category)}</span></td><td><input type="number" step="0.01" value="\${i.estimatedPrice}" id="price_\${i._id}" style="max-width:100px; padding:6px; font-size:14px;"/></td><td><button class="btn small" onclick="updateCatPrice('\${i._id}', '\${esc(i.name)}', '\${esc(i.category)}')">Save Price</button> <button class="btn small ghost" onclick="deleteCat('\${i._id}')" style="color:var(--red-2);">Delete</button></td></tr>\`).join("");
-      }catch(e){ qs("cat_rows").innerHTML = '<tr><td colspan="4" style="color:var(--red-2); text-align:center; padding: 20px;">Error loading.</td></tr>'; }
+        if(!d.items || !d.items.length){ qs("cat_rows").innerHTML = '<tr><td colspan="4" class="muted" style="text-align:center; padding: 30px;">Catalogue is empty.</td></tr>'; return; }
+        qs("cat_rows").innerHTML = d.items.map(i=> \`<tr><td><div style="font-weight:900; font-size:15px;">\${esc(i.name)}</div></td><td><span class="pill">\${esc(i.category)}</span></td><td><input type="number" step="0.01" value="\${i.estimatedPrice}" id="price_\${i._id}" style="max-width:120px; padding:10px; font-size:15px;"/></td><td><button class="btn secondary small" onclick="updateCatPrice('\${i._id}', '\${esc(i.name)}', '\${esc(i.category)}')">Save</button> <button class="btn ghost small" onclick="deleteCat('\${i._id}')" style="color:var(--red-2);">Delete</button></td></tr>\`).join("");
+      }catch(e){ qs("cat_rows").innerHTML = '<tr><td colspan="4" style="color:var(--red-2); text-align:center; padding: 30px;">Error loading.</td></tr>'; }
+  }
+  async function addCatItem() {
+      const name = qs("newCatName").value.trim();
+      const cat = qs("newCatCat").value.trim();
+      const price = qs("newCatPrice").value || 0;
+      if(!name) return toast("Name is required");
+      try {
+          const r = await fetch("/api/admin/catalogue", {
+              method: "POST", headers: { "Content-Type": "application/json" }, credentials: "include",
+              body: JSON.stringify({ name, category: cat, estimatedPrice: Number(price) })
+          });
+          const d = await r.json();
+          if(d.ok) {
+              toast("Item added! ✅");
+              qs("newCatName").value = "";
+              qs("newCatCat").value = "";
+              qs("newCatPrice").value = "";
+              loadCatalogue();
+          } else toast(d.error || "Error adding item");
+      } catch(e) { toast("Network error"); }
   }
   async function updateCatPrice(id, name, cat){
       const price = document.getElementById('price_'+id).value;
@@ -1349,7 +1747,7 @@ app.get("/admin", requireLogin, requireAdmin, async (_req, res) => {
         const d = await r.json();
         if(d.ok) {
            toast("Broadcast Session Started ✅");
-           qs("track_status").innerHTML = '<span style="color:#4caf50;">🟢 Connecting to GPS satellite...</span>';
+           qs("track_status").innerHTML = '<span style="color:#4caf50; font-weight:bold;">🟢 Connecting to GPS satellite...</span>';
            if(navigator.geolocation){
              gpsWatchId = navigator.geolocation.watchPosition(
                async (pos) => {
@@ -1357,9 +1755,9 @@ app.get("/admin", requireLogin, requireAdmin, async (_req, res) => {
                    method:"POST", headers:{"Content-Type":"application/json"}, credentials:"include",
                    body: JSON.stringify({lat: pos.coords.latitude, lng: pos.coords.longitude, heading: pos.coords.heading, speed: pos.coords.speed, accuracy: pos.coords.accuracy})
                  });
-                 qs("track_status").innerHTML = '<span style="color:#4caf50;">🟢 Live Broadcasting!</span> Last ping: ' + new Date().toLocaleTimeString();
+                 qs("track_status").innerHTML = '<span style="color:#4caf50; font-weight:bold;">🟢 Live Broadcasting!</span><br><span style="font-size:13px; color:var(--muted);">Last ping: ' + new Date().toLocaleTimeString() + '</span>';
                },
-               (err) => { qs("track_status").innerHTML = '<span style="color:var(--red-2);">🔴 GPS Error: ' + err.message + ' (Check phone permissions)</span>'; },
+               (err) => { qs("track_status").innerHTML = '<span style="color:var(--red-2); font-weight:bold;">🔴 GPS Error: ' + err.message + ' (Check phone permissions)</span>'; },
                {enableHighAccuracy: true, maximumAge: 5000}
              );
            } else { qs("track_status").innerHTML = "Geolocation not supported by this browser."; }
@@ -1378,7 +1776,7 @@ app.get("/admin", requireLogin, requireAdmin, async (_req, res) => {
   // Event Bindings
   qs("closeModal").addEventListener("click", ()=> openModal(false)); 
   qs("searchBtn").addEventListener("click", search); 
-  qs("clearBtn").addEventListener("click", ()=>{ qs("q").value=""; qs("runKey").value=""; search(); }); 
+  qs("clearBtn").addEventListener("click", ()=>{ qs("q").value=""; qs("runKey").value=""; qs("state").value=""; search(); }); 
   qs("m_saveState").addEventListener("click", saveStatus);
   
   // Boot
@@ -1415,6 +1813,9 @@ async function main() {
   mongoose.connection.on('disconnected', () => {
     console.warn('Lost MongoDB connection. Retrying automatically...');
   });
+  
+  // RUN DATABASE SEEDER
+  await seedDatabaseIfEmpty();
 
   app.listen(PORT, () => console.log("Server running on port", PORT));
 }
