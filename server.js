@@ -231,6 +231,7 @@ function requireProfileComplete(req, res, next) { if (!isProfileComplete(req.use
 function isAdminEmail(email) { const e = String(email || "").toLowerCase().trim(); return !e ? false : (!ADMIN_EMAILS.length ? true : ADMIN_EMAILS.includes(e)); }
 function requireAdmin(req, res, next) { const email = String(req.user?.email || "").toLowerCase().trim(); if (!email || !isAdminEmail(email)) return res.status(403).send("Admin access required."); next(); }
 function adminBy(req) { return req.user?.email || "admin"; }
+async function ensureTrackingDoc(runKey) { await Tracking.findOneAndUpdate({ runKey }, { $setOnInsert: { runKey, enabled: false, updatedBy: "system" } }, { upsert: true }); }
 
 async function pmSend(to, subject, htmlBody, textBody) { try { const rcpt = String(to || "").trim(); if (!pmClient || !POSTMARK_FROM_EMAIL || !rcpt) return; await pmClient.sendEmail({ From: POSTMARK_FROM_EMAIL, To: rcpt, Subject: subject, HtmlBody: htmlBody, TextBody: textBody || "", MessageStream: POSTMARK_MESSAGE_STREAM }); } catch (e) { console.error("Postmark send failed:", String(e)); } }
 async function sendSms(toPhone, message) {
@@ -248,7 +249,7 @@ function base64urlDecodeToString(b64url) { const pad = b64url.length % 4 ? "=".r
 function signCancelToken(orderId, expMs) { const payload = `${orderId}.${String(expMs)}`; const sig = crypto.createHmac("sha256", CANCEL_TOKEN_SECRET).update(payload).digest(); return `${base64urlEncode(payload)}.${base64urlEncode(sig)}`; }
 function verifyCancelToken(orderId, token) { try { const parts = String(token || "").trim().split("."); if (parts.length !== 2) return { ok: false }; const payloadStr = base64urlDecodeToString(parts[0]); const [oid, expStr] = payloadStr.split("."); const expMs = Number(expStr); if (oid !== orderId || !Number.isFinite(expMs)) return { ok: false }; const expectedSig = crypto.createHmac("sha256", CANCEL_TOKEN_SECRET).update(payloadStr).digest(); const a = Buffer.from(parts[1], "base64"); const b = Buffer.from(base64urlEncode(expectedSig), "base64"); if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) return { ok: false }; return { ok: true, expMs }; } catch { return { ok: false }; } }
 function signTrackingToken(orderId, runKey, expMs) { const payload = `${orderId}.${runKey}.${String(expMs)}`; const sig = crypto.createHmac("sha256", TRACKING_TOKEN_SECRET).update(payload).digest(); return `${base64urlEncode(payload)}.${base64urlEncode(sig)}`; }
-function verifyTrackingToken(token) { try { const parts = String(token || "").trim().split("."); if (parts.length !== 2) return { ok: false }; const payloadStr = base64urlDecodeToString(parts[0]); const segs = payloadStr.split("."); if (segs.length < 3) return { ok: false }; const orderId = segs[0]; const expStr = segs[segs.length - 1]; const runKey = segs.slice(1, -1).join("."); const expMs = Number(expStr); if (!orderId || !runKey || !Number.isFinite(expMs)) return { ok: false }; const expectedSig = crypto.createHmac("sha256", TRACKING_TOKEN_SECRET).update(payloadStr).digest(); const a = Buffer.from(parts[1], "base64"); const b = Buffer.from(base64urlEncode(expectedSig), "base64"); if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) return { ok: false }; if (Date.now() > expMs) return { ok: false, error: "expired" }; return { ok: true, orderId, runKey, expMs }; } catch { return { ok: false }; } }
+function verifyTrackingToken(token) { try { const parts = String(token || "").trim().split("."); if (parts.length !== 2) return { ok: false }; const payloadStr = base64urlDecodeToString(parts[0]); segs = payloadStr.split("."); if (segs.length < 3) return { ok: false }; const orderId = segs[0]; const expStr = segs[segs.length - 1]; const runKey = segs.slice(1, -1).join("."); const expMs = Number(expStr); if (!orderId || !runKey || !Number.isFinite(expMs)) return { ok: false }; const expectedSig = crypto.createHmac("sha256", TRACKING_TOKEN_SECRET).update(payloadStr).digest(); const a = Buffer.from(parts[1], "base64"); const b = Buffer.from(base64urlEncode(expectedSig), "base64"); if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) return { ok: false }; if (Date.now() > expMs) return { ok: false, error: "expired" }; return { ok: true, orderId, runKey, expMs }; } catch { return { ok: false }; } }
 
 async function nextOrderId(runType, runKey) {
   const type = String(runType || "").toLowerCase(); const prefix = type === "owen" ? "OWEN" : "LOC"; const datePart = String(runKey || "").slice(0, 10).replaceAll("-", ""); const runDate = /^\d{8}$/.test(datePart) ? datePart : dayjs().tz(TZ).format("YYYYMMDD");
@@ -358,6 +359,47 @@ app.get("/api/public/catalogue/search", async (req, res) => { try { const q = St
 app.get("/api/admin/catalogue", requireLogin, requireAdmin, async (req, res) => { res.json({ ok: true, items: await CatalogueItem.find().sort({ category: 1, name: 1 }).lean() }); });
 app.post("/api/admin/catalogue", requireLogin, requireAdmin, async (req, res) => { try { const { name, category, estimatedPrice } = req.body; if (!name) return res.status(400).json({ ok: false, error: "Name is required" }); res.json({ ok: true, item: await CatalogueItem.findOneAndUpdate({ name: String(name).trim() }, { $set: { category: String(category || "General").trim(), estimatedPrice: Number(estimatedPrice || 0) } }, { upsert: true, new: true }) }); } catch (e) { res.status(500).json({ ok: false, error: String(e) }); } });
 app.delete("/api/admin/catalogue/:id", requireLogin, requireAdmin, async (req, res) => { await CatalogueItem.findByIdAndDelete(req.params.id); res.json({ ok: true }); });
+
+// AUTO-POPULATE CATALOGUE FROM SCAN
+app.post("/api/public/catalogue/suggest", async (req, res) => {
+  try {
+    const { name } = req.body;
+    if (!name) return res.status(400).json({ ok: false });
+    
+    // Only add it if it doesn't exist already
+    const exists = await CatalogueItem.findOne({ name: String(name).trim() });
+    if (!exists) {
+      await CatalogueItem.create({
+        name: String(name).trim(),
+        category: "Newly Scanned",
+        estimatedPrice: 0
+      });
+    }
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ ok: false });
+  }
+});
+
+// =========================
+// BIOMETRIC CHALLENGE ENGINE
+// =========================
+app.get("/api/auth/biometric-challenge", requireLogin, (req, res) => {
+    const challenge = crypto.randomBytes(32).toString('base64');
+    req.session.biometricChallenge = challenge;
+    res.json({ ok: true, challenge, user: { id: req.user._id, name: req.user.email } });
+});
+
+app.post("/api/auth/register-biometrics", requireLogin, async (req, res) => {
+    try {
+        const { credential } = req.body;
+        // Logic to push the biometric public key to user profile
+        await User.findByIdAndUpdate(req.user._id, { 
+            $push: { biometricKeys: { fmt: credential.response.attestationObject, key: credential.id } } 
+        });
+        res.json({ ok: true });
+    } catch (e) { res.status(500).json({ ok: false }); }
+});
 
 // =========================
 // PUBLIC CONFIG & TRACKING
@@ -499,9 +541,8 @@ app.get("/api/runs/active", async (_req, res) => {
 app.post("/api/estimator", (req, res) => { try { const effectiveMemberTier = getEffectiveMemberTierForUser(req.user, req.body?.memberTier || ""); res.json({ ok: true, effectiveMemberTier, breakdown: computeFeeBreakdown({ ...(req.body || {}), memberTier: effectiveMemberTier, applyPerk: "yes" }) }); } catch (e) { res.status(500).json({ ok: false, error: String(e) }); } });
 
 // =========================
-// NEW PAYMENT ENGINE (FEES UPFRONT, GROCERIES ON FILE)
+// ORDER API
 // =========================
-// ADDED orderLimiter to prevent bot spam
 app.post("/api/orders", requireLogin, requireProfileComplete, upload.single("groceryFile"), orderLimiter, async (req, res) => {
   try {
     const b = req.body || {}; const user = await User.findById(req.user._id).lean(); const profile = user?.profile || {}; const orderClass = String(b.orderClass || "grocery");
@@ -754,10 +795,10 @@ app.post("/api/admin/orders/:orderId/status", requireLogin, requireAdmin, async 
         const portalLink = `${PUBLIC_SITE_URL}/member`;
         
         if (state === "shopping") {
-          smsMessage = `Hi ${firstName}! Nick & Lillian here. We're firing up the Jeep and officially starting your grocery run. May the grocery gods bless us with ripe produce and fully stocked shelves! 🥑🚙 - TGR`;
+          smsMessage = `Hi ${firstName}! Nick here. I'm firing up the Jeep and officially starting your grocery run. May the grocery gods bless us with ripe produce and fully stocked shelves! 🥑🚙 - TGR`;
         } 
         else if (state === "packed") {
-          smsMessage = `Great news, ${firstName}! Your order is officially bagged, tagged, and packed. We successfully survived the aisles. Stand by for dispatch! 🛒✨ - TGR`;
+          smsMessage = `Great news, ${firstName}! Your order is officially bagged, tagged, and packed. I successfully survived the aisles. Stand by for dispatch! 🛒✨ - TGR`;
         }
         else if (state === "out_for_delivery") {
           const run = await Run.findOne({ runKey: order.runKey }).lean(); let trackingLink = "";
@@ -765,7 +806,7 @@ app.post("/api/admin/orders/:orderId/status", requireLogin, requireAdmin, async 
           smsMessage = `The Patriot is rolling! 🚙💨 ${firstName}, your groceries are on the move. Watch my exact location live right here: ${trackingLink} - TGR`;
         } 
         else if (state === "delivered") {
-          smsMessage = `Mission accomplished, ${firstName}! 🥦 Your groceries have safely landed. If we saved your day (or just your gas tank), a 5-star review or a quick tip for the driver keeps our local 2-person team fueled up! ⭐ Drop a review or tip in your Member Portal here: ${portalLink} - Nick & Lillian @ TGR`;
+          smsMessage = `Mission accomplished, ${firstName}! 🥦 Your groceries have safely landed. If I saved your day (or just your gas tank), a 5-star review or a quick tip keeps our local 2-person team fueled up! ⭐ Drop a review or tip in your Member Portal here: ${portalLink} - Nick @ TGR`;
         }
         
         if (smsMessage) await sendSms(phone, smsMessage);
@@ -1019,7 +1060,7 @@ app.get("/admin", requireLogin, requireAdmin, async (_req, res) => {
 <style>
   :root{ --bg:#0b0b0b; --panel:rgba(255,255,255,.06); --line:rgba(255,255,255,.14); --text:#fff; --muted:rgba(255,255,255,.75); --red:#e3342f; --red2:#ff4a44; --radius:14px; }
   body{margin:0;background:var(--bg);color:var(--text);font-family:system-ui,-apple-system,sans-serif;}
-  .sidebar { width: 250px; background: rgba(15,15,16,0.95); border-right: 1px solid var(--line); position: fixed; height: 100vh; overflow-y: auto; padding: 20px;}
+  .sidebar { width: 250px; background: rgba(15,15,16,0.95); border-right: 1px solid var(--line); position: fixed; height: 100vh; overflow-y: auto; padding: 20px; box-sizing: border-box;}
   .main-content { margin-left: 250px; padding: 20px; }
   .card{border:1px solid var(--line);background:var(--panel);border-radius:var(--radius);padding:14px; margin-bottom: 14px;}
   .row{display:flex;gap:10px;flex-wrap:wrap;align-items:center;}
@@ -1029,7 +1070,7 @@ app.get("/admin", requireLogin, requireAdmin, async (_req, res) => {
   .pill{display:inline-block;padding:4px 10px;border-radius:999px;border:1px solid rgba(255,255,255,.18);background:rgba(255,255,255,.06);font-weight:900;font-size:12px;}
   .hr{height:1px;background:rgba(255,255,255,.12);margin:12px 0;}
   input,select,textarea{width:100%;padding:12px 12px;border-radius:12px;border:1px solid rgba(255,255,255,.18);background:rgba(0,0,0,.22);color:#fff;font-size:15px;outline:none; box-sizing: border-box;}
-  table{width:100%;border-collapse:collapse;} th,td{padding:10px 8px;border-bottom:1px solid rgba(255,255,255,.12);vertical-align:top; text-align:left;} th{font-size:12px;color:rgba(255,255,255,.72);text-transform:uppercase;}
+  table{width:100%;border-collapse:collapse;} th,td{padding:10px 8px;border-bottom:1px solid rgba(255,255,255,.12);vertical-align:middle; text-align:left;} th{font-size:12px;color:rgba(255,255,255,.72);text-transform:uppercase;}
   .grid{display:grid;grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap:12px;} 
   .toast{position: fixed; bottom: 20px; right: 20px; padding:12px 20px; border-radius:12px; border:1px solid rgba(255,255,255,.18); background:rgba(0,0,0,.8); display:none; font-weight:900; z-index: 99999;} .toast.show{display:block;}
   .modalBack{position:fixed; inset:0; background:rgba(0,0,0,.7); display:none; align-items:center; justify-content:center; padding:16px; z-index:1000;}
@@ -1050,7 +1091,7 @@ app.get("/admin", requireLogin, requireAdmin, async (_req, res) => {
    <button class="nav-btn" onclick="switchTab('orders')">🛒 Order Management</button>
    <button class="nav-btn" onclick="switchTab('catalogue')">📖 Grocery Catalogue</button>
    <div class="hr" style="margin: 20px 0;"></div>
-   <a class="nav-btn" href="/admin/tracking-control" style="display:block;">📍 Tracking Control</a>
+   <button class="nav-btn" onclick="switchTab('tracking')">📍 Tracking Control</button>
    <a class="nav-btn" href="${escapeHtml(PUBLIC_SITE_URL)}/" style="display:block;">🌐 Back to Site</a>
    <a class="nav-btn" href="/logout?returnTo=${encodeURIComponent(PUBLIC_SITE_URL + "/")}" style="display:block; color: var(--red-2);">🚪 Log Out</a>
 </div>
@@ -1098,7 +1139,27 @@ app.get("/admin", requireLogin, requireAdmin, async (_req, res) => {
 
     <div id="tab_catalogue" style="display:none;">
        <h2 style="margin-top:0;">Inventory & Catalogue</h2>
-       <p class="muted">Currently managed via frontend add functionality. Full CRUD coming soon.</p>
+       <p class="muted">Manage the global database of grocery items and their estimated prices.</p>
+       <div class="card" style="padding: 0; overflow-x: auto;">
+         <table style="margin: 0;">
+           <thead style="background: rgba(255,255,255,.05);"><tr><th>Item Name</th><th>Category</th><th>Price ($)</th><th>Actions</th></tr></thead>
+           <tbody id="cat_rows"><tr><td colspan="4" class="muted" style="padding: 20px; text-align:center;">Loading catalogue...</td></tr></tbody>
+         </table>
+       </div>
+    </div>
+
+    <div id="tab_tracking" style="display:none;">
+       <h2 style="margin-top:0;">📍 Driver GPS Broadcasting</h2>
+       <div class="muted" style="margin-bottom: 20px;">Use this on your phone while driving to broadcast your live location to customers.</div>
+       <div class="card" style="box-shadow:none;">
+         <label>Active Run Key (e.g., 2026-03-24-local)</label>
+         <input id="track_runKey" placeholder="YYYY-MM-DD-local" style="margin-bottom: 14px;" />
+         <div class="row">
+           <button class="btn primary" onclick="startDriverTracking()" style="flex:1;">▶ Start Broadcasting</button>
+           <button class="btn ghost" onclick="stopDriverTracking()" style="flex:1; border-color: var(--red-2); color: var(--red-2);">🛑 Stop</button>
+         </div>
+         <div class="card" style="margin-top:14px; background: rgba(0,0,0,0.4);" id="track_status">⚪ GPS is currently inactive.</div>
+       </div>
     </div>
 </div>
 
@@ -1150,12 +1211,15 @@ app.get("/admin", requireLogin, requireAdmin, async (_req, res) => {
   
   function switchTab(tabId) { 
       document.querySelectorAll('.nav-btn').forEach(b => b.classList.remove('active'));
-      event.target.classList.add('active');
+      if(event && event.target) event.target.classList.add('active');
       qs('tab_dashboard').style.display = tabId === 'dashboard' ? 'block' : 'none'; 
       qs('tab_orders').style.display = tabId === 'orders' ? 'block' : 'none'; 
       qs('tab_catalogue').style.display = tabId === 'catalogue' ? 'block' : 'none'; 
+      qs('tab_tracking').style.display = tabId === 'tracking' ? 'block' : 'none'; 
+      
       if(tabId === 'dashboard') loadDashboardMetrics();
       if(tabId === 'orders') search();
+      if(tabId === 'catalogue') loadCatalogue();
   }
 
   // Formatting helpers
@@ -1248,6 +1312,69 @@ app.get("/admin", requireLogin, requireAdmin, async (_req, res) => {
 
   async function saveStatus(){ if(!modalOrder?.orderId) return; try{ await fetch("/api/admin/orders/" + encodeURIComponent(modalOrder.orderId) + "/status", { method:"POST", headers:{ "Content-Type":"application/json" }, credentials:"include", body: JSON.stringify({ state: qs("m_state").value }) }); toast("Status saved ✅"); await search(); } catch(e){ toast(String(e)); } }
   
+  // Catalogue Logic
+  async function loadCatalogue(){
+      qs("cat_rows").innerHTML = '<tr><td colspan="4" class="muted" style="text-align:center; padding: 20px;">Loading database...</td></tr>';
+      try{
+        const r = await fetch("/api/admin/catalogue", {credentials:"include"});
+        const d = await r.json();
+        if(!d.items || !d.items.length){ qs("cat_rows").innerHTML = '<tr><td colspan="4" class="muted" style="text-align:center; padding: 20px;">Catalogue is empty.</td></tr>'; return; }
+        qs("cat_rows").innerHTML = d.items.map(i=> \`<tr><td><div style="font-weight:900;">\${esc(i.name)}</div></td><td><span class="pill">\${esc(i.category)}</span></td><td><input type="number" step="0.01" value="\${i.estimatedPrice}" id="price_\${i._id}" style="max-width:100px; padding:6px; font-size:14px;"/></td><td><button class="btn small" onclick="updateCatPrice('\${i._id}', '\${esc(i.name)}', '\${esc(i.category)}')">Save Price</button> <button class="btn small ghost" onclick="deleteCat('\${i._id}')" style="color:var(--red-2);">Delete</button></td></tr>\`).join("");
+      }catch(e){ qs("cat_rows").innerHTML = '<tr><td colspan="4" style="color:var(--red-2); text-align:center; padding: 20px;">Error loading.</td></tr>'; }
+  }
+  async function updateCatPrice(id, name, cat){
+      const price = document.getElementById('price_'+id).value;
+      try {
+        await fetch("/api/admin/catalogue", {
+            method: "POST", headers: { "Content-Type": "application/json" }, credentials: "include",
+            body: JSON.stringify({ name: name, category: cat, estimatedPrice: Number(price) })
+        });
+        toast("Price updated! ✅");
+      } catch(e) { toast("Error updating price"); }
+  }
+  async function deleteCat(id){
+      if(!confirm("Permanently delete this item?")) return;
+      await fetch("/api/admin/catalogue/"+id, {method:"DELETE", credentials:"include"});
+      toast("Item deleted 🗑️");
+      loadCatalogue();
+  }
+
+  // Tracking Logic
+  let gpsWatchId = null;
+  async function startDriverTracking(){
+      const rk = qs("track_runKey").value.trim();
+      if(!rk) return toast("Please enter a Run Key (e.g. 2026-03-24-local)");
+      try{
+        const r = await fetch("/api/admin/tracking/"+encodeURIComponent(rk)+"/start", {method:"POST", credentials:"include"});
+        const d = await r.json();
+        if(d.ok) {
+           toast("Broadcast Session Started ✅");
+           qs("track_status").innerHTML = '<span style="color:#4caf50;">🟢 Connecting to GPS satellite...</span>';
+           if(navigator.geolocation){
+             gpsWatchId = navigator.geolocation.watchPosition(
+               async (pos) => {
+                 await fetch("/api/admin/tracking/"+encodeURIComponent(rk)+"/update", {
+                   method:"POST", headers:{"Content-Type":"application/json"}, credentials:"include",
+                   body: JSON.stringify({lat: pos.coords.latitude, lng: pos.coords.longitude, heading: pos.coords.heading, speed: pos.coords.speed, accuracy: pos.coords.accuracy})
+                 });
+                 qs("track_status").innerHTML = '<span style="color:#4caf50;">🟢 Live Broadcasting!</span> Last ping: ' + new Date().toLocaleTimeString();
+               },
+               (err) => { qs("track_status").innerHTML = '<span style="color:var(--red-2);">🔴 GPS Error: ' + err.message + ' (Check phone permissions)</span>'; },
+               {enableHighAccuracy: true, maximumAge: 5000}
+             );
+           } else { qs("track_status").innerHTML = "Geolocation not supported by this browser."; }
+        }
+      }catch(e){ toast("Error starting tracking"); }
+  }
+  async function stopDriverTracking(){
+      const rk = qs("track_runKey").value.trim();
+      if(gpsWatchId) navigator.geolocation.clearWatch(gpsWatchId);
+      gpsWatchId = null;
+      if(rk) await fetch("/api/admin/tracking/"+encodeURIComponent(rk)+"/stop", {method:"POST", credentials:"include"});
+      qs("track_status").innerHTML = '⚪ GPS is currently inactive.';
+      toast("Broadcast Stopped 🛑");
+  }
+
   // Event Bindings
   qs("closeModal").addEventListener("click", ()=> openModal(false)); 
   qs("searchBtn").addEventListener("click", search); 
