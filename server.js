@@ -1732,31 +1732,31 @@ app.get("/admin", requireLogin, requireAdmin, async (_req, res) => {
           const d = await r.json();
           if(!d.users || !d.users.length) { tbody.innerHTML = '<tr><td colspan="5" class="muted" style="text-align:center; padding: 30px;">No users found.</td></tr>'; return; }
           
-          tbody.innerHTML = d.users.map(u => `<tr>
-              <td><div style="font-weight:900;">${esc(u.name || "No Name")}</div><div class="muted small">${esc(u.email)}</div></td>
-              <td>${esc(u.profile?.phone || "—")}</td>
+          tbody.innerHTML = d.users.map(u => \`<tr>
+              <td><div style="font-weight:900;">\${esc(u.name || "No Name")}</div><div class="muted small">\${esc(u.email)}</div></td>
+              <td>\${esc(u.profile?.phone || "—")}</td>
               <td>
-                  <select id="utier_${u._id}" style="width:140px; padding:6px;">
-                      <option value="none" ${u.membershipLevel==='none'?'selected':''}>None</option>
-                      <option value="standard" ${u.membershipLevel==='standard'?'selected':''}>Standard</option>
-                      <option value="route" ${u.membershipLevel==='route'?'selected':''}>Route</option>
-                      <option value="access" ${u.membershipLevel==='access'?'selected':''}>Access</option>
-                      <option value="accesspro" ${u.membershipLevel==='accesspro'?'selected':''}>Access Pro</option>
+                  <select id="utier_\${u._id}" style="width:140px; padding:6px;">
+                      <option value="none" \${u.membershipLevel==='none'?'selected':''}>None</option>
+                      <option value="standard" \${u.membershipLevel==='standard'?'selected':''}>Standard</option>
+                      <option value="route" \${u.membershipLevel==='route'?'selected':''}>Route</option>
+                      <option value="access" \${u.membershipLevel==='access'?'selected':''}>Access</option>
+                      <option value="accesspro" \${u.membershipLevel==='accesspro'?'selected':''}>Access Pro</option>
                   </select>
               </td>
               <td>
-                  <select id="ustat_${u._id}" style="width:100px; padding:6px;">
-                      <option value="inactive" ${u.membershipStatus==='inactive'?'selected':''}>Inactive</option>
-                      <option value="active" ${u.membershipStatus==='active'?'selected':''}>Active</option>
+                  <select id="ustat_\${u._id}" style="width:100px; padding:6px;">
+                      <option value="inactive" \${u.membershipStatus==='inactive'?'selected':''}>Inactive</option>
+                      <option value="active" \${u.membershipStatus==='active'?'selected':''}>Active</option>
                   </select>
               </td>
               <td>
                   <div class="row">
-                     <button class="btn secondary small" onclick="updateUser('${u._id}')">Save</button>
-                     <button class="btn ghost small" style="color:var(--red-2);" onclick="impersonateUser('${u._id}', '${esc(u.email)}')">Login As</button>
+                     <button class="btn secondary small" onclick="updateUser('\${u._id}')">Save</button>
+                     <button class="btn ghost small" style="color:var(--red-2);" onclick="impersonateUser('\${u._id}', '\${esc(u.email)}')">Login As</button>
                   </div>
               </td>
-          </tr>`).join("");
+          </tr>\`).join("");
       } catch(e) { tbody.innerHTML = '<tr><td colspan="5" style="color:var(--red-2); text-align:center; padding: 30px;">Error loading users.</td></tr>'; }
   }
 
@@ -1792,18 +1792,18 @@ app.get("/admin", requireLogin, requireAdmin, async (_req, res) => {
           const d = await r.json();
           if(!d.runs || !d.runs.length) { tbody.innerHTML = '<tr><td colspan="5" class="muted" style="text-align:center; padding: 30px;">No runs found.</td></tr>'; return; }
           
-          tbody.innerHTML = d.runs.map(r => `<tr>
-              <td><div style="font-weight:900;">${esc(r.runKey)}</div></td>
-              <td><span class="pill">${esc(r.type)}</span></td>
-              <td class="muted">${new Date(r.cutoffAt).toLocaleString()}</td>
+          tbody.innerHTML = d.runs.map(r => \`<tr>
+              <td><div style="font-weight:900;">\${esc(r.runKey)}</div></td>
+              <td><span class="pill">\${esc(r.type)}</span></td>
+              <td class="muted">\${new Date(r.cutoffAt).toLocaleString()}</td>
               <td>
                   <div class="row">
-                     <span class="muted small">Max Pts:</span> <input type="number" id="rmax_${r.runKey}" value="${r.maxPoints}" style="width:80px; padding:6px;" />
-                     <span class="muted small">Slots:</span> <input type="number" id="rslots_${r.runKey}" value="${r.maxSlots}" style="width:80px; padding:6px;" />
+                     <span class="muted small">Max Pts:</span> <input type="number" id="rmax_\${r.runKey}" value="\${r.maxPoints}" style="width:80px; padding:6px;" />
+                     <span class="muted small">Slots:</span> <input type="number" id="rslots_\${r.runKey}" value="\${r.maxSlots}" style="width:80px; padding:6px;" />
                   </div>
               </td>
-              <td><button class="btn secondary small" onclick="updateRun('${r.runKey}')">Override</button></td>
-          </tr>`).join("");
+              <td><button class="btn secondary small" onclick="updateRun('\${r.runKey}')">Override</button></td>
+          </tr>\`).join("");
       } catch(e) { tbody.innerHTML = '<tr><td colspan="5" style="color:var(--red-2); text-align:center; padding: 30px;">Error loading runs.</td></tr>'; }
   }
 
@@ -1825,7 +1825,7 @@ app.get("/admin", requireLogin, requireAdmin, async (_req, res) => {
         const r = await fetch("/api/admin/catalogue", {credentials:"include"});
         const d = await r.json();
         if(!d.items || !d.items.length){ qs("cat_rows").innerHTML = '<tr><td colspan="4" class="muted" style="text-align:center; padding: 30px;">Catalogue is empty.</td></tr>'; return; }
-        qs("cat_rows").innerHTML = d.items.map(i=> `<tr><td><div style="font-weight:900; font-size:15px;">${esc(i.name)}</div></td><td><span class="pill">${esc(i.category)}</span></td><td><input type="number" step="0.01" value="${i.estimatedPrice}" id="price_${i._id}" style="max-width:120px; padding:10px; font-size:15px;"/></td><td><button class="btn secondary small" onclick="updateCatPrice('${i._id}', '${esc(i.name)}', '${esc(i.category)}')">Save</button> <button class="btn ghost small" onclick="deleteCat('${i._id}')" style="color:var(--red-2);">Delete</button></td></tr>`).join("");
+        qs("cat_rows").innerHTML = d.items.map(i=> \`<tr><td><div style="font-weight:900; font-size:15px;">\${esc(i.name)}</div></td><td><span class="pill">\${esc(i.category)}</span></td><td><input type="number" step="0.01" value="\${i.estimatedPrice}" id="price_\${i._id}" style="max-width:120px; padding:10px; font-size:15px;"/></td><td><button class="btn secondary small" onclick="updateCatPrice('\${i._id}', '\${esc(i.name)}', '\${esc(i.category)}')">Save</button> <button class="btn ghost small" onclick="deleteCat('\${i._id}')" style="color:var(--red-2);">Delete</button></td></tr>\`).join("");
       }catch(e){ qs("cat_rows").innerHTML = '<tr><td colspan="4" style="color:var(--red-2); text-align:center; padding: 30px;">Error loading.</td></tr>'; }
   }
   async function addCatItem() {
@@ -1907,8 +1907,6 @@ app.get("/admin", requireLogin, requireAdmin, async (_req, res) => {
   
   loadDashboardMetrics();
 </script>
-</body>
-</html>`);
 
 // ROUTIFIC EXPORT
 app.get("/api/admin/routific/export-csv", requireLogin, requireAdmin, async (req, res) => {
