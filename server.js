@@ -1063,6 +1063,47 @@ app.post("/api/admin/orders/:orderId/capture", requireLogin, requireAdmin, async
   } catch(e) { res.status(500).json({ ok: false, error: String(e) }); }
 });
 
+// --- ADMIN FEEDBACK INBOX & REPLY LOGIC ---
+app.get("/api/admin/feedback", requireLogin, requireAdmin, async (req, res) => {
+    try {
+        const items = await Feedback.find().sort({ createdAt: -1 }).limit(50);
+        res.json({ items });
+    } catch(e) { res.status(500).json({ error: String(e) }); }
+});
+
+app.post("/api/admin/feedback/:id/reply", requireLogin, requireAdmin, async (req, res) => {
+    try {
+        const { replyText } = req.body;
+        const fb = await Feedback.findById(req.params.id);
+        if (!fb) return res.status(404).json({ ok: false, error: "Message not found" });
+
+        const html = `
+            <div style="font-family: sans-serif; max-width: 600px; padding: 20px; border: 1px solid #e0e0e0; border-radius: 8px;">
+                <h2 style="color: #e3342f;">Update from Tobermory Grocery Run 🚙</h2>
+                <p>Hi ${fb.name},</p>
+                <p style="white-space: pre-wrap; font-size: 16px;">${replyText}</p>
+                <hr style="border: none; border-top: 1px solid #eee; margin: 15px 0;" />
+                <p style="font-size: 12px; color: #666;">In response to your message:<br><i>"${fb.message}"</i></p>
+            </div>
+        `;
+        
+        // Fire the email to the customer
+        await pmSend(fb.email, "Re: Your TGR Feedback", html);
+        
+        // Inbox Zero: Delete the message from the database once replied to
+        await Feedback.findByIdAndDelete(req.params.id); 
+
+        res.json({ ok: true });
+    } catch(e) { res.status(500).json({ ok: false, error: String(e) }); }
+});
+
+app.delete("/api/admin/feedback/:id", requireLogin, requireAdmin, async (req, res) => {
+    try {
+        await Feedback.findByIdAndDelete(req.params.id);
+        res.json({ ok: true });
+    } catch(e) { res.status(500).json({ ok: false, error: String(e) }); }
+});
+
 
 // =========================
 // AUTOMATED SMS FUNNEL & STATUS UPDATES
@@ -1481,6 +1522,7 @@ app.get("/admin", requireLogin, requireAdmin, async (_req, res) => {
        <button class="nav-btn" onclick="switchTab('users')">👥 Customer Database</button>
        <button class="nav-btn" onclick="switchTab('catalogue')">📖 Grocery Catalogue</button>
        <button class="nav-btn" onclick="switchTab('dispatch')">🗺️ Dispatch Board</button>
+       <button class="nav-btn" onclick="switchTab('feedback')">📬 Feedback Inbox</button>
        <button class="nav-btn" onclick="switchTab('tracking')">📍 GPS Broadcasting</button>
        <div class="hr" style="margin: 10px 0;"></div>
        <a class="nav-btn" href="${escapeHtml(PUBLIC_SITE_URL)}/">🌐 Back to Live Site</a>
@@ -1603,6 +1645,14 @@ app.get("/admin", requireLogin, requireAdmin, async (_req, res) => {
            </div>
         </div>
 
+        <div id="tab_feedback" class="tab-pane" style="display:none;">
+           <h2 style="margin-top:0; font-size: 28px;">📬 Feedback Inbox</h2>
+           <p class="muted" style="margin-bottom: 24px;">Direct messages from your Reputation Shield. Reply instantly or dismiss to keep Inbox Zero.</p>
+           <div id="feedback_list" style="display:flex; flex-direction:column; gap:16px;">
+               <div class="muted" style="text-align:center; padding: 30px;">Loading inbox...</div>
+           </div>
+        </div>
+
         <div id="tab_tracking" class="tab-pane" style="display:none;">
            <h2 style="margin-top:0; font-size: 28px;">📍 GPS Broadcasting</h2>
            <div class="muted" style="margin-bottom: 24px;">Use this on your phone while driving to broadcast your live location to customers.</div>
@@ -1710,6 +1760,7 @@ app.get("/admin", requireLogin, requireAdmin, async (_req, res) => {
       if(tabId === 'catalogue') loadCatalogue();
       if(tabId === 'users') loadUsersAdmin();
       if(tabId === 'runs') loadRunsAdmin();
+      if(tabId === 'feedback') loadFeedbackAdmin();
 
       if (window.innerWidth <= 900) { document.getElementById('sidebar').classList.remove('show'); }
   }
@@ -2174,6 +2225,64 @@ app.get("/admin", requireLogin, requireAdmin, async (_req, res) => {
       window.open(url, '_blank');
   };
 
+  // --- FEEDBACK INBOX LOGIC ---
+  async function loadFeedbackAdmin() {
+      const container = qs("feedback_list");
+      container.innerHTML = '<div class="muted" style="text-align:center; padding: 30px;">Loading inbox...</div>';
+      try {
+          const r = await fetch("/api/admin/feedback", {credentials:"include"});
+          const d = await r.json();
+          if(!d.items || d.items.length === 0) {
+              container.innerHTML = '<div class="card" style="text-align:center; padding:40px; color:var(--muted); font-size: 18px;">No new messages. Inbox Zero! 🎉</div>';
+              return;
+          }
+
+          container.innerHTML = d.items.map(f => \`
+              <div class="card" style="box-shadow:none; background: rgba(255,255,255,.05); border-left: 4px solid var(--red-2);">
+                  <div class="row" style="justify-content:space-between; margin-bottom:10px;">
+                      <div>
+                          <span class="pill">\${esc(f.type)}</span>
+                          <span style="font-weight:bold; margin-left:10px; color:white;">\${esc(f.name)}</span>
+                          <span class="muted small" style="margin-left:10px;">\${esc(f.email)} • \${esc(f.phone || 'No phone')}</span>
+                      </div>
+                      <div class="muted small">\${new Date(f.createdAt).toLocaleString()}</div>
+                  </div>
+                  <div style="background: rgba(0,0,0,.3); padding: 14px; border-radius: 8px; margin-bottom: 14px; white-space: pre-wrap; font-size: 15px;">\${esc(f.message)}</div>
+
+                  <div class="row">
+                      <textarea id="reply_\${f._id}" placeholder="Type your reply to \${esc(f.name)}..." style="flex:1; padding:10px; border-radius:8px; min-height:40px; background:rgba(0,0,0,.5); color:white; border:1px solid rgba(255,255,255,.2); font-family:inherit;"></textarea>
+                      <button class="btn primary" onclick="sendFeedbackReply('\${f._id}')">Send Reply & Archive</button>
+                      <button class="btn ghost small" style="color:var(--muted);" onclick="dismissFeedback('\${f._id}')">Dismiss</button>
+                  </div>
+              </div>
+          \`).join("");
+      } catch(e) { container.innerHTML = '<div style="color:var(--red-2); padding: 20px;">Error loading inbox.</div>'; }
+  }
+
+  async function sendFeedbackReply(id) {
+      const text = qs("reply_"+id).value.trim();
+      if(!text) return toast("Type a reply first.");
+      if(!confirm("Send this email to the customer?")) return;
+
+      try {
+          await fetch("/api/admin/feedback/"+id+"/reply", {
+              method:"POST", headers:{"Content-Type":"application/json"}, credentials:"include",
+              body: JSON.stringify({ replyText: text })
+          });
+          toast("Reply sent! 📧");
+          loadFeedbackAdmin();
+      } catch(e) { toast("Error sending reply"); }
+  }
+
+  async function dismissFeedback(id) {
+      if(!confirm("Archive this message without replying?")) return;
+      try {
+          await fetch("/api/admin/feedback/"+id, { method:"DELETE", credentials:"include" });
+          toast("Message archived 🗑️");
+          loadFeedbackAdmin();
+      } catch(e) { toast("Error archiving"); }
+  }
+
   let gpsWatchId = null;
   async function startDriverTracking(){
       const rk = qs("track_runKey").value.trim();
@@ -2218,63 +2327,6 @@ app.get("/admin", requireLogin, requireAdmin, async (_req, res) => {
 </script>
 </body>
 </html>`);
-});
-
-
-// --- REPUTATION SHIELD: FEEDBACK ENGINE ---
-const FeedbackSchema = new mongoose.Schema({
-    name: String, email: String, phone: String,
-    type: String, message: String,
-    createdAt: { type: Date, default: Date.now }
-});
-const Feedback = mongoose.models.Feedback || mongoose.model("Feedback", FeedbackSchema);
-
-app.post("/api/feedback", async (req, res) => {
-    try {
-        const { name, email, phone, type, message } = req.body;
-        await Feedback.create({ name, email, phone, type, message });
-        
-        const html = `
-            <div style="font-family: sans-serif; max-width: 600px; padding: 20px; border: 1px solid #e0e0e0; border-radius: 8px;">
-                <h2 style="color: #e3342f;">🚨 New TGR ${type}</h2>
-                <p><strong>From:</strong> ${name} (${email} | ${phone})</p>
-                <hr style="border: none; border-top: 1px solid #eee; margin: 15px 0;" />
-                <p style="white-space: pre-wrap; font-size: 16px;">${message}</p>
-            </div>
-        `;
-        
-        // Sends the alert straight to your admin email
-        await pmSend(process.env.EMAIL_FROM, `TGR Alert: New ${type} from ${name}`, html); 
-        
-        res.json({ ok: true });
-    } catch(e) { res.status(500).json({ ok: false, error: String(e) }); }
-});
-
-
-
-// GOD MODE CHEAT CODE: SPAWN FAKE ORDERS
-app.get("/admin/spawn-test", requireLogin, requireAdmin, async (req, res) => {
-  try {
-    const runKey = req.query.runKey || "2026-03-24-local";
-    const fakes = [
-      { name: "Test User 1", addr: "7420 Highway 6", town: "Tobermory" },
-      { name: "Test User 2", addr: "120 Tub Access Rd", town: "Tobermory" },
-      { name: "Test User 3", addr: "38 Cape Hurd Rd", town: "Tobermory" }
-    ];
-    for (let i=0; i<fakes.length; i++) {
-      await Order.create({
-        orderId: "TEST-" + Math.floor(Math.random()*90000+10000),
-        runKey: runKey, 
-        runType: "local",
-        customer: { fullName: fakes[i].name, email: "test@example.com", phone: "555-0000" },
-        address: { streetAddress: fakes[i].addr, town: fakes[i].town },
-        list: { groceryListText: "1. Milk\n2. Bread\n3. Eggs" },
-        status: { state: "confirmed", updatedAt: new Date(), updatedBy: "admin" },
-        payments: { fees: { status: "paid" }, groceries: { status: "pending" } }
-      });
-    }
-    res.send(`<h1>Success!</h1><p>Spawned 3 fake orders for run: <b>${runKey}</b>.</p><p><a href="/admin">Go back to God Mode</a> and check the Dispatch Board!</p>`);
-  } catch(e) { res.send("Error: " + String(e)); }
 });
 
 
