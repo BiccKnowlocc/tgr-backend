@@ -1480,6 +1480,7 @@ app.get("/admin", requireLogin, requireAdmin, async (_req, res) => {
        <button class="nav-btn" onclick="switchTab('runs')">🚚 Run Capacity Control</button>
        <button class="nav-btn" onclick="switchTab('users')">👥 Customer Database</button>
        <button class="nav-btn" onclick="switchTab('catalogue')">📖 Grocery Catalogue</button>
+       <button class="nav-btn" onclick="switchTab('dispatch')">🗺️ Dispatch Board</button>
        <button class="nav-btn" onclick="switchTab('tracking')">📍 GPS Broadcasting</button>
        <div class="hr" style="margin: 10px 0;"></div>
        <a class="nav-btn" href="${escapeHtml(PUBLIC_SITE_URL)}/">🌐 Back to Live Site</a>
@@ -1544,11 +1545,11 @@ app.get("/admin", requireLogin, requireAdmin, async (_req, res) => {
 
         <div id="tab_users" class="tab-pane" style="display:none;">
            <h2 style="margin-top:0; font-size: 28px;">Customer Database</h2>
-           <p class="muted" style="margin-bottom: 24px;">View registered users and manually assign or revoke Membership Tiers.</p>
+           <p class="muted" style="margin-bottom: 24px;">View registered users, assign tiers, and manage internal Bank of TGR wallets.</p>
            <div class="card" style="padding: 0;">
              <table>
-               <thead style="background: rgba(255,255,255,.05);"><tr><th>Name / Email</th><th>Phone</th><th>Current Tier</th><th>Status</th><th>Actions</th></tr></thead>
-               <tbody id="users_rows"><tr><td colspan="5" class="muted" style="padding: 30px; text-align:center;">Loading users...</td></tr></tbody>
+               <thead style="background: rgba(255,255,255,.05);"><tr><th>Name / Contact</th><th>Tier & Status</th><th>Bank of TGR</th><th>Actions</th></tr></thead>
+               <tbody id="users_rows"><tr><td colspan="4" class="muted" style="padding: 30px; text-align:center;">Loading users...</td></tr></tbody>
              </table>
            </div>
         </div>
@@ -1572,6 +1573,33 @@ app.get("/admin", requireLogin, requireAdmin, async (_req, res) => {
                <thead style="background: rgba(255,255,255,.05);"><tr><th>Item Name</th><th>Category</th><th>Price ($)</th><th>Actions</th></tr></thead>
                <tbody id="cat_rows"><tr><td colspan="4" class="muted" style="padding: 30px; text-align:center;">Loading catalogue...</td></tr></tbody>
              </table>
+           </div>
+        </div>
+
+        <div id="tab_dispatch" class="tab-pane" style="display:none;">
+           <h2 style="margin-top:0; font-size: 28px;">🗺️ Dispatch Board</h2>
+           <p class="muted" style="margin-bottom: 24px;">Drag and drop orders to set your optimal route. Map updates instantly. Send to Google Maps when ready to drive.</p>
+
+           <div class="row" style="margin-bottom: 20px;">
+               <input id="dispatch_runKey" placeholder="Active Run Key (e.g. 2026-03-24-local)" style="flex:2; font-size: 18px; padding: 12px; background:rgba(0,0,0,.5);" />
+               <button class="btn primary" onclick="loadDispatchOrders()" style="flex:1; padding: 12px; font-size: 16px;">Load Orders</button>
+           </div>
+
+           <div class="grid" style="grid-template-columns: 1fr 1fr;">
+               <div class="card" style="padding:0; overflow:hidden; min-height: 450px;">
+                   <div id="dispatch_map" style="width: 100%; height: 100%; background:#1a1a1a; min-height: 450px;"></div>
+               </div>
+
+               <div class="card" style="box-shadow:none; background: rgba(0,0,0,0.2);">
+                   <div style="font-weight:1000; font-size: 18px; margin-bottom:10px;">Routing Sequence</div>
+                   <div class="muted small" style="margin-bottom:14px;">Drag cards up and down to sort.</div>
+
+                   <div id="dispatch_list" style="display:flex; flex-direction:column; gap:10px; max-height:350px; overflow-y:auto; padding-right: 5px;">
+                       <div class="muted small" style="text-align:center; padding:20px;">Load a run key to start routing.</div>
+                   </div>
+
+                   <button class="btn primary" onclick="sendToGoogleMaps()" style="width:100%; margin-top:20px; font-size:16px; padding:14px; background: linear-gradient(180deg, #4caf50, #388e3c);">🚙 Send Route to Google Maps</button>
+               </div>
            </div>
         </div>
 
@@ -1723,7 +1751,7 @@ app.get("/admin", requireLogin, requireAdmin, async (_req, res) => {
   }
 
   const rowsEl = qs("rows"); let modalOrder = null;
-  let currentCartItems = []; // Live Cart State
+  let currentCartItems = []; 
 
   function buildQuery(){ const p = new URLSearchParams(); const q = qs("q").value.trim(); const state = qs("state").value.trim(); const runKey = qs("runKey").value.trim(); if(q) p.set("q", q); if(state) p.set("state", state); if(runKey) p.set("runKey", runKey); p.set("limit","200"); return p.toString(); }
 
@@ -1769,7 +1797,6 @@ app.get("/admin", requireLogin, requireAdmin, async (_req, res) => {
           currentCartItems.push(val);
           input.value = "";
           renderLiveCart();
-          // scroll to bottom
           const container = qs("live_cart_list");
           container.scrollTop = container.scrollHeight;
       }
@@ -1778,7 +1805,6 @@ app.get("/admin", requireLogin, requireAdmin, async (_req, res) => {
   qs("add_item_input").addEventListener("keypress", (e) => {
       if(e.key === "Enter") qs("add_item_btn").click();
   });
-  // ------------------------
 
   async function openOrder(orderId){
     try{
@@ -1789,18 +1815,16 @@ app.get("/admin", requireLogin, requireAdmin, async (_req, res) => {
       qs("m_groceriesCurrent").textContent = modalOrder.payments?.groceries?.status || "—"; 
       qs("m_state").value = (modalOrder.status?.state || "submitted");
       
-      // Populate Edit Fields
       qs("edit_name").value = modalOrder.customer?.fullName || "";
       qs("edit_phone").value = modalOrder.customer?.phone || "";
       qs("edit_address").value = modalOrder.address?.streetAddress || "";
       qs("edit_town").value = modalOrder.address?.town || "";
       
-      // Init Live Cart
       const rawListText = modalOrder.list?.groceryListText || "";
       currentCartItems = rawListText.split(/\\n/).map(i => i.trim()).filter(Boolean);
       renderLiveCart();
 
-      qs("m_list").textContent = rawListText || "—"; // Keep original as log
+      qs("m_list").textContent = rawListText || "—"; 
       qs("m_addons").textContent = buildAddonsText(modalOrder);
 
       qs("m_finalGroceryTotal").value = "";
@@ -1811,7 +1835,6 @@ app.get("/admin", requireLogin, requireAdmin, async (_req, res) => {
     } catch(e){ toast(String(e)); }
   }
 
-  // SAVE ALL EDITS (Including Live Cart)
   qs("m_saveEditsBtn").addEventListener("click", async () => {
     if(!modalOrder?.orderId) return;
     qs("m_saveEditsBtn").textContent = "Saving...";
@@ -1821,7 +1844,7 @@ app.get("/admin", requireLogin, requireAdmin, async (_req, res) => {
           phone: qs("edit_phone").value.trim(),
           streetAddress: qs("edit_address").value.trim(),
           town: qs("edit_town").value.trim(),
-          listText: currentCartItems.join("\\n") // Pack the live cart array back into a string
+          listText: currentCartItems.join("\\n") 
       };
       const r = await fetch("/api/admin/orders/" + encodeURIComponent(modalOrder.orderId) + "/edit", {
           method: "POST", headers:{"Content-Type":"application/json"}, credentials:"include",
@@ -1830,8 +1853,8 @@ app.get("/admin", requireLogin, requireAdmin, async (_req, res) => {
       const d = await r.json();
       if(!d.ok) throw new Error("Failed to edit");
       toast("Order Edits Saved! ✅");
-      await search(); // refresh list behind
-      await openOrder(modalOrder.orderId); // refresh modal to show updated 'Original Saved List' log
+      await search(); 
+      await openOrder(modalOrder.orderId); 
     } catch(e) { toast("Error saving edits"); }
     finally { qs("m_saveEditsBtn").textContent = "Save All Edits"; }
   });
@@ -2038,6 +2061,119 @@ app.get("/admin", requireLogin, requireAdmin, async (_req, res) => {
       loadCatalogue();
   }
 
+  // --- DISPATCH BOARD & ROUTING ENGINE ---
+  let dispatchMap = null;
+  let dispatchMarkers = [];
+  let dispatchOrders = [];
+  const geoCache = {};
+
+  async function ensureMapboxAdmin() {
+      if (window.mapboxgl) return;
+      const css = document.createElement("link"); css.rel = "stylesheet"; css.href = "https://api.mapbox.com/mapbox-gl-js/v2.15.0/mapbox-gl.css"; document.head.appendChild(css);
+      const s = document.createElement("script"); s.src = "https://api.mapbox.com/mapbox-gl-js/v2.15.0/mapbox-gl.js";
+      await new Promise((res) => { s.onload = res; document.head.appendChild(s); });
+  }
+
+  async function loadDispatchOrders() {
+      const rk = qs("dispatch_runKey").value.trim();
+      if(!rk) return toast("Enter a run key first.");
+      qs("dispatch_list").innerHTML = '<div class="muted" style="text-align:center; padding:20px;">Loading route data...</div>';
+      try {
+          const r = await fetch("/api/admin/orders?limit=100&runKey=" + encodeURIComponent(rk), {credentials:"include"});
+          const d = await r.json();
+          dispatchOrders = d.items.filter(o => ["submitted", "confirmed", "shopping", "packed", "out_for_delivery"].includes(o.status.state));
+          
+          if(dispatchOrders.length === 0) {
+             qs("dispatch_list").innerHTML = '<div class="muted small" style="text-align:center; padding:20px;">No active orders found for this run.</div>';
+             return;
+          }
+          
+          renderDispatchList();
+          await updateDispatchMap();
+          toast("Route loaded! Drag to sort.");
+      } catch(e) { toast("Failed to load orders."); }
+  }
+
+  function renderDispatchList() {
+      const container = qs("dispatch_list");
+      container.innerHTML = dispatchOrders.map((o, index) => \`
+          <div class="card" draggable="true" ondragstart="dragStart(event, \${index})" ondragover="dragOver(event)" ondrop="drop(event, \${index})" style="cursor:grab; padding:12px; margin-bottom:0; background:rgba(255,255,255,.05); border:1px solid rgba(255,255,255,.2); transition: transform 0.1s;">
+              <div style="font-weight:900; color:var(--white); display:flex; align-items:center; gap:10px;">
+                 <div style="background:var(--red); color:#fff; width:24px; height:24px; border-radius:50%; display:flex; align-items:center; justify-content:center; font-size:12px;">\${index + 1}</div>
+                 \${esc(o.customer.fullName)}
+              </div>
+              <div class="muted small" style="margin-top:6px; padding-left: 34px;">\${esc(o.address.streetAddress)}, \${esc(o.address.town)}</div>
+          </div>
+      \`).join("");
+  }
+
+  let draggedIndex = null;
+  window.dragStart = function(e, index) { draggedIndex = index; e.dataTransfer.effectAllowed = "move"; };
+  window.dragOver = function(e) { e.preventDefault(); e.dataTransfer.dropEffect = "move"; };
+  window.drop = async function(e, targetIndex) {
+      e.preventDefault();
+      if(draggedIndex === null || draggedIndex === targetIndex) return;
+      const item = dispatchOrders.splice(draggedIndex, 1)[0];
+      dispatchOrders.splice(targetIndex, 0, item);
+      renderDispatchList();
+      await updateDispatchMap();
+  };
+
+  async function updateDispatchMap() {
+      await ensureMapboxAdmin();
+      const conf = await fetch("/api/public/config").then(r=>r.json());
+      mapboxgl.accessToken = conf.mapboxPublicToken;
+
+      if(!dispatchMap) {
+          dispatchMap = new mapboxgl.Map({ container: 'dispatch_map', style: 'mapbox://styles/mapbox/dark-v11', center: [-81.3, 44.8], zoom: 8 });
+      }
+
+      dispatchMarkers.forEach(m => m.remove());
+      dispatchMarkers = [];
+
+      const bounds = new mapboxgl.LngLatBounds();
+      let hasBounds = false;
+
+      for(let i=0; i<dispatchOrders.length; i++) {
+          const o = dispatchOrders[i];
+          const query = \`\${o.address.streetAddress}, \${o.address.town}, ON, Canada\`;
+          
+          if (!geoCache[o.orderId]) {
+              const geo = await fetch(\`https://api.mapbox.com/geocoding/v5/mapbox.places/\${encodeURIComponent(query)}.json?access_token=\${mapboxgl.accessToken}\`).then(r=>r.json());
+              if(geo.features && geo.features.length > 0) {
+                  geoCache[o.orderId] = geo.features[0].center;
+              }
+          }
+
+          if (geoCache[o.orderId]) {
+              const [lng, lat] = geoCache[o.orderId];
+              const el = document.createElement('div');
+              el.style.backgroundColor = '#e3342f'; el.style.color = '#fff'; el.style.width = '24px'; el.style.height = '24px'; el.style.borderRadius = '50%'; el.style.display = 'flex'; el.style.alignItems = 'center'; el.style.justifyContent = 'center'; el.style.fontWeight = 'bold'; el.innerText = i + 1;
+              el.style.boxShadow = '0 0 10px rgba(0,0,0,0.5)';
+              
+              const marker = new mapboxgl.Marker(el).setLngLat([lng, lat]).addTo(dispatchMap);
+              dispatchMarkers.push(marker);
+              bounds.extend([lng, lat]);
+              hasBounds = true;
+          }
+      }
+      if(hasBounds) dispatchMap.fitBounds(bounds, { padding: 40 });
+  }
+
+  window.sendToGoogleMaps = function() {
+      if(dispatchOrders.length === 0) return toast("No orders to route!");
+      if(dispatchOrders.length > 10) return toast("Google Maps max limit is 10 stops. Please split your route.");
+      
+      const addresses = dispatchOrders.map(o => \`\${o.address.streetAddress}, \${o.address.town}, ON\`);
+      const dest = addresses.pop(); 
+      const waypoints = addresses.join('|');
+      
+      let url = \`https://www.google.com/maps/dir/?api=1&destination=\${encodeURIComponent(dest)}\`;
+      if(waypoints) url += \`&waypoints=\${encodeURIComponent(waypoints)}\`;
+      
+      window.open(url, '_blank');
+  };
+
   let gpsWatchId = null;
   async function startDriverTracking(){
       const rk = qs("track_runKey").value.trim();
@@ -2080,6 +2216,9 @@ app.get("/admin", requireLogin, requireAdmin, async (_req, res) => {
   
   loadDashboardMetrics();
 </script>
+</body>
+</html>`);
+});
 
 
 // ROUTIFIC EXPORT
