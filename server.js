@@ -1907,6 +1907,8 @@ app.get("/admin", requireLogin, requireAdmin, async (_req, res) => {
   
   loadDashboardMetrics();
 </script>
+</body>
+</html>`);
 
 // ROUTIFIC EXPORT
 app.get("/api/admin/routific/export-csv", requireLogin, requireAdmin, async (req, res) => {
