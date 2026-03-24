@@ -2221,6 +2221,37 @@ app.get("/admin", requireLogin, requireAdmin, async (_req, res) => {
 });
 
 
+// --- REPUTATION SHIELD: FEEDBACK ENGINE ---
+const FeedbackSchema = new mongoose.Schema({
+    name: String, email: String, phone: String,
+    type: String, message: String,
+    createdAt: { type: Date, default: Date.now }
+});
+const Feedback = mongoose.models.Feedback || mongoose.model("Feedback", FeedbackSchema);
+
+app.post("/api/feedback", async (req, res) => {
+    try {
+        const { name, email, phone, type, message } = req.body;
+        await Feedback.create({ name, email, phone, type, message });
+        
+        const html = `
+            <div style="font-family: sans-serif; max-width: 600px; padding: 20px; border: 1px solid #e0e0e0; border-radius: 8px;">
+                <h2 style="color: #e3342f;">🚨 New TGR ${type}</h2>
+                <p><strong>From:</strong> ${name} (${email} | ${phone})</p>
+                <hr style="border: none; border-top: 1px solid #eee; margin: 15px 0;" />
+                <p style="white-space: pre-wrap; font-size: 16px;">${message}</p>
+            </div>
+        `;
+        
+        // Sends the alert straight to your admin email
+        await pmSend(process.env.EMAIL_FROM, `TGR Alert: New ${type} from ${name}`, html); 
+        
+        res.json({ ok: true });
+    } catch(e) { res.status(500).json({ ok: false, error: String(e) }); }
+});
+
+
+
 // GOD MODE CHEAT CODE: SPAWN FAKE ORDERS
 app.get("/admin/spawn-test", requireLogin, requireAdmin, async (req, res) => {
   try {
