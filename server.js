@@ -879,6 +879,31 @@ app.post("/api/admin/runs/:runKey", requireLogin, requireAdmin, async (req, res)
 });
 
 
+	// MASTER ORDER EDIT ROUTE
+app.post("/api/admin/orders/:orderId/edit", requireLogin, requireAdmin, async (req, res) => {
+  try {
+    const orderId = String(req.params.orderId || "").trim().toUpperCase();
+    const { fullName, phone, streetAddress, town, listText } = req.body;
+    
+    const order = await Order.findOne({ orderId });
+    if (!order) return res.status(404).json({ ok: false, error: "Order not found" });
+
+    if (fullName) order.customer.fullName = fullName;
+    if (phone) order.customer.phone = phone;
+    if (streetAddress) order.address.streetAddress = streetAddress;
+    if (town) order.address.town = town;
+    if (listText !== undefined) order.list.groceryListText = listText;
+
+    order.status.updatedAt = new Date();
+    order.status.updatedBy = adminBy(req);
+    
+    await order.save();
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ ok: false, error: String(e) }); }
+});
+
+
+
 app.post("/api/admin/orders/:orderId/capture", requireLogin, requireAdmin, async (req, res) => {
   try {
     const orderId = String(req.params.orderId || "").trim().toUpperCase();
@@ -1506,11 +1531,25 @@ app.get("/admin", requireLogin, requireAdmin, async (_req, res) => {
     <div class="grid">
       <div class="card" style="box-shadow:none; border: none; background: rgba(0,0,0,0.2);">
         <div class="k">Order ID</div><div class="v" id="m_orderId" style="font-size: 20px; color: var(--red-2);">—</div>
-        <div class="k">Customer</div><div class="v" id="m_customer">—</div>
-        <div class="k">Phone</div><div class="v" id="m_phone">—</div>
-        <div class="k">Address</div><div class="v" id="m_addr">—</div>
         <div class="k">Run Key</div><div class="v" id="m_run">—</div>
+        
+        <div class="card" style="border: 1px solid rgba(255,255,255,0.2); background: rgba(0,0,0,0.4); margin-top: 14px; padding: 16px;">
+            <div style="font-weight:1000; margin-bottom:10px; color:var(--white);">✏️ Quick Edit Order</div>
+            <div class="row">
+                <input id="edit_name" placeholder="Customer Name" style="flex:1; padding:8px;" />
+                <input id="edit_phone" placeholder="Phone" style="flex:1; padding:8px;" />
+            </div>
+            <div class="row" style="margin-top:10px;">
+                <input id="edit_address" placeholder="Street Address" style="flex:2; padding:8px;" />
+                <input id="edit_town" placeholder="Town" style="flex:1; padding:8px;" />
+            </div>
+            <div class="row" style="margin-top:10px;">
+                <textarea id="edit_list" style="min-height: 120px; padding:8px;" placeholder="Grocery List..."></textarea>
+            </div>
+            <button class="btn secondary small" id="m_saveEditsBtn" style="margin-top:10px; width:100%;">Save Edits</button>
+        </div>
       </div>
+      
       <div class="card" style="box-shadow:none; border: none; background: rgba(0,0,0,0.2);">
         <div class="k">Upfront Fees Status</div><div class="v" id="m_fees">—</div>
         <div class="k">Grocery Charge Status</div><div class="v" id="m_groceriesCurrent">—</div>
@@ -1562,17 +1601,12 @@ app.get("/admin", requireLogin, requireAdmin, async (_req, res) => {
       if(tabId === 'users') loadUsersAdmin();
       if(tabId === 'runs') loadRunsAdmin();
 
-      // Auto-hide mobile menu if clicking a link
-      if (window.innerWidth <= 900) {
-          document.getElementById('sidebar').classList.remove('show');
-      }
+      if (window.innerWidth <= 900) { document.getElementById('sidebar').classList.remove('show'); }
   }
 
-  // Formatting helpers
   function esc(s){ return String(s||"").replaceAll("&","&amp;").replaceAll("<","&lt;").replaceAll(">","&gt;").replaceAll('"',"&quot;"); }
   function money(n){ return Number(n||0).toFixed(2); }
 
-  // Dashboard Logic
   async function loadDashboardMetrics() {
      try {
          const r = await fetch("/api/runs/active");
@@ -1603,12 +1637,9 @@ app.get("/admin", requireLogin, requireAdmin, async (_req, res) => {
              </div>\`;
              grid.insertAdjacentHTML('beforeend', html);
          }
-     } catch (e) {
-         qs("runMetricsGrid").innerHTML = "<p>Failed to load metrics.</p>";
-     }
+     } catch (e) { qs("runMetricsGrid").innerHTML = "<p>Failed to load metrics.</p>"; }
   }
 
-  // Orders Logic
   const rowsEl = qs("rows"); let modalOrder = null;
   function buildQuery(){ const p = new URLSearchParams(); const q = qs("q").value.trim(); const state = qs("state").value.trim(); const runKey = qs("runKey").value.trim(); if(q) p.set("q", q); if(state) p.set("state", state); if(runKey) p.set("runKey", runKey); p.set("limit","200"); return p.toString(); }
 
@@ -1630,13 +1661,48 @@ app.get("/admin", requireLogin, requireAdmin, async (_req, res) => {
   async function openOrder(orderId){
     try{
       const r = await fetch("/api/admin/orders/" + encodeURIComponent(orderId), { credentials:"include" }); const d = await r.json(); modalOrder = d.order;
-      qs("m_orderId").textContent = modalOrder.orderId || "—"; qs("m_customer").textContent = modalOrder.customer?.fullName || "—"; qs("m_phone").textContent = modalOrder.customer?.phone || "—"; 
-      qs("m_addr").textContent = (modalOrder.address?.streetAddress || "") + ", " + (modalOrder.address?.town || ""); qs("m_run").textContent = (modalOrder.runKey||""); qs("m_fees").textContent = "$" + money(modalOrder.pricingSnapshot?.totalFees || 0) + " (" + (modalOrder.payments?.fees?.status || "—") + ")"; qs("m_groceriesCurrent").textContent = modalOrder.payments?.groceries?.status || "—"; qs("m_state").value = (modalOrder.status?.state || "submitted"); qs("m_list").textContent = modalOrder.list?.groceryListText || "—"; qs("m_addons").textContent = buildAddonsText(modalOrder);
+      qs("m_orderId").textContent = modalOrder.orderId || "—";
+      qs("m_run").textContent = (modalOrder.runKey||""); 
+      qs("m_fees").textContent = "$" + money(modalOrder.pricingSnapshot?.totalFees || 0) + " (" + (modalOrder.payments?.fees?.status || "—") + ")"; 
+      qs("m_groceriesCurrent").textContent = modalOrder.payments?.groceries?.status || "—"; 
+      qs("m_state").value = (modalOrder.status?.state || "submitted");
+      
+      // Populate Edit Fields
+      qs("edit_name").value = modalOrder.customer?.fullName || "";
+      qs("edit_phone").value = modalOrder.customer?.phone || "";
+      qs("edit_address").value = modalOrder.address?.streetAddress || "";
+      qs("edit_town").value = modalOrder.address?.town || "";
+      qs("edit_list").value = modalOrder.list?.groceryListText || "";
+
       qs("m_finalGroceryTotal").value = "";
       qs("m_bagsUsed").value = "";
       openModal(true);
     } catch(e){ toast(String(e)); }
   }
+
+  // SAVE EDITS
+  qs("m_saveEditsBtn").addEventListener("click", async () => {
+    if(!modalOrder?.orderId) return;
+    qs("m_saveEditsBtn").textContent = "Saving...";
+    try {
+      const payload = {
+          fullName: qs("edit_name").value.trim(),
+          phone: qs("edit_phone").value.trim(),
+          streetAddress: qs("edit_address").value.trim(),
+          town: qs("edit_town").value.trim(),
+          listText: qs("edit_list").value.trim()
+      };
+      const r = await fetch("/api/admin/orders/" + encodeURIComponent(modalOrder.orderId) + "/edit", {
+          method: "POST", headers:{"Content-Type":"application/json"}, credentials:"include",
+          body: JSON.stringify(payload)
+      });
+      const d = await r.json();
+      if(!d.ok) throw new Error("Failed to edit");
+      toast("Order Edits Saved! ✅");
+      await search(); // refresh list behind
+    } catch(e) { toast("Error saving edits"); }
+    finally { qs("m_saveEditsBtn").textContent = "Save Edits"; }
+  });
 
   qs("m_captureBtn").addEventListener("click", async () => {
     if(!modalOrder?.orderId) return;
@@ -1658,9 +1724,6 @@ app.get("/admin", requireLogin, requireAdmin, async (_req, res) => {
 
   async function saveStatus(){ if(!modalOrder?.orderId) return; try{ await fetch("/api/admin/orders/" + encodeURIComponent(modalOrder.orderId) + "/status", { method:"POST", headers:{ "Content-Type":"application/json" }, credentials:"include", body: JSON.stringify({ state: qs("m_state").value }) }); toast("Status saved ✅"); await search(); } catch(e){ toast(String(e)); } }
   
-  // ===================================
-  // GOD MODE FEATURES (USERS & RUNS)
-  // ===================================
   async function loadUsersAdmin(){
       const tbody = qs("users_rows");
       tbody.innerHTML = '<tr><td colspan="5" class="muted" style="text-align:center; padding: 30px;">Loading users...</td></tr>';
@@ -1669,31 +1732,31 @@ app.get("/admin", requireLogin, requireAdmin, async (_req, res) => {
           const d = await r.json();
           if(!d.users || !d.users.length) { tbody.innerHTML = '<tr><td colspan="5" class="muted" style="text-align:center; padding: 30px;">No users found.</td></tr>'; return; }
           
-          tbody.innerHTML = d.users.map(u => \`<tr>
-              <td><div style="font-weight:900;">\${esc(u.name || "No Name")}</div><div class="muted small">\${esc(u.email)}</div></td>
-              <td>\${esc(u.profile?.phone || "—")}</td>
+          tbody.innerHTML = d.users.map(u => `<tr>
+              <td><div style="font-weight:900;">${esc(u.name || "No Name")}</div><div class="muted small">${esc(u.email)}</div></td>
+              <td>${esc(u.profile?.phone || "—")}</td>
               <td>
-                  <select id="utier_\${u._id}" style="width:140px; padding:6px;">
-                      <option value="none" \${u.membershipLevel==='none'?'selected':''}>None</option>
-                      <option value="standard" \${u.membershipLevel==='standard'?'selected':''}>Standard</option>
-                      <option value="route" \${u.membershipLevel==='route'?'selected':''}>Route</option>
-                      <option value="access" \${u.membershipLevel==='access'?'selected':''}>Access</option>
-                      <option value="accesspro" \${u.membershipLevel==='accesspro'?'selected':''}>Access Pro</option>
+                  <select id="utier_${u._id}" style="width:140px; padding:6px;">
+                      <option value="none" ${u.membershipLevel==='none'?'selected':''}>None</option>
+                      <option value="standard" ${u.membershipLevel==='standard'?'selected':''}>Standard</option>
+                      <option value="route" ${u.membershipLevel==='route'?'selected':''}>Route</option>
+                      <option value="access" ${u.membershipLevel==='access'?'selected':''}>Access</option>
+                      <option value="accesspro" ${u.membershipLevel==='accesspro'?'selected':''}>Access Pro</option>
                   </select>
               </td>
               <td>
-                  <select id="ustat_\${u._id}" style="width:100px; padding:6px;">
-                      <option value="inactive" \${u.membershipStatus==='inactive'?'selected':''}>Inactive</option>
-                      <option value="active" \${u.membershipStatus==='active'?'selected':''}>Active</option>
+                  <select id="ustat_${u._id}" style="width:100px; padding:6px;">
+                      <option value="inactive" ${u.membershipStatus==='inactive'?'selected':''}>Inactive</option>
+                      <option value="active" ${u.membershipStatus==='active'?'selected':''}>Active</option>
                   </select>
               </td>
               <td>
                   <div class="row">
-                     <button class="btn secondary small" onclick="updateUser('\${u._id}')">Save</button>
-                     <button class="btn ghost small" style="color:var(--red-2);" onclick="impersonateUser('\${u._id}', '\${esc(u.email)}')">Login As</button>
+                     <button class="btn secondary small" onclick="updateUser('${u._id}')">Save</button>
+                     <button class="btn ghost small" style="color:var(--red-2);" onclick="impersonateUser('${u._id}', '${esc(u.email)}')">Login As</button>
                   </div>
               </td>
-          </tr>\`).join("");
+          </tr>`).join("");
       } catch(e) { tbody.innerHTML = '<tr><td colspan="5" style="color:var(--red-2); text-align:center; padding: 30px;">Error loading users.</td></tr>'; }
   }
 
@@ -1729,18 +1792,18 @@ app.get("/admin", requireLogin, requireAdmin, async (_req, res) => {
           const d = await r.json();
           if(!d.runs || !d.runs.length) { tbody.innerHTML = '<tr><td colspan="5" class="muted" style="text-align:center; padding: 30px;">No runs found.</td></tr>'; return; }
           
-          tbody.innerHTML = d.runs.map(r => \`<tr>
-              <td><div style="font-weight:900;">\${esc(r.runKey)}</div></td>
-              <td><span class="pill">\${esc(r.type)}</span></td>
-              <td class="muted">\${new Date(r.cutoffAt).toLocaleString()}</td>
+          tbody.innerHTML = d.runs.map(r => `<tr>
+              <td><div style="font-weight:900;">${esc(r.runKey)}</div></td>
+              <td><span class="pill">${esc(r.type)}</span></td>
+              <td class="muted">${new Date(r.cutoffAt).toLocaleString()}</td>
               <td>
                   <div class="row">
-                     <span class="muted small">Max Pts:</span> <input type="number" id="rmax_\${r.runKey}" value="\${r.maxPoints}" style="width:80px; padding:6px;" />
-                     <span class="muted small">Slots:</span> <input type="number" id="rslots_\${r.runKey}" value="\${r.maxSlots}" style="width:80px; padding:6px;" />
+                     <span class="muted small">Max Pts:</span> <input type="number" id="rmax_${r.runKey}" value="${r.maxPoints}" style="width:80px; padding:6px;" />
+                     <span class="muted small">Slots:</span> <input type="number" id="rslots_${r.runKey}" value="${r.maxSlots}" style="width:80px; padding:6px;" />
                   </div>
               </td>
-              <td><button class="btn secondary small" onclick="updateRun('\${r.runKey}')">Override</button></td>
-          </tr>\`).join("");
+              <td><button class="btn secondary small" onclick="updateRun('${r.runKey}')">Override</button></td>
+          </tr>`).join("");
       } catch(e) { tbody.innerHTML = '<tr><td colspan="5" style="color:var(--red-2); text-align:center; padding: 30px;">Error loading runs.</td></tr>'; }
   }
 
@@ -1756,14 +1819,13 @@ app.get("/admin", requireLogin, requireAdmin, async (_req, res) => {
       } catch(e) { toast("Error updating run"); }
   }
 
-  // Catalogue Logic
   async function loadCatalogue(){
       qs("cat_rows").innerHTML = '<tr><td colspan="4" class="muted" style="text-align:center; padding: 30px;">Loading database...</td></tr>';
       try{
         const r = await fetch("/api/admin/catalogue", {credentials:"include"});
         const d = await r.json();
         if(!d.items || !d.items.length){ qs("cat_rows").innerHTML = '<tr><td colspan="4" class="muted" style="text-align:center; padding: 30px;">Catalogue is empty.</td></tr>'; return; }
-        qs("cat_rows").innerHTML = d.items.map(i=> \`<tr><td><div style="font-weight:900; font-size:15px;">\${esc(i.name)}</div></td><td><span class="pill">\${esc(i.category)}</span></td><td><input type="number" step="0.01" value="\${i.estimatedPrice}" id="price_\${i._id}" style="max-width:120px; padding:10px; font-size:15px;"/></td><td><button class="btn secondary small" onclick="updateCatPrice('\${i._id}', '\${esc(i.name)}', '\${esc(i.category)}')">Save</button> <button class="btn ghost small" onclick="deleteCat('\${i._id}')" style="color:var(--red-2);">Delete</button></td></tr>\`).join("");
+        qs("cat_rows").innerHTML = d.items.map(i=> `<tr><td><div style="font-weight:900; font-size:15px;">${esc(i.name)}</div></td><td><span class="pill">${esc(i.category)}</span></td><td><input type="number" step="0.01" value="${i.estimatedPrice}" id="price_${i._id}" style="max-width:120px; padding:10px; font-size:15px;"/></td><td><button class="btn secondary small" onclick="updateCatPrice('${i._id}', '${esc(i.name)}', '${esc(i.category)}')">Save</button> <button class="btn ghost small" onclick="deleteCat('${i._id}')" style="color:var(--red-2);">Delete</button></td></tr>`).join("");
       }catch(e){ qs("cat_rows").innerHTML = '<tr><td colspan="4" style="color:var(--red-2); text-align:center; padding: 30px;">Error loading.</td></tr>'; }
   }
   async function addCatItem() {
@@ -1803,7 +1865,6 @@ app.get("/admin", requireLogin, requireAdmin, async (_req, res) => {
       loadCatalogue();
   }
 
-  // Tracking Logic
   let gpsWatchId = null;
   async function startDriverTracking(){
       const rk = qs("track_runKey").value.trim();
@@ -1839,18 +1900,15 @@ app.get("/admin", requireLogin, requireAdmin, async (_req, res) => {
       toast("Broadcast Stopped 🛑");
   }
 
-  // Event Bindings
   qs("closeModal").addEventListener("click", ()=> openModal(false)); 
   qs("searchBtn").addEventListener("click", search); 
   qs("clearBtn").addEventListener("click", ()=>{ qs("q").value=""; qs("runKey").value=""; qs("state").value=""; search(); }); 
   qs("m_saveState").addEventListener("click", saveStatus);
   
-  // Boot
   loadDashboardMetrics();
 </script>
 </body>
 </html>`);
-});
 
 // ROUTIFIC EXPORT
 app.get("/api/admin/routific/export-csv", requireLogin, requireAdmin, async (req, res) => {
