@@ -641,7 +641,25 @@ app.post("/api/webhooks/square", async (req, res) => {
               { email: normalizedEmail },
               { $set: { membershipLevel: newTier, membershipStatus: "active", renewalDate: renewal } }
             );
-            console.log(`[Webhook Success] Upgraded ${normalizedEmail} to ${newTier} membership.`);
+            
+            // --- AUTOMATED MEMBERSHIP EMAIL ---
+            const memHtml = `
+              <div style="font-family: sans-serif; max-width: 600px; margin: 0 auto; padding: 20px; border: 1px solid #e0e0e0; border-radius: 8px;">
+                <h1 style="color: #e3342f;">Welcome to the VIP Club 🏆</h1>
+                <p>We'd give you a secret handshake, but our hands are usually full of grocery bags.</p>
+                <p>Your <strong>${newTier.toUpperCase()}</strong> membership is officially active. Your perks and discounts will now automatically apply at checkout.</p>
+                <table style="width: 100%; border-collapse: collapse; margin-top: 20px; margin-bottom: 20px;">
+                  <tr style="border-bottom: 1px solid #eee;"><td style="padding: 8px 0;"><strong>Tier:</strong></td><td style="text-align: right; font-weight: bold;">${newTier.toUpperCase()}</td></tr>
+                  <tr style="border-bottom: 1px solid #eee;"><td style="padding: 8px 0;"><strong>Next Renewal:</strong></td><td style="text-align: right;">${renewal.toLocaleDateString()}</td></tr>
+                </table>
+                <p>Need to bail? We'll cry a little, but you can manage or cancel your subscription anytime via your Square email receipt or by checking your profile settings below.</p>
+                <div style="text-align: center; margin-top: 25px; margin-bottom: 15px;">
+                  <a href="${PUBLIC_SITE_URL}/member" style="background-color: #333; color: #fff; padding: 12px 24px; text-decoration: none; border-radius: 6px; font-weight: bold;">Enter Member Portal</a>
+                </div>
+                <p style="margin-top: 20px;">Stay awesome,<br>- Nick @ TGR</p>
+              </div>
+            `;
+            await pmSend(normalizedEmail, `TGR ${newTier.toUpperCase()} Membership Active!`, memHtml);
          }
       }
     }
@@ -685,8 +703,21 @@ app.post("/api/profile", requireLogin, async (req, res) => {
       savedList: savedList
     };
     if (!newProfile.defaultId && newProfile.addresses.length) newProfile.defaultId = newProfile.addresses[0].id;
-    newProfile.complete = isProfileComplete(newProfile); newProfile.completedAt = newProfile.complete ? new Date().toISOString() : null;
-    u.profile = newProfile; u.markModified("profile"); await u.save(); res.json({ ok: true, profileComplete: newProfile.complete === true, profile: newProfile });
+    
+    const wasIncomplete = !u.profile || u.profile.complete !== true;
+    newProfile.complete = isProfileComplete(newProfile); 
+    newProfile.completedAt = newProfile.complete ? new Date().toISOString() : null;
+    
+    u.profile = newProfile; 
+    u.markModified("profile"); 
+    await u.save(); 
+    
+    // --- AUTOMATED WELCOME SMS (Only on first completion) ---
+    if (wasIncomplete && newProfile.complete === true && newProfile.phone) {
+        await sendSms(newProfile.phone, `Welcome to Tobermory Grocery Run! 🚙💨 Your account is perfectly set up. Nick is officially at your service for all your local runs and Owen Sound hauls. Save this number!`);
+    }
+
+    res.json({ ok: true, profileComplete: newProfile.complete === true, profile: newProfile });
   } catch (e) { res.status(500).json({ ok: false, error: String(e) }); }
 });
 
@@ -818,6 +849,23 @@ app.post("/api/orders", requireLogin, requireProfileComplete, upload.single("gro
       status: { state: "submitted", note: "", updatedAt: new Date(), updatedBy: "customer" }, statusHistory: [{ state: "submitted", note: "", at: new Date(), by: "customer" }],
       adminLog: [{ at: new Date(), by: "system", action: "order_created", meta: { runKey: run.runKey, effectiveMemberTier, orderClass } }],
     });
+
+	// --- AUTOMATED ORDER RECEIVED EMAIL ---
+    if (user.email) {
+      const orderHtml = `
+        <div style="font-family: sans-serif; max-width: 600px; margin: 0 auto; padding: 20px; border: 1px solid #e0e0e0; border-radius: 8px;">
+          <h1 style="color: #e3342f;">Order Secured! 🛒</h1>
+          <p>Hi ${fullName.split(' ')[0]},</p>
+          <p>Your grocery list has successfully survived the perilous journey through the interwebs and landed safely on our clipboard. The Jeep Patriot is officially getting warmed up.</p>
+          <p><strong>Order ID:</strong> ${orderId}</p>
+          <p><strong>Run:</strong> ${runType.toUpperCase()} (${run.runKey})</p>
+          <p>You can track our progress, stalk our GPS, or panic-cancel (before the cutoff) directly in your <a href="${PUBLIC_SITE_URL}/member" style="color: #e3342f; font-weight: bold;">Member Portal</a>.</p>
+          <p>May the grocery gods bless us with fully stocked shelves.</p>
+          <p>- Nick @ TGR</p>
+        </div>
+      `;
+      await pmSend(user.email, `TGR Order Received - ${orderId}`, orderHtml);
+    }
 
     res.json({ ok: true, orderId, runKey: run.runKey, cancelToken: signCancelToken(orderId, cutoffAt.toDate().getTime()), cancelUntilLocal: fmtLocal(cutoffAt.toDate()), effectiveMemberTier });
   } catch (e) { res.status(500).json({ ok: false, error: String(e) }); }
