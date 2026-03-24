@@ -1277,6 +1277,54 @@ function buildAddonsText(o){
   return lines.length ? lines.join("\n") : "—";
 }
 
+// ===================================
+// NEW GOD MODE API ROUTES
+// ===================================
+app.get("/api/admin/users", requireLogin, requireAdmin, async (req, res) => {
+  try {
+    const users = await User.find().sort({ createdAt: -1 }).limit(150).lean();
+    res.json({ ok: true, users });
+  } catch (e) { res.status(500).json({ ok: false, error: String(e) }); }
+});
+
+app.post("/api/admin/users/:id/tier", requireLogin, requireAdmin, async (req, res) => {
+  try {
+    const { tier, status } = req.body;
+    await User.findByIdAndUpdate(req.params.id, { $set: { membershipLevel: tier, membershipStatus: status }});
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ ok: false, error: String(e) }); }
+});
+
+// LOGIN AS / IMPERSONATION ROUTE
+app.post("/api/admin/users/:id/impersonate", requireLogin, requireAdmin, async (req, res) => {
+  try {
+    const targetUser = await User.findById(req.params.id);
+    if (!targetUser) return res.status(404).json({ ok: false, error: "User not found" });
+    
+    req.login(targetUser, (err) => {
+      if (err) return res.status(500).json({ ok: false, error: String(err) });
+      res.json({ ok: true });
+    });
+  } catch (e) { res.status(500).json({ ok: false, error: String(e) }); }
+});
+
+app.get("/api/admin/runs-manage", requireLogin, requireAdmin, async (req, res) => {
+  try {
+    const runs = await Run.find().sort({ opensAt: -1 }).limit(30).lean();
+    res.json({ ok: true, runs });
+  } catch (e) { res.status(500).json({ ok: false, error: String(e) }); }
+});
+
+app.post("/api/admin/runs-manage/:runKey", requireLogin, requireAdmin, async (req, res) => {
+  try {
+    const { maxPoints, maxSlots } = req.body;
+    await Run.findOneAndUpdate({ runKey: req.params.runKey }, { $set: { maxPoints: Number(maxPoints), maxSlots: Number(maxSlots) }});
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ ok: false, error: String(e) }); }
+});
+
+
+
 // FULL SCREEN ADMIN GOD MODE
 app.get("/admin", requireLogin, requireAdmin, async (_req, res) => {
   res.setHeader("Content-Type", "text/html; charset=utf-8");
@@ -1294,6 +1342,7 @@ app.get("/admin", requireLogin, requireAdmin, async (_req, res) => {
   .row { display:flex; gap:10px; flex-wrap:wrap; align-items:center; }
   .btn { border:1px solid rgba(255,255,255,.18); background:rgba(255,255,255,.06); color:#fff; font-weight:900; border-radius:999px; padding:10px 16px; cursor:pointer; text-decoration:none; white-space:nowrap; display: inline-block; text-align: center; transition: background 0.2s; }
   .btn.primary { background:linear-gradient(180deg,var(--red2),var(--red)); border-color:rgba(0,0,0,.25); }
+  .btn.secondary { background:rgba(217,217,217,.10); border-color:rgba(217,217,217,.22); color:var(--white); }
   .btn.ghost { background:transparent; } 
   .btn:hover { background:rgba(255,255,255,.12); }
   .muted { color:var(--muted); }
@@ -1515,7 +1564,7 @@ app.get("/admin", requireLogin, requireAdmin, async (_req, res) => {
 
       // Auto-hide mobile menu if clicking a link
       if (window.innerWidth <= 900) {
-          qs('sidebar').classList.remove('show');
+          document.getElementById('sidebar').classList.remove('show');
       }
   }
 
@@ -1610,7 +1659,7 @@ app.get("/admin", requireLogin, requireAdmin, async (_req, res) => {
   async function saveStatus(){ if(!modalOrder?.orderId) return; try{ await fetch("/api/admin/orders/" + encodeURIComponent(modalOrder.orderId) + "/status", { method:"POST", headers:{ "Content-Type":"application/json" }, credentials:"include", body: JSON.stringify({ state: qs("m_state").value }) }); toast("Status saved ✅"); await search(); } catch(e){ toast(String(e)); } }
   
   // ===================================
-  // NEW GOD MODE FEATURES (USERS & RUNS)
+  // GOD MODE FEATURES (USERS & RUNS)
   // ===================================
   async function loadUsersAdmin(){
       const tbody = qs("users_rows");
@@ -1638,7 +1687,12 @@ app.get("/admin", requireLogin, requireAdmin, async (_req, res) => {
                       <option value="active" \${u.membershipStatus==='active'?'selected':''}>Active</option>
                   </select>
               </td>
-              <td><button class="btn secondary small" onclick="updateUser('\${u._id}')">Save</button></td>
+              <td>
+                  <div class="row">
+                     <button class="btn secondary small" onclick="updateUser('\${u._id}')">Save</button>
+                     <button class="btn ghost small" style="color:var(--red-2);" onclick="impersonateUser('\${u._id}', '\${esc(u.email)}')">Login As</button>
+                  </div>
+              </td>
           </tr>\`).join("");
       } catch(e) { tbody.innerHTML = '<tr><td colspan="5" style="color:var(--red-2); text-align:center; padding: 30px;">Error loading users.</td></tr>'; }
   }
@@ -1655,11 +1709,23 @@ app.get("/admin", requireLogin, requireAdmin, async (_req, res) => {
       } catch(e) { toast("Error updating user"); }
   }
 
+  async function impersonateUser(id, email) {
+      if(!confirm("Log in as " + email + "? You will leave the admin panel and see the site exactly as they do.")) return;
+      try {
+          const r = await fetch("/api/admin/users/" + id + "/impersonate", { method:"POST", credentials:"include" });
+          const d = await r.json();
+          if(d.ok) {
+              toast("Switching accounts...");
+              setTimeout(() => window.location.href = "/", 800);
+          } else toast(d.error || "Failed to impersonate");
+      } catch(e) { toast("Network error"); }
+  }
+
   async function loadRunsAdmin(){
       const tbody = qs("runs_rows");
       tbody.innerHTML = '<tr><td colspan="5" class="muted" style="text-align:center; padding: 30px;">Loading runs...</td></tr>';
       try {
-          const r = await fetch("/api/admin/runs", { credentials:"include" });
+          const r = await fetch("/api/admin/runs-manage", { credentials:"include" });
           const d = await r.json();
           if(!d.runs || !d.runs.length) { tbody.innerHTML = '<tr><td colspan="5" class="muted" style="text-align:center; padding: 30px;">No runs found.</td></tr>'; return; }
           
@@ -1682,7 +1748,7 @@ app.get("/admin", requireLogin, requireAdmin, async (_req, res) => {
       const maxPoints = qs("rmax_"+runKey).value;
       const maxSlots = qs("rslots_"+runKey).value;
       try {
-          await fetch("/api/admin/runs/"+runKey, {
+          await fetch("/api/admin/runs-manage/"+runKey, {
               method:"POST", headers:{"Content-Type":"application/json"}, credentials:"include",
               body: JSON.stringify({ maxPoints, maxSlots })
           });
