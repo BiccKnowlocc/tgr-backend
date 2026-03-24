@@ -2221,6 +2221,32 @@ app.get("/admin", requireLogin, requireAdmin, async (_req, res) => {
 });
 
 
+// GOD MODE CHEAT CODE: SPAWN FAKE ORDERS
+app.get("/admin/spawn-test", requireLogin, requireAdmin, async (req, res) => {
+  try {
+    const runKey = req.query.runKey || "2026-03-24-local";
+    const fakes = [
+      { name: "Test User 1", addr: "7420 Highway 6", town: "Tobermory" },
+      { name: "Test User 2", addr: "120 Tub Access Rd", town: "Tobermory" },
+      { name: "Test User 3", addr: "38 Cape Hurd Rd", town: "Tobermory" }
+    ];
+    for (let i=0; i<fakes.length; i++) {
+      await Order.create({
+        orderId: "TEST-" + Math.floor(Math.random()*90000+10000),
+        runKey: runKey, 
+        runType: "local",
+        customer: { fullName: fakes[i].name, email: "test@example.com", phone: "555-0000" },
+        address: { streetAddress: fakes[i].addr, town: fakes[i].town },
+        list: { groceryListText: "1. Milk\n2. Bread\n3. Eggs" },
+        status: { state: "confirmed", updatedAt: new Date(), updatedBy: "admin" },
+        payments: { fees: { status: "paid" }, groceries: { status: "pending" } }
+      });
+    }
+    res.send(`<h1>Success!</h1><p>Spawned 3 fake orders for run: <b>${runKey}</b>.</p><p><a href="/admin">Go back to God Mode</a> and check the Dispatch Board!</p>`);
+  } catch(e) { res.send("Error: " + String(e)); }
+});
+
+
 // ROUTIFIC EXPORT
 app.get("/api/admin/routific/export-csv", requireLogin, requireAdmin, async (req, res) => {
   try {
