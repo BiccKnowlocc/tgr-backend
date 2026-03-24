@@ -904,14 +904,22 @@ app.get("/api/admin/users", requireLogin, requireAdmin, async (req, res) => {
     res.json({ ok: true, users });
   } catch (e) { res.status(500).json({ ok: false, error: String(e) }); }
 });
-app.post("/api/admin/users/:id/tier", requireLogin, requireAdmin, async (req, res) => {
+app.post("/api/admin/users/:id/update", requireLogin, requireAdmin, async (req, res) => {
   try {
-    const { tier, status } = req.body;
-    await User.findByIdAndUpdate(req.params.id, { $set: { membershipLevel: tier, membershipStatus: status }});
+    const { tier, status, wallet, credOk, credLim, credOwed } = req.body;
+    await User.findByIdAndUpdate(req.params.id, { 
+      $set: { 
+        membershipLevel: tier, 
+        membershipStatus: status,
+        walletBalance: Number(wallet || 0),
+        "creditAccount.approved": String(credOk) === "yes",
+        "creditAccount.limit": Number(credLim || 0),
+        "creditAccount.balanceOwed": Number(credOwed || 0)
+      }
+    });
     res.json({ ok: true });
   } catch (e) { res.status(500).json({ ok: false, error: String(e) }); }
 });
-
 app.get("/api/admin/runs", requireLogin, requireAdmin, async (req, res) => {
   try {
     const runs = await Run.find().sort({ opensAt: -1 }).limit(30).lean();
@@ -1774,49 +1782,79 @@ app.get("/admin", requireLogin, requireAdmin, async (_req, res) => {
   
   async function loadUsersAdmin(){
       const tbody = qs("users_rows");
-      tbody.innerHTML = '<tr><td colspan="5" class="muted" style="text-align:center; padding: 30px;">Loading users...</td></tr>';
+      tbody.innerHTML = '<tr><td colspan="4" class="muted" style="text-align:center; padding: 30px;">Loading users...</td></tr>';
       try {
           const r = await fetch("/api/admin/users", { credentials:"include" });
           const d = await r.json();
-          if(!d.users || !d.users.length) { tbody.innerHTML = '<tr><td colspan="5" class="muted" style="text-align:center; padding: 30px;">No users found.</td></tr>'; return; }
+          if(!d.users || !d.users.length) { tbody.innerHTML = '<tr><td colspan="4" class="muted" style="text-align:center; padding: 30px;">No users found.</td></tr>'; return; }
           
+          qs("users_rows").closest("table").querySelector("thead").innerHTML = '<tr style="background: rgba(255,255,255,.05);"><th>Name / Contact</th><th>Tier & Status</th><th>Bank of TGR</th><th>Actions</th></tr>';
+
           tbody.innerHTML = d.users.map(u => \`<tr>
-              <td><div style="font-weight:900;">\${esc(u.name || "No Name")}</div><div class="muted small">\${esc(u.email)}</div></td>
-              <td>\${esc(u.profile?.phone || "—")}</td>
               <td>
-                  <select id="utier_\${u._id}" style="width:140px; padding:6px;">
+                <div style="font-weight:900;">\${esc(u.name || "No Name")}</div>
+                <div class="muted small">\${esc(u.email)}</div>
+                <div class="muted small">\${esc(u.profile?.phone || "—")}</div>
+              </td>
+              <td>
+                  <select id="utier_\${u._id}" style="width:130px; padding:4px; margin-bottom:6px;">
                       <option value="none" \${u.membershipLevel==='none'?'selected':''}>None</option>
                       <option value="standard" \${u.membershipLevel==='standard'?'selected':''}>Standard</option>
                       <option value="route" \${u.membershipLevel==='route'?'selected':''}>Route</option>
                       <option value="access" \${u.membershipLevel==='access'?'selected':''}>Access</option>
                       <option value="accesspro" \${u.membershipLevel==='accesspro'?'selected':''}>Access Pro</option>
-                  </select>
-              </td>
-              <td>
-                  <select id="ustat_\${u._id}" style="width:100px; padding:6px;">
+                  </select><br>
+                  <select id="ustat_\${u._id}" style="width:130px; padding:4px;">
                       <option value="inactive" \${u.membershipStatus==='inactive'?'selected':''}>Inactive</option>
                       <option value="active" \${u.membershipStatus==='active'?'selected':''}>Active</option>
                   </select>
               </td>
-              <td>
+              <td style="background: rgba(227,52,47,.05); border-left: 1px solid rgba(227,52,47,.2);">
+                  <div class="row" style="margin-bottom:6px;">
+                    <span class="muted small" style="width:60px;">Wallet $</span>
+                    <input type="number" step="0.01" id="uwall_\${u._id}" value="\${u.walletBalance || 0}" style="width:90px; padding:4px; background:rgba(0,0,0,.5);" />
+                  </div>
+                  <div class="row" style="margin-bottom:6px;">
+                    <span class="muted small" style="width:60px;">Credit?</span>
+                    <select id="ucredok_\${u._id}" style="width:90px; padding:4px; background:rgba(0,0,0,.5);">
+                        <option value="no" \${!(u.creditAccount?.approved) ? 'selected' : ''}>Locked</option>
+                        <option value="yes" \${u.creditAccount?.approved ? 'selected' : ''}>Approved</option>
+                    </select>
+                  </div>
+                  <div class="row" style="margin-bottom:6px;">
+                    <span class="muted small" style="width:60px;">Limit $</span>
+                    <input type="number" step="0.01" id="ucredlim_\${u._id}" value="\${u.creditAccount?.limit || 0}" style="width:90px; padding:4px; background:rgba(0,0,0,.5);" />
+                  </div>
                   <div class="row">
-                     <button class="btn secondary small" onclick="updateUser('\${u._id}')">Save</button>
-                     <button class="btn ghost small" style="color:var(--red-2);" onclick="impersonateUser('\${u._id}', '\${esc(u.email)}')">Login As</button>
+                    <span class="muted small" style="width:60px; color:#ff4a44;">Owed $</span>
+                    <input type="number" step="0.01" id="ucredowed_\${u._id}" value="\${u.creditAccount?.balanceOwed || 0}" style="width:90px; padding:4px; border-color:#ff4a44; background:rgba(227,52,47,.1);" />
+                  </div>
+              </td>
+              <td>
+                  <div class="row" style="flex-direction:column; align-items:flex-start;">
+                     <button class="btn secondary small" onclick="updateUser('\${u._id}')" style="width:100%;">Save</button>
+                     <button class="btn ghost small" style="color:var(--red-2); width:100%;" onclick="impersonateUser('\${u._id}', '\${esc(u.email)}')">Login As</button>
                   </div>
               </td>
           </tr>\`).join("");
-      } catch(e) { tbody.innerHTML = '<tr><td colspan="5" style="color:var(--red-2); text-align:center; padding: 30px;">Error loading users.</td></tr>'; }
+      } catch(e) { tbody.innerHTML = '<tr><td colspan="4" style="color:var(--red-2); text-align:center; padding: 30px;">Error loading users.</td></tr>'; }
   }
 
   async function updateUser(id) {
-      const tier = qs("utier_"+id).value;
-      const status = qs("ustat_"+id).value;
       try {
-          await fetch("/api/admin/users/"+id+"/tier", {
+          const payload = {
+              tier: qs("utier_"+id).value,
+              status: qs("ustat_"+id).value,
+              wallet: qs("uwall_"+id).value,
+              credOk: qs("ucredok_"+id).value,
+              credLim: qs("ucredlim_"+id).value,
+              credOwed: qs("ucredowed_"+id).value
+          };
+          await fetch("/api/admin/users/"+id+"/update", {
               method:"POST", headers:{"Content-Type":"application/json"}, credentials:"include",
-              body: JSON.stringify({ tier, status })
+              body: JSON.stringify(payload)
           });
-          toast("User Updated ✅");
+          toast("Customer Profile Saved ✅");
       } catch(e) { toast("Error updating user"); }
   }
 
