@@ -1601,7 +1601,7 @@ app.get("/admin", requireLogin, requireAdmin, async (_req, res) => {
         <div class="k">Run Key</div><div class="v" id="m_run">—</div>
         
         <div class="card" style="border: 1px solid rgba(255,255,255,0.2); background: rgba(0,0,0,0.4); margin-top: 14px; padding: 16px;">
-            <div style="font-weight:1000; margin-bottom:10px; color:var(--white);">✏️ Quick Edit Order</div>
+            <div style="font-weight:1000; margin-bottom:10px; color:var(--white);">✏️ Quick Edit Contact</div>
             <div class="row">
                 <input id="edit_name" placeholder="Customer Name" style="flex:1; padding:8px;" />
                 <input id="edit_phone" placeholder="Phone" style="flex:1; padding:8px;" />
@@ -1610,10 +1610,21 @@ app.get("/admin", requireLogin, requireAdmin, async (_req, res) => {
                 <input id="edit_address" placeholder="Street Address" style="flex:2; padding:8px;" />
                 <input id="edit_town" placeholder="Town" style="flex:1; padding:8px;" />
             </div>
-            <div class="row" style="margin-top:10px;">
-                <textarea id="edit_list" style="min-height: 120px; padding:8px;" placeholder="Grocery List..."></textarea>
+            
+            <div class="hr" style="margin: 16px 0;"></div>
+            
+            <div style="font-weight:1000; margin-bottom:6px; color:var(--white);">🛒 Live Cart Editor</div>
+            <div class="muted small" style="margin-bottom:10px;">Add or remove items on the fly.</div>
+            
+            <div class="row" style="margin-bottom: 10px;">
+                <input id="add_item_input" placeholder="Type new item..." style="flex:1; padding:8px; background:rgba(0,0,0,.5);" />
+                <button class="btn secondary small" id="add_item_btn">Add</button>
             </div>
-            <button class="btn secondary small" id="m_saveEditsBtn" style="margin-top:10px; width:100%;">Save Edits</button>
+            
+            <div id="live_cart_list" style="display:flex; flex-direction:column; gap:6px; max-height:220px; overflow-y:auto; background:rgba(0,0,0,.3); padding:10px; border-radius:8px; border:1px solid rgba(255,255,255,.1);">
+                </div>
+
+            <button class="btn primary small" id="m_saveEditsBtn" style="margin-top:16px; width:100%;">Save All Edits</button>
         </div>
       </div>
       
@@ -1648,7 +1659,7 @@ app.get("/admin", requireLogin, requireAdmin, async (_req, res) => {
     </div>
     <div class="hr"></div>
     <div class="grid">
-      <div class="card" style="box-shadow:none; background: rgba(0,0,0,0.2);"><div style="font-weight:1000; font-size: 16px;">Grocery List</div><div class="hr"></div><pre id="m_list" style="font-family: inherit; font-size: 16px; white-space: pre-wrap; line-height: 1.4;"></pre></div>
+      <div class="card" style="box-shadow:none; background: rgba(0,0,0,0.2);"><div style="font-weight:1000; font-size: 16px;">Original Saved List</div><div class="hr"></div><pre id="m_list" style="font-family: inherit; font-size: 16px; white-space: pre-wrap; line-height: 1.4;"></pre></div>
       <div class="card" style="box-shadow:none; background: rgba(0,0,0,0.2);"><div style="font-weight:1000; font-size: 16px;">Premium Add-ons / Notes</div><div class="hr"></div><pre id="m_addons" style="font-family: inherit; font-size: 16px; white-space: pre-wrap; color: #ffc107; line-height: 1.4;"></pre></div>
     </div>
   </div>
@@ -1712,6 +1723,8 @@ app.get("/admin", requireLogin, requireAdmin, async (_req, res) => {
   }
 
   const rowsEl = qs("rows"); let modalOrder = null;
+  let currentCartItems = []; // Live Cart State
+
   function buildQuery(){ const p = new URLSearchParams(); const q = qs("q").value.trim(); const state = qs("state").value.trim(); const runKey = qs("runKey").value.trim(); if(q) p.set("q", q); if(state) p.set("state", state); if(runKey) p.set("runKey", runKey); p.set("limit","200"); return p.toString(); }
 
   function render(items){
@@ -1729,6 +1742,44 @@ app.get("/admin", requireLogin, requireAdmin, async (_req, res) => {
 
   function openModal(show){ qs("modalBack").style.display = show ? "flex" : "none"; }
 
+  // --- LIVE CART LOGIC ---
+  function renderLiveCart() {
+      const container = qs("live_cart_list");
+      if (currentCartItems.length === 0) {
+          container.innerHTML = '<div class="muted small" style="text-align:center; padding:10px;">Cart is empty.</div>';
+          return;
+      }
+      container.innerHTML = currentCartItems.map((item, index) => \`
+          <div class="row" style="justify-content:space-between; background:rgba(255,255,255,.05); padding:8px 12px; border-radius:6px; border:1px solid rgba(255,255,255,.08);">
+              <div style="font-size:14px; font-weight:bold;">\${esc(item)}</div>
+              <button class="btn ghost small" style="color:var(--red-2); padding:2px 8px; border:none;" onclick="removeCartItem(\${index})">X</button>
+          </div>
+      \`).join("");
+  }
+
+  window.removeCartItem = function(index) {
+      currentCartItems.splice(index, 1);
+      renderLiveCart();
+  };
+
+  qs("add_item_btn").addEventListener("click", () => {
+      const input = qs("add_item_input");
+      const val = input.value.trim();
+      if (val) {
+          currentCartItems.push(val);
+          input.value = "";
+          renderLiveCart();
+          // scroll to bottom
+          const container = qs("live_cart_list");
+          container.scrollTop = container.scrollHeight;
+      }
+  });
+
+  qs("add_item_input").addEventListener("keypress", (e) => {
+      if(e.key === "Enter") qs("add_item_btn").click();
+  });
+  // ------------------------
+
   async function openOrder(orderId){
     try{
       const r = await fetch("/api/admin/orders/" + encodeURIComponent(orderId), { credentials:"include" }); const d = await r.json(); modalOrder = d.order;
@@ -1743,7 +1794,14 @@ app.get("/admin", requireLogin, requireAdmin, async (_req, res) => {
       qs("edit_phone").value = modalOrder.customer?.phone || "";
       qs("edit_address").value = modalOrder.address?.streetAddress || "";
       qs("edit_town").value = modalOrder.address?.town || "";
-      qs("edit_list").value = modalOrder.list?.groceryListText || "";
+      
+      // Init Live Cart
+      const rawListText = modalOrder.list?.groceryListText || "";
+      currentCartItems = rawListText.split(/\\n/).map(i => i.trim()).filter(Boolean);
+      renderLiveCart();
+
+      qs("m_list").textContent = rawListText || "—"; // Keep original as log
+      qs("m_addons").textContent = buildAddonsText(modalOrder);
 
       qs("m_finalGroceryTotal").value = "";
       qs("m_bagsUsed").value = "";
@@ -1753,7 +1811,7 @@ app.get("/admin", requireLogin, requireAdmin, async (_req, res) => {
     } catch(e){ toast(String(e)); }
   }
 
-  // SAVE EDITS
+  // SAVE ALL EDITS (Including Live Cart)
   qs("m_saveEditsBtn").addEventListener("click", async () => {
     if(!modalOrder?.orderId) return;
     qs("m_saveEditsBtn").textContent = "Saving...";
@@ -1763,7 +1821,7 @@ app.get("/admin", requireLogin, requireAdmin, async (_req, res) => {
           phone: qs("edit_phone").value.trim(),
           streetAddress: qs("edit_address").value.trim(),
           town: qs("edit_town").value.trim(),
-          listText: qs("edit_list").value.trim()
+          listText: currentCartItems.join("\\n") // Pack the live cart array back into a string
       };
       const r = await fetch("/api/admin/orders/" + encodeURIComponent(modalOrder.orderId) + "/edit", {
           method: "POST", headers:{"Content-Type":"application/json"}, credentials:"include",
@@ -1773,8 +1831,9 @@ app.get("/admin", requireLogin, requireAdmin, async (_req, res) => {
       if(!d.ok) throw new Error("Failed to edit");
       toast("Order Edits Saved! ✅");
       await search(); // refresh list behind
+      await openOrder(modalOrder.orderId); // refresh modal to show updated 'Original Saved List' log
     } catch(e) { toast("Error saving edits"); }
-    finally { qs("m_saveEditsBtn").textContent = "Save Edits"; }
+    finally { qs("m_saveEditsBtn").textContent = "Save All Edits"; }
   });
 
   qs("m_captureBtn").addEventListener("click", async () => {
@@ -1804,48 +1863,6 @@ app.get("/admin", requireLogin, requireAdmin, async (_req, res) => {
       await openOrder(modalOrder.orderId); await search();
     } catch(e) { toast(String(e.message||e)); }
     finally { qs("m_captureBtn").textContent = "Charge Card & Dispatch"; }
-  });
-
-  // SAVE EDITS
-  qs("m_saveEditsBtn").addEventListener("click", async () => {
-    if(!modalOrder?.orderId) return;
-    qs("m_saveEditsBtn").textContent = "Saving...";
-    try {
-      const payload = {
-          fullName: qs("edit_name").value.trim(),
-          phone: qs("edit_phone").value.trim(),
-          streetAddress: qs("edit_address").value.trim(),
-          town: qs("edit_town").value.trim(),
-          listText: qs("edit_list").value.trim()
-      };
-      const r = await fetch("/api/admin/orders/" + encodeURIComponent(modalOrder.orderId) + "/edit", {
-          method: "POST", headers:{"Content-Type":"application/json"}, credentials:"include",
-          body: JSON.stringify(payload)
-      });
-      const d = await r.json();
-      if(!d.ok) throw new Error("Failed to edit");
-      toast("Order Edits Saved! ✅");
-      await search(); // refresh list behind
-    } catch(e) { toast("Error saving edits"); }
-    finally { qs("m_saveEditsBtn").textContent = "Save Edits"; }
-  });
-
-  qs("m_captureBtn").addEventListener("click", async () => {
-    if(!modalOrder?.orderId) return;
-    const finalGroc = qs("m_finalGroceryTotal").value;
-    const bagsUsed = qs("m_bagsUsed").value || 0;
-    if(!finalGroc) return toast("Enter the exact grocery total from the receipt.");
-    if(!confirm("Charge their saved card and dispatch driver?")) return;
-    try {
-      const r = await fetch("/api/admin/orders/" + encodeURIComponent(modalOrder.orderId) + "/capture", {
-        method: "POST", headers:{ "Content-Type":"application/json" }, credentials: "include",
-        body: JSON.stringify({ finalGroceryTotal: Number(finalGroc), bagsUsed: Number(bagsUsed) })
-      });
-      const d = await r.json();
-      if(!r.ok || d.ok===false) throw new Error(d.error || "Capture failed");
-      toast("Card charged, receipt emailed, & customer texted! ✅");
-      await openOrder(modalOrder.orderId); await search();
-    } catch(e) { toast(String(e.message||e)); }
   });
 
   async function saveStatus(){ if(!modalOrder?.orderId) return; try{ await fetch("/api/admin/orders/" + encodeURIComponent(modalOrder.orderId) + "/status", { method:"POST", headers:{ "Content-Type":"application/json" }, credentials:"include", body: JSON.stringify({ state: qs("m_state").value }) }); toast("Status saved ✅"); await search(); } catch(e){ toast(String(e)); } }
@@ -2063,9 +2080,8 @@ app.get("/admin", requireLogin, requireAdmin, async (_req, res) => {
   
   loadDashboardMetrics();
 </script>
-</body>
-</html>`);
-});
+
+
 // ROUTIFIC EXPORT
 app.get("/api/admin/routific/export-csv", requireLogin, requireAdmin, async (req, res) => {
   try {
