@@ -965,6 +965,11 @@ app.post("/api/admin/orders/:orderId/capture", requireLogin, requireAdmin, async
     const orderId = String(req.params.orderId || "").trim().toUpperCase();
     const finalGroceryTotal = Number(req.body.finalGroceryTotal || 0);
     const bagsUsed = Math.max(0, Number(req.body.bagsUsed || 0));
+    
+    // CUSTOM FEE INJECTOR VARIABLES
+    const customFeeAmount = Math.max(0, Number(req.body.customFeeAmount || 0));
+    const customFeeName = String(req.body.customFeeName || "").trim() || "Custom Administrative Fee";
+
     const order = await Order.findOne({ orderId });
     if (!order) return res.status(404).json({ ok: false, error: "Order not found" });
 
@@ -982,7 +987,12 @@ app.post("/api/admin/orders/:orderId/capture", requireLogin, requireAdmin, async
         }
     }
 
-    const finalCents = Math.round((finalGroceryTotal + bagFee) * 100);
+    let customFeeNote = "";
+    if (customFeeAmount > 0) {
+        customFeeNote = `(+ $${customFeeAmount.toFixed(2)} for ${customFeeName})`;
+    }
+
+    const finalCents = Math.round((finalGroceryTotal + bagFee + customFeeAmount) * 100);
 
     // Declined Card Automation
     if (finalCents > 0 && order.payments.groceries.squareCardId && order.payments.groceries.squareCustomerId) {
@@ -1000,7 +1010,6 @@ app.post("/api/admin/orders/:orderId/capture", requireLogin, requireAdmin, async
            order.payments.groceries.squarePaymentId = payRes.result.payment.id;
        } catch (err) {
            console.error("Square Capture Failed:", err);
-           // Put order in issue status and text customer
            order.status.state = "issue"; 
            order.status.note = "Card on file declined."; 
            order.status.updatedAt = new Date(); order.status.updatedBy = adminBy(req);
@@ -1008,7 +1017,7 @@ app.post("/api/admin/orders/:orderId/capture", requireLogin, requireAdmin, async
            await order.save();
            
            if (order.customer?.phone) {
-               await sendSms(order.customer.phone, `TGR Alert: Your saved card was declined for your $${(finalGroceryTotal + bagFee).toFixed(2)} grocery total. We have paused your delivery. Please contact us immediately to update your payment so we can dispatch your order. - TGR`);
+               await sendSms(order.customer.phone, `TGR Alert: Your saved card was declined for your $${(finalGroceryTotal + bagFee + customFeeAmount).toFixed(2)} grocery total. We have paused your delivery. Please contact us immediately to update your payment so we can dispatch your order. - TGR`);
            }
            return res.status(400).json({ ok: false, error: "Payment declined by Square. The order has been marked as 'Issue' and the customer was texted." });
        }
@@ -1016,7 +1025,7 @@ app.post("/api/admin/orders/:orderId/capture", requireLogin, requireAdmin, async
 
     order.payments.groceries.status = "paid";
     order.payments.groceries.paidAt = new Date();
-    order.payments.groceries.note = "Exact grocery total: $" + finalGroceryTotal.toFixed(2) + " " + bagNote;
+    order.payments.groceries.note = "Exact grocery total: $" + finalGroceryTotal.toFixed(2) + " " + bagNote + " " + customFeeNote;
     order.status.state = "out_for_delivery"; order.status.updatedAt = new Date(); order.status.updatedBy = adminBy(req);
     order.statusHistory.push({ state: "out_for_delivery", note: "Payment finalized, driver dispatched", at: new Date(), by: adminBy(req) });
     await order.save();
@@ -1034,7 +1043,8 @@ app.post("/api/admin/orders/:orderId/capture", requireLogin, requireAdmin, async
                 <table style="width: 100%; border-collapse: collapse; margin-top: 20px;">
                     <tr style="border-bottom: 1px solid #eee;"><td style="padding: 8px 0;"><strong>Exact Grocery Cost:</strong></td><td style="text-align: right;">$${finalGroceryTotal.toFixed(2)}</td></tr>
                     ${bagFee > 0 ? `<tr style="border-bottom: 1px solid #eee;"><td style="padding: 8px 0;"><strong>Premium Paper Bags (${bagsUsed}):</strong></td><td style="text-align: right;">$${bagFee.toFixed(2)}</td></tr>` : ''}
-                    <tr style="background: #f9f9f9; font-weight: bold;"><td style="padding: 8px;">TOTAL BILLED TO SAVED CARD:</td><td style="padding: 8px; text-align: right; color: #e3342f;">$${(finalGroceryTotal + bagFee).toFixed(2)}</td></tr>
+                    ${customFeeAmount > 0 ? `<tr style="border-bottom: 1px solid #eee;"><td style="padding: 8px 0;"><strong>${customFeeName}:</strong></td><td style="text-align: right; color: #ff4a44;">$${customFeeAmount.toFixed(2)}</td></tr>` : ''}
+                    <tr style="background: #f9f9f9; font-weight: bold;"><td style="padding: 8px;">TOTAL BILLED TO SAVED CARD:</td><td style="padding: 8px; text-align: right; color: #e3342f;">$${(finalGroceryTotal + bagFee + customFeeAmount).toFixed(2)}</td></tr>
                 </table>
                 <p style="margin-top: 20px; font-size: 12px; color: #666;">Note: Service and Delivery fees were billed previously when your slot was booked. ${bagNote}</p>
                 <p>Thank you for choosing Tobermory Grocery Run!</p>
@@ -1046,12 +1056,13 @@ app.post("/api/admin/orders/:orderId/capture", requireLogin, requireAdmin, async
     if (phone) {
        const run = await Run.findOne({ runKey: order.runKey }).lean(); let trackingLink = "";
        if (run) trackingLink = `${PUBLIC_SITE_URL}/member?trackRunKey=${encodeURIComponent(run.runKey)}&token=${encodeURIComponent(signTrackingToken(order.orderId, run.runKey, dayjs(run.cutoffAt).add(1, "day").valueOf()))}&orderId=${encodeURIComponent(order.orderId)}`;
-       const smsMessage = `The Patriot is rolling! 🚙💨 ${firstName}, your groceries are packed and your saved card was billed for the exact receipt total ($${finalGroceryTotal.toFixed(2)}${bagNote ? ' ' + bagNote.trim() : ''}). Watch my exact location live right here: ${trackingLink} - TGR`;
+       const smsMessage = `The Patriot is rolling! 🚙💨 ${firstName}, your groceries are packed and your saved card was billed for the exact receipt total ($${(finalGroceryTotal + bagFee + customFeeAmount).toFixed(2)}${bagNote ? ' ' + bagNote.trim() : ''}${customFeeNote ? ' ' + customFeeNote.trim() : ''}). Watch my exact location live right here: ${trackingLink} - TGR`;
        await sendSms(phone, smsMessage);
     }
     res.json({ ok: true });
   } catch(e) { res.status(500).json({ ok: false, error: String(e) }); }
 });
+
 
 // =========================
 // AUTOMATED SMS FUNNEL & STATUS UPDATES
@@ -1612,12 +1623,16 @@ app.get("/admin", requireLogin, requireAdmin, async (_req, res) => {
         
         <div class="card" style="border: 1px solid rgba(227,52,47,.45); background: rgba(227,52,47,.1); margin-top: 14px; padding: 16px;">
           <div class="k" style="color: #ff4a44; font-size: 14px;">Finalize Groceries (Charge Saved Card)</div>
-          <div class="muted" style="font-size:13px; margin-bottom:10px;">Charge exact receipt total and premium bags used.</div>
-          <div class="row">
+          <div class="muted" style="font-size:13px; margin-bottom:10px;">Charge exact receipt, bags used, and any reality taxes.</div>
+          <div class="row" style="margin-bottom: 10px;">
             <input id="m_finalGroceryTotal" type="number" step="0.01" placeholder="Receipt total ($)" style="max-width:150px; background:rgba(0,0,0,.5);" />
             <input id="m_bagsUsed" type="number" min="0" placeholder="Bags used" style="max-width:120px; background:rgba(0,0,0,.5);" />
-            <button class="btn primary" id="m_captureBtn">Charge Card</button>
           </div>
+          <div class="row" style="margin-bottom: 10px;">
+            <input id="m_customFeeName" placeholder="Custom Fee Reason (Optional)" style="flex:2; background:rgba(0,0,0,.5);" />
+            <input id="m_customFeeAmt" type="number" step="0.01" placeholder="Fee Amount ($)" style="flex:1; background:rgba(0,0,0,.5);" />
+          </div>
+          <button class="btn primary" id="m_captureBtn" style="width: 100%;">Charge Card & Dispatch</button>
         </div>
 
         <div class="k" style="margin-top: 20px;">Manual Status Override</div>
@@ -1732,9 +1747,64 @@ app.get("/admin", requireLogin, requireAdmin, async (_req, res) => {
 
       qs("m_finalGroceryTotal").value = "";
       qs("m_bagsUsed").value = "";
+      qs("m_customFeeName").value = "";
+      qs("m_customFeeAmt").value = "";
       openModal(true);
     } catch(e){ toast(String(e)); }
   }
+
+  // SAVE EDITS
+  qs("m_saveEditsBtn").addEventListener("click", async () => {
+    if(!modalOrder?.orderId) return;
+    qs("m_saveEditsBtn").textContent = "Saving...";
+    try {
+      const payload = {
+          fullName: qs("edit_name").value.trim(),
+          phone: qs("edit_phone").value.trim(),
+          streetAddress: qs("edit_address").value.trim(),
+          town: qs("edit_town").value.trim(),
+          listText: qs("edit_list").value.trim()
+      };
+      const r = await fetch("/api/admin/orders/" + encodeURIComponent(modalOrder.orderId) + "/edit", {
+          method: "POST", headers:{"Content-Type":"application/json"}, credentials:"include",
+          body: JSON.stringify(payload)
+      });
+      const d = await r.json();
+      if(!d.ok) throw new Error("Failed to edit");
+      toast("Order Edits Saved! ✅");
+      await search(); // refresh list behind
+    } catch(e) { toast("Error saving edits"); }
+    finally { qs("m_saveEditsBtn").textContent = "Save Edits"; }
+  });
+
+  qs("m_captureBtn").addEventListener("click", async () => {
+    if(!modalOrder?.orderId) return;
+    const finalGroc = qs("m_finalGroceryTotal").value;
+    const bagsUsed = qs("m_bagsUsed").value || 0;
+    const customFeeName = qs("m_customFeeName").value.trim();
+    const customFeeAmt = qs("m_customFeeAmt").value || 0;
+
+    if(!finalGroc) return toast("Enter the exact grocery total from the receipt.");
+    if(!confirm("Charge their saved card and dispatch driver?")) return;
+    
+    qs("m_captureBtn").textContent = "Charging Card...";
+    try {
+      const r = await fetch("/api/admin/orders/" + encodeURIComponent(modalOrder.orderId) + "/capture", {
+        method: "POST", headers:{ "Content-Type":"application/json" }, credentials: "include",
+        body: JSON.stringify({ 
+            finalGroceryTotal: Number(finalGroc), 
+            bagsUsed: Number(bagsUsed),
+            customFeeName: customFeeName,
+            customFeeAmount: Number(customFeeAmt)
+        })
+      });
+      const d = await r.json();
+      if(!r.ok || d.ok===false) throw new Error(d.error || "Capture failed");
+      toast("Card charged, receipt emailed, & customer texted! ✅");
+      await openOrder(modalOrder.orderId); await search();
+    } catch(e) { toast(String(e.message||e)); }
+    finally { qs("m_captureBtn").textContent = "Charge Card & Dispatch"; }
+  });
 
   // SAVE EDITS
   qs("m_saveEditsBtn").addEventListener("click", async () => {
