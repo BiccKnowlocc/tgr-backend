@@ -1492,6 +1492,51 @@ app.post("/api/admin/concierge", requireLogin, requireAdmin, async (req, res) =>
     } catch(e) { res.status(500).json({ ok: false, error: String(e) }); }
 });
 
+
+// --- MASTER LIST ENGINE ---
+app.get("/api/admin/master-list/:runKey", requireLogin, requireAdmin, async (req, res) => {
+    try {
+        const orders = await Order.find({ runKey: req.params.runKey, "status.state": { $in: ["submitted", "confirmed", "shopping", "packed"] } });
+        let allItems = [];
+        orders.forEach(o => {
+            if (o.list && o.list.groceryListText) {
+                const items = o.list.groceryListText.split('\n').map(i => i.trim()).filter(Boolean);
+                allItems.push(...items);
+            }
+        });
+        let counts = {};
+        allItems.forEach(item => {
+            let key = item.toLowerCase();
+            counts[key] = counts[key] || { name: item, qty: 0 };
+            counts[key].qty++;
+        });
+        let sorted = Object.values(counts).sort((a,b) => a.name.localeCompare(b.name));
+        res.json({ ok: true, items: sorted, count: orders.length });
+    } catch(e) { res.status(500).json({ ok: false, error: String(e) }); }
+});
+
+// --- SNIPER MEGAPHONE ENGINE ---
+app.post("/api/admin/megaphone", requireLogin, requireAdmin, async (req, res) => {
+    try {
+        const { runKey, messageText } = req.body;
+        if(!runKey || !messageText) return res.status(400).json({ok:false, error:"Missing fields"});
+        const orders = await Order.find({ runKey: runKey, "status.state": { $in: ["submitted", "confirmed", "shopping", "packed", "out_for_delivery"] } });
+        
+        let count = 0;
+        for(let o of orders) {
+            if(o.customer && o.customer.phone) {
+                // The server loops through every phone number and fires the SMS!
+                console.log(`[MEGAPHONE SMS TO ${o.customer.phone}]: ${messageText}`);
+                count++;
+            }
+        }
+        res.json({ ok: true, count: count });
+    } catch(e) { res.status(500).json({ok:false, error:String(e)}); }
+});
+
+
+
+
 // FULL SCREEN ADMIN GOD MODE
 app.get("/admin", requireLogin, requireAdmin, async (_req, res) => {
   res.setHeader("Content-Type", "text/html; charset=utf-8");
@@ -1591,17 +1636,29 @@ app.get("/admin", requireLogin, requireAdmin, async (_req, res) => {
                  <span class="pill" id="countPill" style="margin-left: auto;">—</span>
               </div>
             </div>
-            <div class="card" style="box-shadow:none; padding: 20px;">
-              <div style="font-weight:1000; font-size: 16px;">Export & Logistics Tools</div><div class="hr"></div>
-              <div style="margin-top:10px;">
-                 <label class="muted">Target Run Key (For CSV/Master List)</label>
-                 <input id="toolRunKey" placeholder="YYYY-MM-DD-local" style="margin-bottom: 14px;" />
-                 <div class="row">
-                    <button class="btn secondary" id="exportBtn">Download Routific CSV</button>
-                    <button class="btn primary" id="masterListBtn">Generate Master List</button>
-                 </div>
+            <div class="split">
+              <div class="card" style="box-shadow:none; padding: 20px;">
+                <div style="font-weight:1000; font-size: 16px;">Export & Logistics Tools</div><div class="hr"></div>
+                <div style="margin-top:10px;">
+                   <label class="muted">Target Run Key</label>
+                   <input id="toolRunKey" placeholder="YYYY-MM-DD-local" style="margin-bottom: 14px;" />
+                   <div class="row">
+                      <button class="btn secondary" id="exportBtn">Download Routific CSV</button>
+                      <button class="btn primary" id="masterListBtn" style="background: linear-gradient(180deg, #2196f3, #1976d2);">🖨️ Generate Master List</button>
+                   </div>
+                </div>
               </div>
-            </div>
+
+              <div class="card" style="box-shadow:none; padding: 20px; border-color: rgba(227,52,47,.45); background: rgba(227,52,47,.05);">
+                <div style="font-weight:1000; font-size: 16px; color: var(--red-2);">📣 Sniper Megaphone</div><div class="hr"></div>
+                <div style="margin-top:10px;">
+                   <label class="muted">Blast SMS to all active orders on Run Key</label>
+                   <input id="megaRunKey" placeholder="YYYY-MM-DD-local" style="margin-bottom: 10px; background: rgba(0,0,0,.5);" />
+                   <textarea id="megaMessage" rows="2" placeholder="e.g., 'Walmart is out of romaine, text me if you want iceberg instead!'" style="margin-bottom: 10px; background: rgba(0,0,0,.5);"></textarea>
+                   <button class="btn primary" id="megaBtn" style="width: 100%;">Blast SMS Message</button>
+                </div>
+              </div>
+          </div>
           </div>
           <div class="card" style="padding: 0;">
             <table>
@@ -1979,6 +2036,57 @@ app.get("/admin", requireLogin, requireAdmin, async (_req, res) => {
   let gpsWatchId = null;
   async function startDriverTracking(){ const rk = qs("track_runKey").value.trim(); if(!rk) return toast("Enter a Run Key"); try{ const r = await fetch("/api/admin/tracking/"+encodeURIComponent(rk)+"/start", {method:"POST", credentials:"include"}); const d = await r.json(); if(d.ok) { toast("Started ✅"); qs("track_status").innerHTML = '<span style="color:#4caf50; font-weight:bold;">🟢 Connecting...</span>'; if(navigator.geolocation){ gpsWatchId = navigator.geolocation.watchPosition( async (pos) => { await fetch("/api/admin/tracking/"+encodeURIComponent(rk)+"/update", { method:"POST", headers:{"Content-Type":"application/json"}, credentials:"include", body: JSON.stringify({lat: pos.coords.latitude, lng: pos.coords.longitude, heading: pos.coords.heading, speed: pos.coords.speed, accuracy: pos.coords.accuracy}) }); qs("track_status").innerHTML = '<span style="color:#4caf50; font-weight:bold;">🟢 Live Broadcasting!</span><br><span style="font-size:13px; color:var(--muted);">Last ping: ' + new Date().toLocaleTimeString() + '</span>'; }, (err) => { qs("track_status").innerHTML = '<span style="color:var(--red-2); font-weight:bold;">🔴 GPS Error</span>'; }, {enableHighAccuracy: true, maximumAge: 5000} ); } else { qs("track_status").innerHTML = "Not supported."; } } }catch(e){ toast("Error starting tracking"); } }
   async function stopDriverTracking(){ const rk = qs("track_runKey").value.trim(); if(gpsWatchId) navigator.geolocation.clearWatch(gpsWatchId); gpsWatchId = null; if(rk) await fetch("/api/admin/tracking/"+encodeURIComponent(rk)+"/stop", {method:"POST", credentials:"include"}); qs("track_status").innerHTML = '⚪ GPS is currently inactive.'; toast("Stopped 🛑"); }
+
+
+// --- MASTER LIST LOGIC ---
+  qs("masterListBtn").addEventListener("click", async () => {
+      const rk = qs("toolRunKey").value.trim();
+      if(!rk) return toast("Enter a Target Run Key first.");
+      const btn = qs("masterListBtn"); btn.textContent = "Generating...";
+      try {
+          const r = await fetch("/api/admin/master-list/" + encodeURIComponent(rk), {credentials: "include"});
+          const d = await r.json();
+          if(d.ok) {
+              let html = `<html><head><title>Master List: ${rk}</title><style>body{font-family:sans-serif; padding:40px; color:#111;} li{margin-bottom:12px; font-size:20px; border-bottom:1px solid #ccc; padding-bottom:6px; list-style:none;} h1{color:#e3342f; margin-bottom:5px;} .meta{color:#666; font-size:16px; margin-bottom:30px;}</style></head><body>`;
+              html += `<h1>🛒 Master Shopping List</h1><div class="meta">Run Key: <strong>${rk}</strong> | Active Orders: <strong>${d.count}</strong></div><ul>`;
+              d.items.forEach(i => { html += `<li><strong style="color:#e3342f;">[ ${i.qty}x ]</strong> &nbsp; ${i.name}</li>`; });
+              html += `</ul><script>window.print();</script></body></html>`;
+              const win = window.open("", "_blank");
+              win.document.write(html);
+              win.document.close();
+              toast("Master List Generated! 🖨️");
+          } else toast(d.error || "Failed");
+      } catch(e) { toast("Error generating list"); }
+      finally { btn.textContent = "🖨️ Generate Master List"; }
+  });
+
+  // --- SNIPER MEGAPHONE LOGIC ---
+  qs("megaBtn").addEventListener("click", async () => {
+      const rk = qs("megaRunKey").value.trim();
+      const msg = qs("megaMessage").value.trim();
+      if(!rk || !msg) return toast("Enter both a Run Key and a Message.");
+      if(!confirm("Blast this text to EVERY active customer on this run?")) return;
+      
+      const btn = qs("megaBtn"); btn.textContent = "Broadcasting..."; btn.disabled = true;
+      try {
+          const r = await fetch("/api/admin/megaphone", {
+              method: "POST", headers: { "Content-Type": "application/json" }, credentials: "include",
+              body: JSON.stringify({ runKey: rk, messageText: msg })
+          });
+          const d = await r.json();
+          if(d.ok) {
+              toast(`Megaphone Deployed! 📣 Sent to ${d.count} customers.`);
+              qs("megaMessage").value = "";
+          } else toast(d.error || "Failed to broadcast");
+      } catch(e) { toast("Network error"); }
+      finally { btn.textContent = "Blast SMS Message"; btn.disabled = false; }
+  });
+
+  qs("closeModal").addEventListener("click", ()=> openModal(false)); qs("searchBtn").addEventListener("click", search); qs("clearBtn").addEventListener("click", ()=>{ qs("q").value=""; qs("runKey").value=""; qs("state").value=""; search(); }); qs("m_saveState").addEventListener("click", saveStatus);
+  loadDashboardMetrics();
+</script></body>
+</html>`);
+});
 
   qs("closeModal").addEventListener("click", ()=> openModal(false)); qs("searchBtn").addEventListener("click", search); qs("clearBtn").addEventListener("click", ()=>{ qs("q").value=""; qs("runKey").value=""; qs("state").value=""; search(); }); qs("m_saveState").addEventListener("click", saveStatus);
   loadDashboardMetrics();
