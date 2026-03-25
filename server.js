@@ -2082,18 +2082,16 @@ app.get("/admin", requireLogin, requireAdmin, async (_req, res) => {
       finally { btn.textContent = "Blast SMS Message"; btn.disabled = false; }
   });
 
-  qs("closeModal").addEventListener("click", ()=> openModal(false)); qs("searchBtn").addEventListener("click", search); qs("clearBtn").addEventListener("click", ()=>{ qs("q").value=""; qs("runKey").value=""; qs("state").value=""; search(); }); qs("m_saveState").addEventListener("click", saveStatus);
+  qs("closeModal").addEventListener("click", ()=> openModal(false)); 
+  qs("searchBtn").addEventListener("click", search); 
+  qs("clearBtn").addEventListener("click", ()=>{ qs("q").value=""; qs("runKey").value=""; qs("state").value=""; search(); }); 
+  qs("m_saveState").addEventListener("click", saveStatus);
+  
   loadDashboardMetrics();
 </script>
 </body>
 </html>`);
 });
-  qs("closeModal").addEventListener("click", ()=> openModal(false)); qs("searchBtn").addEventListener("click", search); qs("clearBtn").addEventListener("click", ()=>{ qs("q").value=""; qs("runKey").value=""; qs("state").value=""; search(); }); qs("m_saveState").addEventListener("click", saveStatus);
-  loadDashboardMetrics();
-</script></body>
-</html>`);
-});
-
 // ROUTIFIC EXPORT
 app.get("/api/admin/routific/export-csv", requireLogin, requireAdmin, async (req, res) => {
   try {
