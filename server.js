@@ -1458,6 +1458,40 @@ app.post("/api/admin/runs-manage/:runKey", requireLogin, requireAdmin, async (re
 
 
 
+// --- CONCIERGE BOOKING SYSTEM ---
+app.post("/api/admin/concierge", requireLogin, requireAdmin, async (req, res) => {
+    try {
+        const { fullName, phone, streetAddress, town, runKey, listText } = req.body;
+        
+        if (!fullName || !streetAddress || !runKey || !listText) {
+            return res.status(400).json({ ok: false, error: "Missing required fields." });
+        }
+
+        const run = await Run.findOne({ runKey: runKey });
+        if (!run) return res.status(400).json({ ok: false, error: "Invalid or inactive Run Key." });
+
+        const orderId = "TGR-" + require("crypto").randomBytes(3).toString("hex").toUpperCase();
+        const placeholderEmail = `concierge-${orderId}@tobermorygroceryrun.ca`;
+
+        const newOrder = new Order({
+            orderId: orderId,
+            runKey: runKey,
+            runType: run.type || "local",
+            customer: { fullName, email: placeholderEmail, phone },
+            address: { streetAddress, town },
+            list: { groceryListText: listText, estimatedTotalPoints: 5 }, 
+            status: { state: "confirmed", updatedAt: new Date(), updatedBy: "admin" },
+            payments: {
+                fees: { status: "waived_or_cash", totalCents: 0 },
+                groceries: { status: "pending" }
+            }
+        });
+        
+        await newOrder.save();
+        res.json({ ok: true, orderId });
+    } catch(e) { res.status(500).json({ ok: false, error: String(e) }); }
+});
+
 // FULL SCREEN ADMIN GOD MODE
 app.get("/admin", requireLogin, requireAdmin, async (_req, res) => {
   res.setHeader("Content-Type", "text/html; charset=utf-8");
@@ -1539,7 +1573,10 @@ app.get("/admin", requireLogin, requireAdmin, async (_req, res) => {
         </div>
 
         <div id="tab_orders" class="tab-pane" style="display:none;">
-          <h2 style="margin-top:0; font-size: 28px;">Order Management</h2>
+          <div class="row" style="justify-content: space-between; margin-bottom: 20px;">
+              <h2 style="margin-top:0; font-size: 28px; margin-bottom:0;">Order Management</h2>
+              <button class="btn primary" onclick="document.getElementById('conciergeModal').style.display='flex'" style="background: linear-gradient(180deg, #4caf50, #388e3c); font-size: 16px;">📞 + New Concierge Order</button>
+          </div>
           <div class="grid">
             <div class="card" style="box-shadow:none; padding: 20px;">
               <div style="font-weight:1000; font-size: 16px;">Search & Filters</div><div class="hr"></div>
@@ -1669,6 +1706,33 @@ app.get("/admin", requireLogin, requireAdmin, async (_req, res) => {
     </div>
 </div>
 
+<div class="modalBack" id="conciergeModal">
+  <div class="modal" style="max-width: 600px;">
+    <div class="row" style="justify-content:space-between;"><div style="font-weight:1000;font-size:22px;">📞 Concierge Booking</div><button class="btn ghost" onclick="document.getElementById('conciergeModal').style.display='none'">Close</button></div>
+    <div class="muted small" style="margin-bottom: 20px;">Manually inject an offline order into the system. Bypasses the credit card checkout. Collect cash/e-transfer at the door.</div>
+    <div class="hr"></div>
+    
+    <div style="display:flex; flex-direction:column; gap:14px;">
+        <input id="c_name" placeholder="Customer Name" style="background:rgba(0,0,0,.5);" />
+        <input id="c_phone" placeholder="Phone Number" style="background:rgba(0,0,0,.5);" />
+        
+        <div class="row" style="gap:10px;">
+            <input id="c_street" placeholder="Street Address (e.g., 123 Main St)" style="flex:2; background:rgba(0,0,0,.5);" />
+            <input id="c_town" placeholder="Town" style="flex:1; background:rgba(0,0,0,.5);" value="Tobermory" />
+        </div>
+        
+        <div class="hr" style="margin: 4px 0;"></div>
+        
+        <input id="c_runKey" placeholder="Target Run Key (e.g., 2026-03-24-local)" style="background:rgba(227,52,47,.1); border-color:rgba(227,52,47,.4);" />
+        
+        <label class="muted small">Grocery List (Type items line by line)</label>
+        <textarea id="c_list" rows="6" placeholder="1. 2L Milk&#10;2. Loaf of bread&#10;3. Eggs" style="background:rgba(0,0,0,.5); font-family:inherit;"></textarea>
+        
+        <button id="c_submitBtn" class="btn primary" onclick="submitConciergeOrder()" style="width:100%; padding: 14px; font-size: 16px; margin-top: 10px;">Inject Order into Database</button>
+    </div>
+  </div>
+</div>
+
 <div class="modalBack" id="modalBack">
   <div class="modal">
     <div class="row" style="justify-content:space-between;"><div style="font-weight:1000;font-size:26px;">Order Details</div><button class="btn ghost" id="closeModal">Close</button></div>
@@ -1765,8 +1829,19 @@ app.get("/admin", requireLogin, requireAdmin, async (_req, res) => {
       if (window.innerWidth <= 900) { document.getElementById('sidebar').classList.remove('show'); }
   }
 
-  function esc(s){ return String(s||"").replaceAll("&","&amp;").replaceAll("<","&lt;").replaceAll(">","&gt;").replaceAll('"',"&quot;"); }
+  function esc(s){ return String(s||"").replaceAll("&","&").replaceAll("<","<").replaceAll(">",">").replaceAll('"',"""); }
   function money(n){ return Number(n||0).toFixed(2); }
+
+
+	function buildAddonsText(o) {
+      let txt = "";
+      if (o.list?.premiumAddons?.length) txt += "Add-ons: " + o.list.premiumAddons.join(", ") + "\n";
+      if (o.address?.deliveryNote) txt += "Delivery Note: " + o.address.deliveryNote + "\n";
+      if (o.list?.substitutions) txt += "Substitutions: " + o.list.substitutions + "\n";
+      return txt.trim() || "No premium add-ons or special notes.";
+  }
+
+
 
   async function loadDashboardMetrics() {
      try {
@@ -2283,6 +2358,46 @@ app.get("/admin", requireLogin, requireAdmin, async (_req, res) => {
       } catch(e) { toast("Error archiving"); }
   }
 
+  // --- CONCIERGE SCRIPT ---
+  async function submitConciergeOrder() {
+      const btn = document.getElementById("c_submitBtn");
+      const payload = {
+          fullName: document.getElementById("c_name").value.trim(),
+          phone: document.getElementById("c_phone").value.trim(),
+          streetAddress: document.getElementById("c_street").value.trim(),
+          town: document.getElementById("c_town").value.trim(),
+          runKey: document.getElementById("c_runKey").value.trim(),
+          listText: document.getElementById("c_list").value.trim()
+      };
+      
+      if(!payload.fullName || !payload.streetAddress || !payload.runKey || !payload.listText) {
+          return toast("Please fill out Name, Address, Run Key, and the Grocery List.");
+      }
+      
+      btn.textContent = "Injecting..."; btn.disabled = true;
+      
+      try {
+          const r = await fetch("/api/admin/concierge", {
+              method: "POST", headers: { "Content-Type": "application/json" }, credentials: "include",
+              body: JSON.stringify(payload)
+          });
+          const d = await r.json();
+          
+          if(d.ok) {
+              toast("Concierge Order Injected! ✅");
+              document.getElementById('conciergeModal').style.display = 'none';
+              document.getElementById("c_name").value = "";
+              document.getElementById("c_phone").value = "";
+              document.getElementById("c_street").value = "";
+              document.getElementById("c_list").value = "";
+              if(typeof search === "function") search();
+          } else {
+              toast(d.error || "Failed to create order");
+          }
+      } catch(e) { toast("Network error"); }
+      finally { btn.textContent = "Inject Order into Database"; btn.disabled = false; }
+  }
+
   let gpsWatchId = null;
   async function startDriverTracking(){
       const rk = qs("track_runKey").value.trim();
@@ -2328,7 +2443,6 @@ app.get("/admin", requireLogin, requireAdmin, async (_req, res) => {
 </body>
 </html>`);
 });
-
 
 // ROUTIFIC EXPORT
 app.get("/api/admin/routific/export-csv", requireLogin, requireAdmin, async (req, res) => {
