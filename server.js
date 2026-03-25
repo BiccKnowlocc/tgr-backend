@@ -1832,16 +1832,13 @@ app.get("/admin", requireLogin, requireAdmin, async (_req, res) => {
   function esc(s){ return String(s||"").replaceAll("&","&amp;").replaceAll("<","&lt;").replaceAll(">","&gt;").replaceAll('"',"&quot;"); }
   function money(n){ return Number(n||0).toFixed(2); }
 
-
-	function buildAddonsText(o) {
+  function buildAddonsText(o) {
       let txt = "";
-      if (o.list?.premiumAddons?.length) txt += "Add-ons: " + o.list.premiumAddons.join(", ") + "\n";
-      if (o.address?.deliveryNote) txt += "Delivery Note: " + o.address.deliveryNote + "\n";
-      if (o.list?.substitutions) txt += "Substitutions: " + o.list.substitutions + "\n";
+      if (o.list?.premiumAddons?.length) txt += "Add-ons: " + o.list.premiumAddons.join(", ") + "\\n";
+      if (o.address?.deliveryNote) txt += "Delivery Note: " + o.address.deliveryNote + "\\n";
+      if (o.list?.substitutions) txt += "Substitutions: " + o.list.substitutions + "\\n";
       return txt.trim() || "No premium add-ons or special notes.";
   }
-
-
 
   async function loadDashboardMetrics() {
      try {
@@ -1849,28 +1846,9 @@ app.get("/admin", requireLogin, requireAdmin, async (_req, res) => {
          const d = await r.json();
          const grid = qs("runMetricsGrid");
          grid.innerHTML = "";
-         
          for (const key in d.runs) {
              const run = d.runs[key];
-             const html = \`<div class="stat-box">
-                <div style="text-transform: uppercase; font-weight: 900; letter-spacing: 1px;">\${run.type} Run</div>
-                <div class="muted small" style="margin-top:4px;">\${run.runKey}</div>
-                <div class="hr"></div>
-                <div class="row" style="justify-content: space-around;">
-                   <div>
-                      <div class="stat-num">\${run.bookedOrdersCount}</div>
-                      <div class="muted small">Orders</div>
-                   </div>
-                   <div>
-                      <div class="stat-num" style="color: \${run.pointsRemaining === 0 ? 'var(--red-2)' : '#4caf50'};">\${run.bookedPoints}/\${run.maxPoints}</div>
-                      <div class="muted small">Points Used</div>
-                   </div>
-                   <div>
-                      <div class="stat-num" style="color: #ffc107;">$\${money(run.bookedFeesTotal)}</div>
-                      <div class="muted small">Fees Collected</div>
-                   </div>
-                </div>
-             </div>\`;
+             const html = \`<div class="stat-box"><div style="text-transform: uppercase; font-weight: 900; letter-spacing: 1px;">\${run.type} Run</div><div class="muted small" style="margin-top:4px;">\${run.runKey}</div><div class="hr"></div><div class="row" style="justify-content: space-around;"><div><div class="stat-num">\${run.bookedOrdersCount}</div><div class="muted small">Orders</div></div><div><div class="stat-num" style="color: \${run.pointsRemaining === 0 ? 'var(--red-2)' : '#4caf50'};">\${run.bookedPoints}/\${run.maxPoints}</div><div class="muted small">Points Used</div></div><div><div class="stat-num" style="color: #ffc107;">$\${money(run.bookedFeesTotal)}</div><div class="muted small">Fees Collected</div></div></div></div>\`;
              grid.insertAdjacentHTML('beforeend', html);
          }
      } catch (e) { qs("runMetricsGrid").innerHTML = "<p>Failed to load metrics.</p>"; }
@@ -1896,41 +1874,15 @@ app.get("/admin", requireLogin, requireAdmin, async (_req, res) => {
 
   function openModal(show){ qs("modalBack").style.display = show ? "flex" : "none"; }
 
-  // --- LIVE CART LOGIC ---
+  // LIVE CART
   function renderLiveCart() {
       const container = qs("live_cart_list");
-      if (currentCartItems.length === 0) {
-          container.innerHTML = '<div class="muted small" style="text-align:center; padding:10px;">Cart is empty.</div>';
-          return;
-      }
-      container.innerHTML = currentCartItems.map((item, index) => \`
-          <div class="row" style="justify-content:space-between; background:rgba(255,255,255,.05); padding:8px 12px; border-radius:6px; border:1px solid rgba(255,255,255,.08);">
-              <div style="font-size:14px; font-weight:bold;">\${esc(item)}</div>
-              <button class="btn ghost small" style="color:var(--red-2); padding:2px 8px; border:none;" onclick="removeCartItem(\${index})">X</button>
-          </div>
-      \`).join("");
+      if (currentCartItems.length === 0) { container.innerHTML = '<div class="muted small" style="text-align:center; padding:10px;">Cart is empty.</div>'; return; }
+      container.innerHTML = currentCartItems.map((item, index) => \`<div class="row" style="justify-content:space-between; background:rgba(255,255,255,.05); padding:8px 12px; border-radius:6px; border:1px solid rgba(255,255,255,.08);"><div style="font-size:14px; font-weight:bold;">\${esc(item)}</div><button class="btn ghost small" style="color:var(--red-2); padding:2px 8px; border:none;" onclick="removeCartItem(\${index})">X</button></div>\`).join("");
   }
-
-  window.removeCartItem = function(index) {
-      currentCartItems.splice(index, 1);
-      renderLiveCart();
-  };
-
-  qs("add_item_btn").addEventListener("click", () => {
-      const input = qs("add_item_input");
-      const val = input.value.trim();
-      if (val) {
-          currentCartItems.push(val);
-          input.value = "";
-          renderLiveCart();
-          const container = qs("live_cart_list");
-          container.scrollTop = container.scrollHeight;
-      }
-  });
-
-  qs("add_item_input").addEventListener("keypress", (e) => {
-      if(e.key === "Enter") qs("add_item_btn").click();
-  });
+  window.removeCartItem = function(index) { currentCartItems.splice(index, 1); renderLiveCart(); };
+  qs("add_item_btn").addEventListener("click", () => { const input = qs("add_item_input"); const val = input.value.trim(); if (val) { currentCartItems.push(val); input.value = ""; renderLiveCart(); qs("live_cart_list").scrollTop = qs("live_cart_list").scrollHeight; } });
+  qs("add_item_input").addEventListener("keypress", (e) => { if(e.key === "Enter") qs("add_item_btn").click(); });
 
   async function openOrder(orderId){
     try{
@@ -1953,494 +1905,84 @@ app.get("/admin", requireLogin, requireAdmin, async (_req, res) => {
       qs("m_list").textContent = rawListText || "—"; 
       qs("m_addons").textContent = buildAddonsText(modalOrder);
 
-      qs("m_finalGroceryTotal").value = "";
-      qs("m_bagsUsed").value = "";
-      qs("m_customFeeName").value = "";
-      qs("m_customFeeAmt").value = "";
+      qs("m_finalGroceryTotal").value = ""; qs("m_bagsUsed").value = ""; qs("m_customFeeName").value = ""; qs("m_customFeeAmt").value = "";
       openModal(true);
     } catch(e){ toast(String(e)); }
   }
 
   qs("m_saveEditsBtn").addEventListener("click", async () => {
-    if(!modalOrder?.orderId) return;
-    qs("m_saveEditsBtn").textContent = "Saving...";
+    if(!modalOrder?.orderId) return; qs("m_saveEditsBtn").textContent = "Saving...";
     try {
-      const payload = {
-          fullName: qs("edit_name").value.trim(),
-          phone: qs("edit_phone").value.trim(),
-          streetAddress: qs("edit_address").value.trim(),
-          town: qs("edit_town").value.trim(),
-          listText: currentCartItems.join("\\n") 
-      };
-      const r = await fetch("/api/admin/orders/" + encodeURIComponent(modalOrder.orderId) + "/edit", {
-          method: "POST", headers:{"Content-Type":"application/json"}, credentials:"include",
-          body: JSON.stringify(payload)
-      });
+      const payload = { fullName: qs("edit_name").value.trim(), phone: qs("edit_phone").value.trim(), streetAddress: qs("edit_address").value.trim(), town: qs("edit_town").value.trim(), listText: currentCartItems.join("\\n") };
+      const r = await fetch("/api/admin/orders/" + encodeURIComponent(modalOrder.orderId) + "/edit", { method: "POST", headers:{"Content-Type":"application/json"}, credentials:"include", body: JSON.stringify(payload) });
       const d = await r.json();
       if(!d.ok) throw new Error("Failed to edit");
-      toast("Order Edits Saved! ✅");
-      await search(); 
-      await openOrder(modalOrder.orderId); 
-    } catch(e) { toast("Error saving edits"); }
-    finally { qs("m_saveEditsBtn").textContent = "Save All Edits"; }
+      toast("Order Edits Saved! ✅"); await search(); await openOrder(modalOrder.orderId); 
+    } catch(e) { toast("Error saving edits"); } finally { qs("m_saveEditsBtn").textContent = "Save All Edits"; }
   });
 
   qs("m_captureBtn").addEventListener("click", async () => {
     if(!modalOrder?.orderId) return;
-    const finalGroc = qs("m_finalGroceryTotal").value;
-    const bagsUsed = qs("m_bagsUsed").value || 0;
-    const customFeeName = qs("m_customFeeName").value.trim();
-    const customFeeAmt = qs("m_customFeeAmt").value || 0;
-
+    const finalGroc = qs("m_finalGroceryTotal").value; const bagsUsed = qs("m_bagsUsed").value || 0; const customFeeName = qs("m_customFeeName").value.trim(); const customFeeAmt = qs("m_customFeeAmt").value || 0;
     if(!finalGroc) return toast("Enter the exact grocery total from the receipt.");
     if(!confirm("Charge their saved card and dispatch driver?")) return;
-    
     qs("m_captureBtn").textContent = "Charging Card...";
     try {
-      const r = await fetch("/api/admin/orders/" + encodeURIComponent(modalOrder.orderId) + "/capture", {
-        method: "POST", headers:{ "Content-Type":"application/json" }, credentials: "include",
-        body: JSON.stringify({ 
-            finalGroceryTotal: Number(finalGroc), 
-            bagsUsed: Number(bagsUsed),
-            customFeeName: customFeeName,
-            customFeeAmount: Number(customFeeAmt)
-        })
-      });
+      const r = await fetch("/api/admin/orders/" + encodeURIComponent(modalOrder.orderId) + "/capture", { method: "POST", headers:{ "Content-Type":"application/json" }, credentials: "include", body: JSON.stringify({ finalGroceryTotal: Number(finalGroc), bagsUsed: Number(bagsUsed), customFeeName: customFeeName, customFeeAmount: Number(customFeeAmt) }) });
       const d = await r.json();
       if(!r.ok || d.ok===false) throw new Error(d.error || "Capture failed");
-      toast("Card charged, receipt emailed, & customer texted! ✅");
-      await openOrder(modalOrder.orderId); await search();
-    } catch(e) { toast(String(e.message||e)); }
-    finally { qs("m_captureBtn").textContent = "Charge Card & Dispatch"; }
+      toast("Card charged, receipt emailed, & customer texted! ✅"); await openOrder(modalOrder.orderId); await search();
+    } catch(e) { toast(String(e.message||e)); } finally { qs("m_captureBtn").textContent = "Charge Card & Dispatch"; }
   });
 
   async function saveStatus(){ if(!modalOrder?.orderId) return; try{ await fetch("/api/admin/orders/" + encodeURIComponent(modalOrder.orderId) + "/status", { method:"POST", headers:{ "Content-Type":"application/json" }, credentials:"include", body: JSON.stringify({ state: qs("m_state").value }) }); toast("Status saved ✅"); await search(); } catch(e){ toast(String(e)); } }
   
+  // USERS
   async function loadUsersAdmin(){
-      const tbody = qs("users_rows");
-      tbody.innerHTML = '<tr><td colspan="4" class="muted" style="text-align:center; padding: 30px;">Loading users...</td></tr>';
+      const tbody = qs("users_rows"); tbody.innerHTML = '<tr><td colspan="4" class="muted" style="text-align:center; padding: 30px;">Loading users...</td></tr>';
       try {
-          const r = await fetch("/api/admin/users", { credentials:"include" });
-          const d = await r.json();
+          const r = await fetch("/api/admin/users", { credentials:"include" }); const d = await r.json();
           if(!d.users || !d.users.length) { tbody.innerHTML = '<tr><td colspan="4" class="muted" style="text-align:center; padding: 30px;">No users found.</td></tr>'; return; }
-          
           qs("users_rows").closest("table").querySelector("thead").innerHTML = '<tr style="background: rgba(255,255,255,.05);"><th>Name / Contact</th><th>Tier & Status</th><th>Bank of TGR</th><th>Actions</th></tr>';
-
-          tbody.innerHTML = d.users.map(u => \`<tr>
-              <td>
-                <div style="font-weight:900;">\${esc(u.name || "No Name")}</div>
-                <div class="muted small">\${esc(u.email)}</div>
-                <div class="muted small">\${esc(u.profile?.phone || "—")}</div>
-              </td>
-              <td>
-                  <select id="utier_\${u._id}" style="width:130px; padding:4px; margin-bottom:6px;">
-                      <option value="none" \${u.membershipLevel==='none'?'selected':''}>None</option>
-                      <option value="standard" \${u.membershipLevel==='standard'?'selected':''}>Standard</option>
-                      <option value="route" \${u.membershipLevel==='route'?'selected':''}>Route</option>
-                      <option value="access" \${u.membershipLevel==='access'?'selected':''}>Access</option>
-                      <option value="accesspro" \${u.membershipLevel==='accesspro'?'selected':''}>Access Pro</option>
-                  </select><br>
-                  <select id="ustat_\${u._id}" style="width:130px; padding:4px;">
-                      <option value="inactive" \${u.membershipStatus==='inactive'?'selected':''}>Inactive</option>
-                      <option value="active" \${u.membershipStatus==='active'?'selected':''}>Active</option>
-                  </select>
-              </td>
-              <td style="background: rgba(227,52,47,.05); border-left: 1px solid rgba(227,52,47,.2);">
-                  <div class="row" style="margin-bottom:6px;">
-                    <span class="muted small" style="width:60px;">Wallet $</span>
-                    <input type="number" step="0.01" id="uwall_\${u._id}" value="\${u.walletBalance || 0}" style="width:90px; padding:4px; background:rgba(0,0,0,.5);" />
-                  </div>
-                  <div class="row" style="margin-bottom:6px;">
-                    <span class="muted small" style="width:60px;">Credit?</span>
-                    <select id="ucredok_\${u._id}" style="width:90px; padding:4px; background:rgba(0,0,0,.5);">
-                        <option value="no" \${!(u.creditAccount?.approved) ? 'selected' : ''}>Locked</option>
-                        <option value="yes" \${u.creditAccount?.approved ? 'selected' : ''}>Approved</option>
-                    </select>
-                  </div>
-                  <div class="row" style="margin-bottom:6px;">
-                    <span class="muted small" style="width:60px;">Limit $</span>
-                    <input type="number" step="0.01" id="ucredlim_\${u._id}" value="\${u.creditAccount?.limit || 0}" style="width:90px; padding:4px; background:rgba(0,0,0,.5);" />
-                  </div>
-                  <div class="row">
-                    <span class="muted small" style="width:60px; color:#ff4a44;">Owed $</span>
-                    <input type="number" step="0.01" id="ucredowed_\${u._id}" value="\${u.creditAccount?.balanceOwed || 0}" style="width:90px; padding:4px; border-color:#ff4a44; background:rgba(227,52,47,.1);" />
-                  </div>
-              </td>
-              <td>
-                  <div class="row" style="flex-direction:column; align-items:flex-start;">
-                     <button class="btn secondary small" onclick="updateUser('\${u._id}')" style="width:100%;">Save</button>
-                     <button class="btn ghost small" style="color:var(--red-2); width:100%;" onclick="impersonateUser('\${u._id}', '\${esc(u.email)}')">Login As</button>
-                  </div>
-              </td>
-          </tr>\`).join("");
+          tbody.innerHTML = d.users.map(u => \`<tr><td><div style="font-weight:900;">\${esc(u.name || "No Name")}</div><div class="muted small">\${esc(u.email)}</div><div class="muted small">\${esc(u.profile?.phone || "—")}</div></td><td><select id="utier_\${u._id}" style="width:130px; padding:4px; margin-bottom:6px;"><option value="none" \${u.membershipLevel==='none'?'selected':''}>None</option><option value="standard" \${u.membershipLevel==='standard'?'selected':''}>Standard</option><option value="route" \${u.membershipLevel==='route'?'selected':''}>Route</option><option value="access" \${u.membershipLevel==='access'?'selected':''}>Access</option><option value="accesspro" \${u.membershipLevel==='accesspro'?'selected':''}>Access Pro</option></select><br><select id="ustat_\${u._id}" style="width:130px; padding:4px;"><option value="inactive" \${u.membershipStatus==='inactive'?'selected':''}>Inactive</option><option value="active" \${u.membershipStatus==='active'?'selected':''}>Active</option></select></td><td style="background: rgba(227,52,47,.05); border-left: 1px solid rgba(227,52,47,.2);"><div class="row" style="margin-bottom:6px;"><span class="muted small" style="width:60px;">Wallet $</span><input type="number" step="0.01" id="uwall_\${u._id}" value="\${u.walletBalance || 0}" style="width:90px; padding:4px; background:rgba(0,0,0,.5);" /></div><div class="row" style="margin-bottom:6px;"><span class="muted small" style="width:60px;">Credit?</span><select id="ucredok_\${u._id}" style="width:90px; padding:4px; background:rgba(0,0,0,.5);"><option value="no" \${!(u.creditAccount?.approved) ? 'selected' : ''}>Locked</option><option value="yes" \${u.creditAccount?.approved ? 'selected' : ''}>Approved</option></select></div><div class="row" style="margin-bottom:6px;"><span class="muted small" style="width:60px;">Limit $</span><input type="number" step="0.01" id="ucredlim_\${u._id}" value="\${u.creditAccount?.limit || 0}" style="width:90px; padding:4px; background:rgba(0,0,0,.5);" /></div><div class="row"><span class="muted small" style="width:60px; color:#ff4a44;">Owed $</span><input type="number" step="0.01" id="ucredowed_\${u._id}" value="\${u.creditAccount?.balanceOwed || 0}" style="width:90px; padding:4px; border-color:#ff4a44; background:rgba(227,52,47,.1);" /></div></td><td><div class="row" style="flex-direction:column; align-items:flex-start;"><button class="btn secondary small" onclick="updateUser('\${u._id}')" style="width:100%;">Save</button><button class="btn ghost small" style="color:var(--red-2); width:100%;" onclick="impersonateUser('\${u._id}', '\${esc(u.email)}')">Login As</button></div></td></tr>\`).join("");
       } catch(e) { tbody.innerHTML = '<tr><td colspan="4" style="color:var(--red-2); text-align:center; padding: 30px;">Error loading users.</td></tr>'; }
   }
 
-  async function updateUser(id) {
-      try {
-          const payload = {
-              tier: qs("utier_"+id).value,
-              status: qs("ustat_"+id).value,
-              wallet: qs("uwall_"+id).value,
-              credOk: qs("ucredok_"+id).value,
-              credLim: qs("ucredlim_"+id).value,
-              credOwed: qs("ucredowed_"+id).value
-          };
-          await fetch("/api/admin/users/"+id+"/update", {
-              method:"POST", headers:{"Content-Type":"application/json"}, credentials:"include",
-              body: JSON.stringify(payload)
-          });
-          toast("Customer Profile Saved ✅");
-      } catch(e) { toast("Error updating user"); }
-  }
+  async function updateUser(id) { try { const payload = { tier: qs("utier_"+id).value, status: qs("ustat_"+id).value, wallet: qs("uwall_"+id).value, credOk: qs("ucredok_"+id).value, credLim: qs("ucredlim_"+id).value, credOwed: qs("ucredowed_"+id).value }; await fetch("/api/admin/users/"+id+"/update", { method:"POST", headers:{"Content-Type":"application/json"}, credentials:"include", body: JSON.stringify(payload) }); toast("Customer Profile Saved ✅"); } catch(e) { toast("Error updating user"); } }
+  async function impersonateUser(id, email) { if(!confirm("Log in as " + email + "?")) return; try { const r = await fetch("/api/admin/users/" + id + "/impersonate", { method:"POST", credentials:"include" }); const d = await r.json(); if(d.ok) { toast("Switching accounts..."); setTimeout(() => window.location.href = "/", 800); } else toast(d.error || "Failed"); } catch(e) { toast("Network error"); } }
 
-  async function impersonateUser(id, email) {
-      if(!confirm("Log in as " + email + "? You will leave the admin panel and see the site exactly as they do.")) return;
-      try {
-          const r = await fetch("/api/admin/users/" + id + "/impersonate", { method:"POST", credentials:"include" });
-          const d = await r.json();
-          if(d.ok) {
-              toast("Switching accounts...");
-              setTimeout(() => window.location.href = "/", 800);
-          } else toast(d.error || "Failed to impersonate");
-      } catch(e) { toast("Network error"); }
-  }
+  // RUNS & CATALOGUE
+  async function loadRunsAdmin(){ const tbody = qs("runs_rows"); tbody.innerHTML = '<tr><td colspan="5" class="muted" style="text-align:center; padding: 30px;">Loading runs...</td></tr>'; try { const r = await fetch("/api/admin/runs-manage", { credentials:"include" }); const d = await r.json(); if(!d.runs || !d.runs.length) { tbody.innerHTML = '<tr><td colspan="5" class="muted" style="text-align:center; padding: 30px;">No runs found.</td></tr>'; return; } tbody.innerHTML = d.runs.map(r => \`<tr><td><div style="font-weight:900;">\${esc(r.runKey)}</div></td><td><span class="pill">\${esc(r.type)}</span></td><td class="muted">\${new Date(r.cutoffAt).toLocaleString()}</td><td><div class="row"><span class="muted small">Max Pts:</span> <input type="number" id="rmax_\${r.runKey}" value="\${r.maxPoints}" style="width:80px; padding:6px;" /><span class="muted small">Slots:</span> <input type="number" id="rslots_\${r.runKey}" value="\${r.maxSlots}" style="width:80px; padding:6px;" /></div></td><td><button class="btn secondary small" onclick="updateRun('\${r.runKey}')">Override</button></td></tr>\`).join(""); } catch(e) { tbody.innerHTML = '<tr><td colspan="5" style="color:var(--red-2); text-align:center; padding: 30px;">Error loading runs.</td></tr>'; } }
+  async function updateRun(runKey) { const maxPoints = qs("rmax_"+runKey).value; const maxSlots = qs("rslots_"+runKey).value; try { await fetch("/api/admin/runs-manage/"+runKey, { method:"POST", headers:{"Content-Type":"application/json"}, credentials:"include", body: JSON.stringify({ maxPoints, maxSlots }) }); toast("Capacity Updated ✅"); } catch(e) { toast("Error updating run"); } }
+  async function loadCatalogue(){ qs("cat_rows").innerHTML = '<tr><td colspan="4" class="muted" style="text-align:center; padding: 30px;">Loading database...</td></tr>'; try{ const r = await fetch("/api/admin/catalogue", {credentials:"include"}); const d = await r.json(); if(!d.items || !d.items.length){ qs("cat_rows").innerHTML = '<tr><td colspan="4" class="muted" style="text-align:center; padding: 30px;">Catalogue is empty.</td></tr>'; return; } qs("cat_rows").innerHTML = d.items.map(i=> \`<tr><td><div style="font-weight:900; font-size:15px;">\${esc(i.name)}</div></td><td><span class="pill">\${esc(i.category)}</span></td><td><input type="number" step="0.01" value="\${i.estimatedPrice}" id="price_\${i._id}" style="max-width:120px; padding:10px; font-size:15px;"/></td><td><button class="btn secondary small" onclick="updateCatPrice('\${i._id}', '\${esc(i.name)}', '\${esc(i.category)}')">Save</button> <button class="btn ghost small" onclick="deleteCat('\${i._id}')" style="color:var(--red-2);">Delete</button></td></tr>\`).join(""); }catch(e){ qs("cat_rows").innerHTML = '<tr><td colspan="4" style="color:var(--red-2); text-align:center; padding: 30px;">Error loading.</td></tr>'; } }
+  async function addCatItem() { const name = qs("newCatName").value.trim(); const cat = qs("newCatCat").value.trim(); const price = qs("newCatPrice").value || 0; if(!name) return toast("Name is required"); try { const r = await fetch("/api/admin/catalogue", { method: "POST", headers: { "Content-Type": "application/json" }, credentials: "include", body: JSON.stringify({ name, category: cat, estimatedPrice: Number(price) }) }); const d = await r.json(); if(d.ok) { toast("Item added! ✅"); qs("newCatName").value = ""; qs("newCatCat").value = ""; qs("newCatPrice").value = ""; loadCatalogue(); } else toast(d.error); } catch(e) { toast("Network error"); } }
+  async function updateCatPrice(id, name, cat){ const price = document.getElementById('price_'+id).value; try { await fetch("/api/admin/catalogue", { method: "POST", headers: { "Content-Type": "application/json" }, credentials: "include", body: JSON.stringify({ name, category: cat, estimatedPrice: Number(price) }) }); toast("Price updated! ✅"); } catch(e) { toast("Error updating price"); } }
+  async function deleteCat(id){ if(!confirm("Permanently delete this item?")) return; await fetch("/api/admin/catalogue/"+id, {method:"DELETE", credentials:"include"}); toast("Item deleted 🗑️"); loadCatalogue(); }
 
-  async function loadRunsAdmin(){
-      const tbody = qs("runs_rows");
-      tbody.innerHTML = '<tr><td colspan="5" class="muted" style="text-align:center; padding: 30px;">Loading runs...</td></tr>';
-      try {
-          const r = await fetch("/api/admin/runs-manage", { credentials:"include" });
-          const d = await r.json();
-          if(!d.runs || !d.runs.length) { tbody.innerHTML = '<tr><td colspan="5" class="muted" style="text-align:center; padding: 30px;">No runs found.</td></tr>'; return; }
-          
-          tbody.innerHTML = d.runs.map(r => \`<tr>
-              <td><div style="font-weight:900;">\${esc(r.runKey)}</div></td>
-              <td><span class="pill">\${esc(r.type)}</span></td>
-              <td class="muted">\${new Date(r.cutoffAt).toLocaleString()}</td>
-              <td>
-                  <div class="row">
-                     <span class="muted small">Max Pts:</span> <input type="number" id="rmax_\${r.runKey}" value="\${r.maxPoints}" style="width:80px; padding:6px;" />
-                     <span class="muted small">Slots:</span> <input type="number" id="rslots_\${r.runKey}" value="\${r.maxSlots}" style="width:80px; padding:6px;" />
-                  </div>
-              </td>
-              <td><button class="btn secondary small" onclick="updateRun('\${r.runKey}')">Override</button></td>
-          </tr>\`).join("");
-      } catch(e) { tbody.innerHTML = '<tr><td colspan="5" style="color:var(--red-2); text-align:center; padding: 30px;">Error loading runs.</td></tr>'; }
-  }
+  // DISPATCH BOARD
+  let dispatchMap = null; let dispatchMarkers = []; let dispatchOrders = []; const geoCache = {};
+  async function ensureMapboxAdmin() { if (window.mapboxgl) return; const css = document.createElement("link"); css.rel = "stylesheet"; css.href = "https://api.mapbox.com/mapbox-gl-js/v2.15.0/mapbox-gl.css"; document.head.appendChild(css); const s = document.createElement("script"); s.src = "https://api.mapbox.com/mapbox-gl-js/v2.15.0/mapbox-gl.js"; await new Promise((res) => { s.onload = res; document.head.appendChild(s); }); }
+  async function loadDispatchOrders() { const rk = qs("dispatch_runKey").value.trim(); if(!rk) return toast("Enter a run key first."); qs("dispatch_list").innerHTML = '<div class="muted" style="text-align:center; padding:20px;">Loading route data...</div>'; try { const r = await fetch("/api/admin/orders?limit=100&runKey=" + encodeURIComponent(rk), {credentials:"include"}); const d = await r.json(); dispatchOrders = d.items.filter(o => ["submitted", "confirmed", "shopping", "packed", "out_for_delivery"].includes(o.status.state)); if(dispatchOrders.length === 0) { qs("dispatch_list").innerHTML = '<div class="muted small" style="text-align:center; padding:20px;">No active orders found for this run.</div>'; return; } renderDispatchList(); await updateDispatchMap(); toast("Route loaded! Drag to sort."); } catch(e) { toast("Failed to load orders."); } }
+  function renderDispatchList() { const container = qs("dispatch_list"); container.innerHTML = dispatchOrders.map((o, index) => \`<div class="card" draggable="true" ondragstart="dragStart(event, \${index})" ondragover="dragOver(event)" ondrop="drop(event, \${index})" style="cursor:grab; padding:12px; margin-bottom:0; background:rgba(255,255,255,.05); border:1px solid rgba(255,255,255,.2); transition: transform 0.1s;"><div style="font-weight:900; color:var(--white); display:flex; align-items:center; gap:10px;"><div style="background:var(--red); color:#fff; width:24px; height:24px; border-radius:50%; display:flex; align-items:center; justify-content:center; font-size:12px;">\${index + 1}</div>\${esc(o.customer.fullName)}</div><div class="muted small" style="margin-top:6px; padding-left: 34px;">\${esc(o.address.streetAddress)}, \${esc(o.address.town)}</div></div>\`).join(""); }
+  let draggedIndex = null; window.dragStart = function(e, index) { draggedIndex = index; e.dataTransfer.effectAllowed = "move"; }; window.dragOver = function(e) { e.preventDefault(); e.dataTransfer.dropEffect = "move"; }; window.drop = async function(e, targetIndex) { e.preventDefault(); if(draggedIndex === null || draggedIndex === targetIndex) return; const item = dispatchOrders.splice(draggedIndex, 1)[0]; dispatchOrders.splice(targetIndex, 0, item); renderDispatchList(); await updateDispatchMap(); };
+  async function updateDispatchMap() { await ensureMapboxAdmin(); const conf = await fetch("/api/public/config").then(r=>r.json()); mapboxgl.accessToken = conf.mapboxPublicToken; if(!dispatchMap) { dispatchMap = new mapboxgl.Map({ container: 'dispatch_map', style: 'mapbox://styles/mapbox/dark-v11', center: [-81.3, 44.8], zoom: 8 }); } dispatchMarkers.forEach(m => m.remove()); dispatchMarkers = []; const bounds = new mapboxgl.LngLatBounds(); let hasBounds = false; for(let i=0; i<dispatchOrders.length; i++) { const o = dispatchOrders[i]; const query = \`\${o.address.streetAddress}, \${o.address.town}, ON, Canada\`; if (!geoCache[o.orderId]) { const geo = await fetch(\`https://api.mapbox.com/geocoding/v5/mapbox.places/\${encodeURIComponent(query)}.json?access_token=\${mapboxgl.accessToken}\`).then(r=>r.json()); if(geo.features && geo.features.length > 0) { geoCache[o.orderId] = geo.features[0].center; } } if (geoCache[o.orderId]) { const [lng, lat] = geoCache[o.orderId]; const el = document.createElement('div'); el.style.backgroundColor = '#e3342f'; el.style.color = '#fff'; el.style.width = '24px'; el.style.height = '24px'; el.style.borderRadius = '50%'; el.style.display = 'flex'; el.style.alignItems = 'center'; el.style.justifyContent = 'center'; el.style.fontWeight = 'bold'; el.innerText = i + 1; el.style.boxShadow = '0 0 10px rgba(0,0,0,0.5)'; const marker = new mapboxgl.Marker(el).setLngLat([lng, lat]).addTo(dispatchMap); dispatchMarkers.push(marker); bounds.extend([lng, lat]); hasBounds = true; } } if(hasBounds) dispatchMap.fitBounds(bounds, { padding: 40 }); }
+  window.sendToGoogleMaps = function() { if(dispatchOrders.length === 0) return toast("No orders to route!"); if(dispatchOrders.length > 10) return toast("Google Maps max limit is 10 stops. Please split your route."); const addresses = dispatchOrders.map(o => \`\${o.address.streetAddress}, \${o.address.town}, ON\`); const dest = addresses.pop(); const waypoints = addresses.join('|'); let url = \`https://www.google.com/maps/dir/?api=1&destination=\${encodeURIComponent(dest)}\`; if(waypoints) url += \`&waypoints=\${encodeURIComponent(waypoints)}\`; window.open(url, '_blank'); };
 
-  async function updateRun(runKey) {
-      const maxPoints = qs("rmax_"+runKey).value;
-      const maxSlots = qs("rslots_"+runKey).value;
-      try {
-          await fetch("/api/admin/runs-manage/"+runKey, {
-              method:"POST", headers:{"Content-Type":"application/json"}, credentials:"include",
-              body: JSON.stringify({ maxPoints, maxSlots })
-          });
-          toast("Capacity Updated ✅");
-      } catch(e) { toast("Error updating run"); }
-  }
+  // FEEDBACK
+  async function loadFeedbackAdmin() { const container = qs("feedback_list"); container.innerHTML = '<div class="muted" style="text-align:center; padding: 30px;">Loading inbox...</div>'; try { const r = await fetch("/api/admin/feedback", {credentials:"include"}); const d = await r.json(); if(!d.items || d.items.length === 0) { container.innerHTML = '<div class="card" style="text-align:center; padding:40px; color:var(--muted); font-size: 18px;">No new messages. Inbox Zero! 🎉</div>'; return; } container.innerHTML = d.items.map(f => \`<div class="card" style="box-shadow:none; background: rgba(255,255,255,.05); border-left: 4px solid var(--red-2);"><div class="row" style="justify-content:space-between; margin-bottom:10px;"><div><span class="pill">\${esc(f.type)}</span><span style="font-weight:bold; margin-left:10px; color:white;">\${esc(f.name)}</span><span class="muted small" style="margin-left:10px;">\${esc(f.email)} • \${esc(f.phone || 'No phone')}</span></div><div class="muted small">\${new Date(f.createdAt).toLocaleString()}</div></div><div style="background: rgba(0,0,0,.3); padding: 14px; border-radius: 8px; margin-bottom: 14px; white-space: pre-wrap; font-size: 15px;">\${esc(f.message)}</div><div class="row"><textarea id="reply_\${f._id}" placeholder="Type your reply to \${esc(f.name)}..." style="flex:1; padding:10px; border-radius:8px; min-height:40px; background:rgba(0,0,0,.5); color:white; border:1px solid rgba(255,255,255,.2); font-family:inherit;"></textarea><button class="btn primary" onclick="sendFeedbackReply('\${f._id}')">Send Reply & Archive</button><button class="btn ghost small" style="color:var(--muted);" onclick="dismissFeedback('\${f._id}')">Dismiss</button></div></div>\`).join(""); } catch(e) { container.innerHTML = '<div style="color:var(--red-2); padding: 20px;">Error loading inbox.</div>'; } }
+  async function sendFeedbackReply(id) { const text = qs("reply_"+id).value.trim(); if(!text) return toast("Type a reply first."); if(!confirm("Send this email?")) return; try { await fetch("/api/admin/feedback/"+id+"/reply", { method:"POST", headers:{"Content-Type":"application/json"}, credentials:"include", body: JSON.stringify({ replyText: text }) }); toast("Reply sent! 📧"); loadFeedbackAdmin(); } catch(e) { toast("Error sending reply"); } }
+  async function dismissFeedback(id) { if(!confirm("Archive this message?")) return; try { await fetch("/api/admin/feedback/"+id, { method:"DELETE", credentials:"include" }); toast("Message archived 🗑️"); loadFeedbackAdmin(); } catch(e) { toast("Error archiving"); } }
 
-  async function loadCatalogue(){
-      qs("cat_rows").innerHTML = '<tr><td colspan="4" class="muted" style="text-align:center; padding: 30px;">Loading database...</td></tr>';
-      try{
-        const r = await fetch("/api/admin/catalogue", {credentials:"include"});
-        const d = await r.json();
-        if(!d.items || !d.items.length){ qs("cat_rows").innerHTML = '<tr><td colspan="4" class="muted" style="text-align:center; padding: 30px;">Catalogue is empty.</td></tr>'; return; }
-        qs("cat_rows").innerHTML = d.items.map(i=> \`<tr><td><div style="font-weight:900; font-size:15px;">\${esc(i.name)}</div></td><td><span class="pill">\${esc(i.category)}</span></td><td><input type="number" step="0.01" value="\${i.estimatedPrice}" id="price_\${i._id}" style="max-width:120px; padding:10px; font-size:15px;"/></td><td><button class="btn secondary small" onclick="updateCatPrice('\${i._id}', '\${esc(i.name)}', '\${esc(i.category)}')">Save</button> <button class="btn ghost small" onclick="deleteCat('\${i._id}')" style="color:var(--red-2);">Delete</button></td></tr>\`).join("");
-      }catch(e){ qs("cat_rows").innerHTML = '<tr><td colspan="4" style="color:var(--red-2); text-align:center; padding: 30px;">Error loading.</td></tr>'; }
-  }
-  async function addCatItem() {
-      const name = qs("newCatName").value.trim();
-      const cat = qs("newCatCat").value.trim();
-      const price = qs("newCatPrice").value || 0;
-      if(!name) return toast("Name is required");
-      try {
-          const r = await fetch("/api/admin/catalogue", {
-              method: "POST", headers: { "Content-Type": "application/json" }, credentials: "include",
-              body: JSON.stringify({ name, category: cat, estimatedPrice: Number(price) })
-          });
-          const d = await r.json();
-          if(d.ok) {
-              toast("Item added! ✅");
-              qs("newCatName").value = "";
-              qs("newCatCat").value = "";
-              qs("newCatPrice").value = "";
-              loadCatalogue();
-          } else toast(d.error || "Error adding item");
-      } catch(e) { toast("Network error"); }
-  }
-  async function updateCatPrice(id, name, cat){
-      const price = document.getElementById('price_'+id).value;
-      try {
-        await fetch("/api/admin/catalogue", {
-            method: "POST", headers: { "Content-Type": "application/json" }, credentials: "include",
-            body: JSON.stringify({ name: name, category: cat, estimatedPrice: Number(price) })
-        });
-        toast("Price updated! ✅");
-      } catch(e) { toast("Error updating price"); }
-  }
-  async function deleteCat(id){
-      if(!confirm("Permanently delete this item?")) return;
-      await fetch("/api/admin/catalogue/"+id, {method:"DELETE", credentials:"include"});
-      toast("Item deleted 🗑️");
-      loadCatalogue();
-  }
-
-  // --- DISPATCH BOARD & ROUTING ENGINE ---
-  let dispatchMap = null;
-  let dispatchMarkers = [];
-  let dispatchOrders = [];
-  const geoCache = {};
-
-  async function ensureMapboxAdmin() {
-      if (window.mapboxgl) return;
-      const css = document.createElement("link"); css.rel = "stylesheet"; css.href = "https://api.mapbox.com/mapbox-gl-js/v2.15.0/mapbox-gl.css"; document.head.appendChild(css);
-      const s = document.createElement("script"); s.src = "https://api.mapbox.com/mapbox-gl-js/v2.15.0/mapbox-gl.js";
-      await new Promise((res) => { s.onload = res; document.head.appendChild(s); });
-  }
-
-  async function loadDispatchOrders() {
-      const rk = qs("dispatch_runKey").value.trim();
-      if(!rk) return toast("Enter a run key first.");
-      qs("dispatch_list").innerHTML = '<div class="muted" style="text-align:center; padding:20px;">Loading route data...</div>';
-      try {
-          const r = await fetch("/api/admin/orders?limit=100&runKey=" + encodeURIComponent(rk), {credentials:"include"});
-          const d = await r.json();
-          dispatchOrders = d.items.filter(o => ["submitted", "confirmed", "shopping", "packed", "out_for_delivery"].includes(o.status.state));
-          
-          if(dispatchOrders.length === 0) {
-             qs("dispatch_list").innerHTML = '<div class="muted small" style="text-align:center; padding:20px;">No active orders found for this run.</div>';
-             return;
-          }
-          
-          renderDispatchList();
-          await updateDispatchMap();
-          toast("Route loaded! Drag to sort.");
-      } catch(e) { toast("Failed to load orders."); }
-  }
-
-  function renderDispatchList() {
-      const container = qs("dispatch_list");
-      container.innerHTML = dispatchOrders.map((o, index) => \`
-          <div class="card" draggable="true" ondragstart="dragStart(event, \${index})" ondragover="dragOver(event)" ondrop="drop(event, \${index})" style="cursor:grab; padding:12px; margin-bottom:0; background:rgba(255,255,255,.05); border:1px solid rgba(255,255,255,.2); transition: transform 0.1s;">
-              <div style="font-weight:900; color:var(--white); display:flex; align-items:center; gap:10px;">
-                 <div style="background:var(--red); color:#fff; width:24px; height:24px; border-radius:50%; display:flex; align-items:center; justify-content:center; font-size:12px;">\${index + 1}</div>
-                 \${esc(o.customer.fullName)}
-              </div>
-              <div class="muted small" style="margin-top:6px; padding-left: 34px;">\${esc(o.address.streetAddress)}, \${esc(o.address.town)}</div>
-          </div>
-      \`).join("");
-  }
-
-  let draggedIndex = null;
-  window.dragStart = function(e, index) { draggedIndex = index; e.dataTransfer.effectAllowed = "move"; };
-  window.dragOver = function(e) { e.preventDefault(); e.dataTransfer.dropEffect = "move"; };
-  window.drop = async function(e, targetIndex) {
-      e.preventDefault();
-      if(draggedIndex === null || draggedIndex === targetIndex) return;
-      const item = dispatchOrders.splice(draggedIndex, 1)[0];
-      dispatchOrders.splice(targetIndex, 0, item);
-      renderDispatchList();
-      await updateDispatchMap();
-  };
-
-  async function updateDispatchMap() {
-      await ensureMapboxAdmin();
-      const conf = await fetch("/api/public/config").then(r=>r.json());
-      mapboxgl.accessToken = conf.mapboxPublicToken;
-
-      if(!dispatchMap) {
-          dispatchMap = new mapboxgl.Map({ container: 'dispatch_map', style: 'mapbox://styles/mapbox/dark-v11', center: [-81.3, 44.8], zoom: 8 });
-      }
-
-      dispatchMarkers.forEach(m => m.remove());
-      dispatchMarkers = [];
-
-      const bounds = new mapboxgl.LngLatBounds();
-      let hasBounds = false;
-
-      for(let i=0; i<dispatchOrders.length; i++) {
-          const o = dispatchOrders[i];
-          const query = \`\${o.address.streetAddress}, \${o.address.town}, ON, Canada\`;
-          
-          if (!geoCache[o.orderId]) {
-              const geo = await fetch(\`https://api.mapbox.com/geocoding/v5/mapbox.places/\${encodeURIComponent(query)}.json?access_token=\${mapboxgl.accessToken}\`).then(r=>r.json());
-              if(geo.features && geo.features.length > 0) {
-                  geoCache[o.orderId] = geo.features[0].center;
-              }
-          }
-
-          if (geoCache[o.orderId]) {
-              const [lng, lat] = geoCache[o.orderId];
-              const el = document.createElement('div');
-              el.style.backgroundColor = '#e3342f'; el.style.color = '#fff'; el.style.width = '24px'; el.style.height = '24px'; el.style.borderRadius = '50%'; el.style.display = 'flex'; el.style.alignItems = 'center'; el.style.justifyContent = 'center'; el.style.fontWeight = 'bold'; el.innerText = i + 1;
-              el.style.boxShadow = '0 0 10px rgba(0,0,0,0.5)';
-              
-              const marker = new mapboxgl.Marker(el).setLngLat([lng, lat]).addTo(dispatchMap);
-              dispatchMarkers.push(marker);
-              bounds.extend([lng, lat]);
-              hasBounds = true;
-          }
-      }
-      if(hasBounds) dispatchMap.fitBounds(bounds, { padding: 40 });
-  }
-
-  window.sendToGoogleMaps = function() {
-      if(dispatchOrders.length === 0) return toast("No orders to route!");
-      if(dispatchOrders.length > 10) return toast("Google Maps max limit is 10 stops. Please split your route.");
-      
-      const addresses = dispatchOrders.map(o => \`\${o.address.streetAddress}, \${o.address.town}, ON\`);
-      const dest = addresses.pop(); 
-      const waypoints = addresses.join('|');
-      
-      let url = \`https://www.google.com/maps/dir/?api=1&destination=\${encodeURIComponent(dest)}\`;
-      if(waypoints) url += \`&waypoints=\${encodeURIComponent(waypoints)}\`;
-      
-      window.open(url, '_blank');
-  };
-
-  // --- FEEDBACK INBOX LOGIC ---
-  async function loadFeedbackAdmin() {
-      const container = qs("feedback_list");
-      container.innerHTML = '<div class="muted" style="text-align:center; padding: 30px;">Loading inbox...</div>';
-      try {
-          const r = await fetch("/api/admin/feedback", {credentials:"include"});
-          const d = await r.json();
-          if(!d.items || d.items.length === 0) {
-              container.innerHTML = '<div class="card" style="text-align:center; padding:40px; color:var(--muted); font-size: 18px;">No new messages. Inbox Zero! 🎉</div>';
-              return;
-          }
-
-          container.innerHTML = d.items.map(f => \`
-              <div class="card" style="box-shadow:none; background: rgba(255,255,255,.05); border-left: 4px solid var(--red-2);">
-                  <div class="row" style="justify-content:space-between; margin-bottom:10px;">
-                      <div>
-                          <span class="pill">\${esc(f.type)}</span>
-                          <span style="font-weight:bold; margin-left:10px; color:white;">\${esc(f.name)}</span>
-                          <span class="muted small" style="margin-left:10px;">\${esc(f.email)} • \${esc(f.phone || 'No phone')}</span>
-                      </div>
-                      <div class="muted small">\${new Date(f.createdAt).toLocaleString()}</div>
-                  </div>
-                  <div style="background: rgba(0,0,0,.3); padding: 14px; border-radius: 8px; margin-bottom: 14px; white-space: pre-wrap; font-size: 15px;">\${esc(f.message)}</div>
-
-                  <div class="row">
-                      <textarea id="reply_\${f._id}" placeholder="Type your reply to \${esc(f.name)}..." style="flex:1; padding:10px; border-radius:8px; min-height:40px; background:rgba(0,0,0,.5); color:white; border:1px solid rgba(255,255,255,.2); font-family:inherit;"></textarea>
-                      <button class="btn primary" onclick="sendFeedbackReply('\${f._id}')">Send Reply & Archive</button>
-                      <button class="btn ghost small" style="color:var(--muted);" onclick="dismissFeedback('\${f._id}')">Dismiss</button>
-                  </div>
-              </div>
-          \`).join("");
-      } catch(e) { container.innerHTML = '<div style="color:var(--red-2); padding: 20px;">Error loading inbox.</div>'; }
-  }
-
-  async function sendFeedbackReply(id) {
-      const text = qs("reply_"+id).value.trim();
-      if(!text) return toast("Type a reply first.");
-      if(!confirm("Send this email to the customer?")) return;
-
-      try {
-          await fetch("/api/admin/feedback/"+id+"/reply", {
-              method:"POST", headers:{"Content-Type":"application/json"}, credentials:"include",
-              body: JSON.stringify({ replyText: text })
-          });
-          toast("Reply sent! 📧");
-          loadFeedbackAdmin();
-      } catch(e) { toast("Error sending reply"); }
-  }
-
-  async function dismissFeedback(id) {
-      if(!confirm("Archive this message without replying?")) return;
-      try {
-          await fetch("/api/admin/feedback/"+id, { method:"DELETE", credentials:"include" });
-          toast("Message archived 🗑️");
-          loadFeedbackAdmin();
-      } catch(e) { toast("Error archiving"); }
-  }
-
-  // --- CONCIERGE SCRIPT ---
-  async function submitConciergeOrder() {
-      const btn = document.getElementById("c_submitBtn");
-      const payload = {
-          fullName: document.getElementById("c_name").value.trim(),
-          phone: document.getElementById("c_phone").value.trim(),
-          streetAddress: document.getElementById("c_street").value.trim(),
-          town: document.getElementById("c_town").value.trim(),
-          runKey: document.getElementById("c_runKey").value.trim(),
-          listText: document.getElementById("c_list").value.trim()
-      };
-      
-      if(!payload.fullName || !payload.streetAddress || !payload.runKey || !payload.listText) {
-          return toast("Please fill out Name, Address, Run Key, and the Grocery List.");
-      }
-      
-      btn.textContent = "Injecting..."; btn.disabled = true;
-      
-      try {
-          const r = await fetch("/api/admin/concierge", {
-              method: "POST", headers: { "Content-Type": "application/json" }, credentials: "include",
-              body: JSON.stringify(payload)
-          });
-          const d = await r.json();
-          
-          if(d.ok) {
-              toast("Concierge Order Injected! ✅");
-              document.getElementById('conciergeModal').style.display = 'none';
-              document.getElementById("c_name").value = "";
-              document.getElementById("c_phone").value = "";
-              document.getElementById("c_street").value = "";
-              document.getElementById("c_list").value = "";
-              if(typeof search === "function") search();
-          } else {
-              toast(d.error || "Failed to create order");
-          }
-      } catch(e) { toast("Network error"); }
-      finally { btn.textContent = "Inject Order into Database"; btn.disabled = false; }
-  }
-
-  let gpsWatchId = null;
-  async function startDriverTracking(){
-      const rk = qs("track_runKey").value.trim();
-      if(!rk) return toast("Please enter a Run Key (e.g. 2026-03-24-local)");
-      try{
-        const r = await fetch("/api/admin/tracking/"+encodeURIComponent(rk)+"/start", {method:"POST", credentials:"include"});
-        const d = await r.json();
-        if(d.ok) {
-           toast("Broadcast Session Started ✅");
-           qs("track_status").innerHTML = '<span style="color:#4caf50; font-weight:bold;">🟢 Connecting to GPS satellite...</span>';
-           if(navigator.geolocation){
-             gpsWatchId = navigator.geolocation.watchPosition(
-               async (pos) => {
-                 await fetch("/api/admin/tracking/"+encodeURIComponent(rk)+"/update", {
-                   method:"POST", headers:{"Content-Type":"application/json"}, credentials:"include",
-                   body: JSON.stringify({lat: pos.coords.latitude, lng: pos.coords.longitude, heading: pos.coords.heading, speed: pos.coords.speed, accuracy: pos.coords.accuracy})
-                 });
-                 qs("track_status").innerHTML = '<span style="color:#4caf50; font-weight:bold;">🟢 Live Broadcasting!</span><br><span style="font-size:13px; color:var(--muted);">Last ping: ' + new Date().toLocaleTimeString() + '</span>';
-               },
-               (err) => { qs("track_status").innerHTML = '<span style="color:var(--red-2); font-weight:bold;">🔴 GPS Error: ' + err.message + ' (Check phone permissions)</span>'; },
-               {enableHighAccuracy: true, maximumAge: 5000}
-             );
-           } else { qs("track_status").innerHTML = "Geolocation not supported by this browser."; }
-        }
-      }catch(e){ toast("Error starting tracking"); }
-  }
-  async function stopDriverTracking(){
-      const rk = qs("track_runKey").value.trim();
-      if(gpsWatchId) navigator.geolocation.clearWatch(gpsWatchId);
-      gpsWatchId = null;
-      if(rk) await fetch("/api/admin/tracking/"+encodeURIComponent(rk)+"/stop", {method:"POST", credentials:"include"});
-      qs("track_status").innerHTML = '⚪ GPS is currently inactive.';
-      toast("Broadcast Stopped 🛑");
-  }
-
-  qs("closeModal").addEventListener("click", ()=> openModal(false)); 
-  qs("searchBtn").addEventListener("click", search); 
-  qs("clearBtn").addEventListener("click", ()=>{ qs("q").value=""; qs("runKey").value=""; qs("state").value=""; search(); }); 
-  qs("m_saveState").addEventListener("click", saveStatus);
+  // CONCIERGE & TRACKING
+  async function submitConciergeOrder() { const btn = document.getElementById("c_submitBtn"); const payload = { fullName: document.getElementById("c_name").value.trim(), phone: document.getElementById("c_phone").value.trim(), streetAddress: document.getElementById("c_street").value.trim(), town: document.getElementById("c_town").value.trim(), runKey: document.getElementById("c_runKey").value.trim(), listText: document.getElementById("c_list").value.trim() }; if(!payload.fullName || !payload.streetAddress || !payload.runKey || !payload.listText) return toast("Fill out Name, Address, Run Key, and List."); btn.textContent = "Injecting..."; btn.disabled = true; try { const r = await fetch("/api/admin/concierge", { method: "POST", headers: { "Content-Type": "application/json" }, credentials: "include", body: JSON.stringify(payload) }); const d = await r.json(); if(d.ok) { toast("Injected! ✅"); document.getElementById('conciergeModal').style.display = 'none'; document.getElementById("c_name").value = ""; document.getElementById("c_phone").value = ""; document.getElementById("c_street").value = ""; document.getElementById("c_list").value = ""; if(typeof search === "function") search(); } else toast(d.error); } catch(e) { toast("Network error"); } finally { btn.textContent = "Inject Order"; btn.disabled = false; } }
   
+  let gpsWatchId = null;
+  async function startDriverTracking(){ const rk = qs("track_runKey").value.trim(); if(!rk) return toast("Enter a Run Key"); try{ const r = await fetch("/api/admin/tracking/"+encodeURIComponent(rk)+"/start", {method:"POST", credentials:"include"}); const d = await r.json(); if(d.ok) { toast("Started ✅"); qs("track_status").innerHTML = '<span style="color:#4caf50; font-weight:bold;">🟢 Connecting...</span>'; if(navigator.geolocation){ gpsWatchId = navigator.geolocation.watchPosition( async (pos) => { await fetch("/api/admin/tracking/"+encodeURIComponent(rk)+"/update", { method:"POST", headers:{"Content-Type":"application/json"}, credentials:"include", body: JSON.stringify({lat: pos.coords.latitude, lng: pos.coords.longitude, heading: pos.coords.heading, speed: pos.coords.speed, accuracy: pos.coords.accuracy}) }); qs("track_status").innerHTML = '<span style="color:#4caf50; font-weight:bold;">🟢 Live Broadcasting!</span><br><span style="font-size:13px; color:var(--muted);">Last ping: ' + new Date().toLocaleTimeString() + '</span>'; }, (err) => { qs("track_status").innerHTML = '<span style="color:var(--red-2); font-weight:bold;">🔴 GPS Error</span>'; }, {enableHighAccuracy: true, maximumAge: 5000} ); } else { qs("track_status").innerHTML = "Not supported."; } } }catch(e){ toast("Error starting tracking"); } }
+  async function stopDriverTracking(){ const rk = qs("track_runKey").value.trim(); if(gpsWatchId) navigator.geolocation.clearWatch(gpsWatchId); gpsWatchId = null; if(rk) await fetch("/api/admin/tracking/"+encodeURIComponent(rk)+"/stop", {method:"POST", credentials:"include"}); qs("track_status").innerHTML = '⚪ GPS is currently inactive.'; toast("Stopped 🛑"); }
+
+  qs("closeModal").addEventListener("click", ()=> openModal(false)); qs("searchBtn").addEventListener("click", search); qs("clearBtn").addEventListener("click", ()=>{ qs("q").value=""; qs("runKey").value=""; qs("state").value=""; search(); }); qs("m_saveState").addEventListener("click", saveStatus);
   loadDashboardMetrics();
-</script>
-</body>
+</script></body>
 </html>`);
 });
 
