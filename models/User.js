@@ -1,6 +1,5 @@
 // DEPLOY MARKER a30a136
 
-
 const mongoose = require("mongoose");
 
 const OrderSchema = new mongoose.Schema(
@@ -37,17 +36,15 @@ const UserSchema = new mongoose.Schema(
     },
 
     orderHistory: { type: [OrderSchema], default: [] },
-  },
-	
-	// --- INTERNAL WALLET & CREDIT SYSTEM ---
-  walletBalance: { type: Number, default: 0 },
-  creditAccount: {
-    approved: { type: Boolean, default: false },
-    limit: { type: Number, default: 0 },
-    balanceOwed: { type: Number, default: 0 }
-  },
 
-
+    // --- INTERNAL WALLET & CREDIT SYSTEM ---
+    walletBalance: { type: Number, default: 0 },
+    creditAccount: {
+      approved: { type: Boolean, default: false },
+      limit: { type: Number, default: 0 },
+      balanceOwed: { type: Number, default: 0 }
+    }
+  },
   { timestamps: true }
 );
 
