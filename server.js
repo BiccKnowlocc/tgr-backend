@@ -1829,7 +1829,7 @@ app.get("/admin", requireLogin, requireAdmin, async (_req, res) => {
       if (window.innerWidth <= 900) { document.getElementById('sidebar').classList.remove('show'); }
   }
 
-  function esc(s){ return String(s||"").replaceAll("&","&").replaceAll("<","<").replaceAll(">",">").replaceAll('"',"""); }
+  function esc(s){ return String(s||"").replaceAll("&","&amp;").replaceAll("<","&lt;").replaceAll(">","&gt;").replaceAll('"',"&quot;"); }
   function money(n){ return Number(n||0).toFixed(2); }
 
 
