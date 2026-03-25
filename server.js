@@ -2047,10 +2047,10 @@ app.get("/admin", requireLogin, requireAdmin, async (_req, res) => {
           const r = await fetch("/api/admin/master-list/" + encodeURIComponent(rk), {credentials: "include"});
           const d = await r.json();
           if(d.ok) {
-              let html = `<html><head><title>Master List: ${rk}</title><style>body{font-family:sans-serif; padding:40px; color:#111;} li{margin-bottom:12px; font-size:20px; border-bottom:1px solid #ccc; padding-bottom:6px; list-style:none;} h1{color:#e3342f; margin-bottom:5px;} .meta{color:#666; font-size:16px; margin-bottom:30px;}</style></head><body>`;
-              html += `<h1>🛒 Master Shopping List</h1><div class="meta">Run Key: <strong>${rk}</strong> | Active Orders: <strong>${d.count}</strong></div><ul>`;
-              d.items.forEach(i => { html += `<li><strong style="color:#e3342f;">[ ${i.qty}x ]</strong> &nbsp; ${i.name}</li>`; });
-              html += `</ul><script>window.print();</script></body></html>`;
+              let html = "<html><head><title>Master List: " + rk + "</title><style>body{font-family:sans-serif; padding:40px; color:#111;} li{margin-bottom:12px; font-size:20px; border-bottom:1px solid #ccc; padding-bottom:6px; list-style:none;} h1{color:#e3342f; margin-bottom:5px;} .meta{color:#666; font-size:16px; margin-bottom:30px;}</style></head><body>";
+              html += "<h1>🛒 Master Shopping List</h1><div class='meta'>Run Key: <strong>" + rk + "</strong> | Active Orders: <strong>" + d.count + "</strong></div><ul>";
+              d.items.forEach(i => { html += "<li><strong style='color:#e3342f;'>[ " + i.qty + "x ]</strong> &nbsp; " + i.name + "</li>"; });
+              html += "</ul><script>window.print();</" + "script></body></html>";
               const win = window.open("", "_blank");
               win.document.write(html);
               win.document.close();
@@ -2075,13 +2075,12 @@ app.get("/admin", requireLogin, requireAdmin, async (_req, res) => {
           });
           const d = await r.json();
           if(d.ok) {
-              toast(`Megaphone Deployed! 📣 Sent to ${d.count} customers.`);
+              toast("Megaphone Deployed! 📣 Sent to " + d.count + " customers.");
               qs("megaMessage").value = "";
           } else toast(d.error || "Failed to broadcast");
       } catch(e) { toast("Network error"); }
       finally { btn.textContent = "Blast SMS Message"; btn.disabled = false; }
   });
-
   qs("closeModal").addEventListener("click", ()=> openModal(false)); qs("searchBtn").addEventListener("click", search); qs("clearBtn").addEventListener("click", ()=>{ qs("q").value=""; qs("runKey").value=""; qs("state").value=""; search(); }); qs("m_saveState").addEventListener("click", saveStatus);
   loadDashboardMetrics();
 </script></body>
