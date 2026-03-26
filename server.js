@@ -1544,7 +1544,7 @@ app.post("/api/admin/approve-credit", requireLogin, requireAdmin, async (req, re
         }
 
         // 1. Find the user in your database
-        const user = await User.findOne({ email: targetEmail });
+        const user = await User.findOne({ email: targetEmail.toLowerCase() });
         if (!user) return res.status(404).json({ ok: false, error: "User not found." });
 
         // 2. The Square Bridge: Create a Square Customer if they don't have one
