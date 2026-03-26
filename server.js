@@ -1604,8 +1604,8 @@ app.get("/admin", requireLogin, requireAdmin, async (_req, res) => {
        <button class="nav-btn" onclick="switchTab('feedback')">📬 Feedback Inbox</button>
        <button class="nav-btn" onclick="switchTab('tracking')">📍 GPS Broadcasting</button>
        <div class="hr" style="margin: 10px 0;"></div>
-       <a class="nav-btn" href="${escapeHtml(PUBLIC_SITE_URL)}/">🌐 Back to Live Site</a>
-       <a class="nav-btn" href="/logout?returnTo=${encodeURIComponent(PUBLIC_SITE_URL + "/")}" style="color: var(--red-2);">🚪 Secure Log Out</a>
+       <a class="nav-btn" href="/">🌐 Back to Live Site</a>
+       <a class="nav-btn" href="/logout" style="color: var(--red-2);">🚪 Secure Log Out</a>
     </div>
 
     <div class="main-content">
