@@ -1535,6 +1535,59 @@ app.post("/api/admin/megaphone", requireLogin, requireAdmin, async (req, res) =>
 });
 
 
+// --- BANK OF TGR: CREDIT APPROVAL & TWILIO SMS ---
+app.post("/api/admin/approve-credit", requireLogin, requireAdmin, async (req, res) => {
+    try {
+        const { targetEmail, creditLimit, phone } = req.body;
+        if (!targetEmail || !creditLimit || !phone) {
+            return res.status(400).json({ ok: false, error: "Missing email, limit, or phone." });
+        }
+
+        // 1. Find the user in your database
+        const user = await User.findOne({ email: targetEmail });
+        if (!user) return res.status(404).json({ ok: false, error: "User not found." });
+
+        // 2. The Square Bridge: Create a Square Customer if they don't have one
+        if (!user.squareCustomerId && process.env.SQUARE_ACCESS_TOKEN) {
+            const custRes = await fetch("https://connect.squareup.com/v2/customers", {
+                method: "POST",
+                headers: {
+                    "Authorization": `Bearer ${process.env.SQUARE_ACCESS_TOKEN}`,
+                    "Content-Type": "application/json"
+                },
+                body: JSON.stringify({
+                    idempotency_key: require('crypto').randomUUID(),
+                    given_name: user.name || "TGR Customer",
+                    email_address: user.email,
+                    phone_number: phone
+                })
+            });
+            const custData = await custRes.json();
+            if (custData.customer && custData.customer.id) {
+                user.squareCustomerId = custData.customer.id; // Vault the Square ID
+            }
+        }
+
+        // 3. Approve their TGR Credit Account
+        user.creditAccount.approved = true;
+        user.creditAccount.limit = Number(creditLimit);
+        await user.save();
+
+        // 4. Fire the "Bank of TGR" Twilio SMS
+        const messageText = `🏦 Welcome to the Bank of TGR! Good news: your monthly credit account has been approved. Your credit limit is $${creditLimit}. You can now bypass upfront checkout fees—just order what you need, and we'll keep a running tab. We will send you a consolidated invoice on the last day of the month. Please pay it promptly so our driver doesn't have to eat ramen for dinner. 🍜 Shop now: tobermorygroceryrun.ca`;
+        
+        // Uses your existing Twilio helper function safely!
+        await sendSms(phone, messageText);
+        console.log(`[TWILIO SMS FIRED TO ${phone}]: ${messageText}`);
+
+        res.json({ ok: true, message: "Credit approved, Square linked, and SMS sent!" });
+    } catch (e) { 
+        res.status(500).json({ ok: false, error: String(e) }); 
+    }
+});
+
+
+
 
 
 // FULL SCREEN ADMIN GOD MODE
@@ -2083,64 +2136,7 @@ app.get("/admin", requireLogin, requireAdmin, async (_req, res) => {
       finally { btn.textContent = "🖨️ Generate Master List"; }
   });
 
-	// --- BANK OF TGR: CREDIT APPROVAL & TWILIO SMS ---
-app.post("/api/admin/approve-credit", requireLogin, requireAdmin, async (req, res) => {
-    try {
-        const { targetEmail, creditLimit, phone } = req.body;
-        if (!targetEmail || !creditLimit || !phone) {
-            return res.status(400).json({ ok: false, error: "Missing email, limit, or phone." });
-        }
 
-        // 1. Find the user in your database
-        const user = await User.findOne({ email: targetEmail });
-        if (!user) return res.status(404).json({ ok: false, error: "User not found." });
-
-        // 2. The Square Bridge: Create a Square Customer if they don't have one
-        if (!user.squareCustomerId && process.env.SQUARE_ACCESS_TOKEN) {
-            const custRes = await fetch("https://connect.squareup.com/v2/customers", {
-                method: "POST",
-                headers: {
-                    "Authorization": `Bearer ${process.env.SQUARE_ACCESS_TOKEN}`,
-                    "Content-Type": "application/json"
-                },
-                body: JSON.stringify({
-                    idempotency_key: require('crypto').randomUUID(),
-                    given_name: user.name || "TGR Customer",
-                    email_address: user.email,
-                    phone_number: phone
-                })
-            });
-            const custData = await custRes.json();
-            if (custData.customer && custData.customer.id) {
-                user.squareCustomerId = custData.customer.id; // Vault the Square ID
-            }
-        }
-
-        // 3. Approve their TGR Credit Account
-        user.creditAccount.approved = true;
-        user.creditAccount.limit = Number(creditLimit);
-        await user.save();
-
-        // 4. Fire the "Bank of TGR" Twilio SMS
-        const messageText = `🏦 Welcome to the Bank of TGR! Good news: your monthly credit account has been approved. Your credit limit is $${creditLimit}. You can now bypass upfront checkout fees—just order what you need, and we'll keep a running tab. We will send you a consolidated invoice on the last day of the month. Please pay it promptly so our driver doesn't have to eat ramen for dinner. 🍜 Shop now: tobermorygroceryrun.ca`;
-        
-        
-        const twilio = require('twilio')(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
-        await twilio.messages.create({
-            body: messageText,
-            from: process.env.TWILIO_PHONE_NUMBER,
-            to: phone
-        });
-        
-
-        // Temporary console log so it doesn't crash if Twilio isn't active yet
-        console.log(`[TWILIO SMS FIRED TO ${phone}]: ${messageText}`);
-
-        res.json({ ok: true, message: "Credit approved, Square linked, and SMS sent!" });
-    } catch (e) { 
-        res.status(500).json({ ok: false, error: String(e) }); 
-    }
-});
 
 
 
