@@ -19,6 +19,7 @@ const UserSchema = new mongoose.Schema(
   {
     googleId: { type: String, default: "", index: true },
     email: { type: String, required: true, unique: true, index: true },
+	squareCustomerId: { type: String, default: "" },
     name: { type: String, default: "" },
     photo: { type: String, default: "" },
 

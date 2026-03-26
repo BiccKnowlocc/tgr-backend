@@ -1661,6 +1661,29 @@ app.get("/admin", requireLogin, requireAdmin, async (_req, res) => {
           </div>
           </div>
           <div class="card" style="padding: 0;">
+		
+
+<div class="card" style="box-shadow:none; padding: 20px; border-color: #ffc107; background: rgba(255,193,7,.05); margin-bottom: 14px;">
+            <div style="font-weight:1000; font-size: 16px; color: #ffc107;">🏦 Bank of TGR: Credit Approval</div><div class="hr"></div>
+            <div class="split" style="margin-top:10px;">
+               <div class="col">
+                 <label class="muted">Customer Email</label>
+                 <input id="creditEmail" placeholder="customer@email.com" style="margin-bottom: 10px; background: rgba(0,0,0,.5);" />
+               </div>
+               <div class="col">
+                 <label class="muted">Phone (For Welcome SMS)</label>
+                 <input id="creditPhone" placeholder="519-555-1234" style="margin-bottom: 10px; background: rgba(0,0,0,.5);" />
+               </div>
+               <div class="col">
+                 <label class="muted">Credit Limit ($)</label>
+                 <input id="creditLimit" type="number" placeholder="e.g., 300" style="margin-bottom: 10px; background: rgba(0,0,0,.5);" />
+               </div>
+            </div>
+            <button class="btn primary" id="approveCreditBtn" style="width: 100%; background: linear-gradient(180deg, #ffc107, #ff9800); color: #000; font-weight: 900;">Approve Credit & Send Welcome SMS</button>
+          </div>
+
+
+
             <table>
               <thead style="background: rgba(255,255,255,.05);"><tr><th>Order</th><th>Customer</th><th>Address</th><th>Run</th><th>Status</th><th>Fees Paid</th><th>Actions</th></tr></thead>
               <tbody id="rows"><tr><td colspan="7" class="muted" style="padding: 30px; text-align:center;">Loading database...</td></tr></tbody>
@@ -2060,6 +2083,68 @@ app.get("/admin", requireLogin, requireAdmin, async (_req, res) => {
       finally { btn.textContent = "🖨️ Generate Master List"; }
   });
 
+	// --- BANK OF TGR: CREDIT APPROVAL & TWILIO SMS ---
+app.post("/api/admin/approve-credit", requireLogin, requireAdmin, async (req, res) => {
+    try {
+        const { targetEmail, creditLimit, phone } = req.body;
+        if (!targetEmail || !creditLimit || !phone) {
+            return res.status(400).json({ ok: false, error: "Missing email, limit, or phone." });
+        }
+
+        // 1. Find the user in your database
+        const user = await User.findOne({ email: targetEmail });
+        if (!user) return res.status(404).json({ ok: false, error: "User not found." });
+
+        // 2. The Square Bridge: Create a Square Customer if they don't have one
+        if (!user.squareCustomerId && process.env.SQUARE_ACCESS_TOKEN) {
+            const custRes = await fetch("https://connect.squareup.com/v2/customers", {
+                method: "POST",
+                headers: {
+                    "Authorization": `Bearer ${process.env.SQUARE_ACCESS_TOKEN}`,
+                    "Content-Type": "application/json"
+                },
+                body: JSON.stringify({
+                    idempotency_key: require('crypto').randomUUID(),
+                    given_name: user.name || "TGR Customer",
+                    email_address: user.email,
+                    phone_number: phone
+                })
+            });
+            const custData = await custRes.json();
+            if (custData.customer && custData.customer.id) {
+                user.squareCustomerId = custData.customer.id; // Vault the Square ID
+            }
+        }
+
+        // 3. Approve their TGR Credit Account
+        user.creditAccount.approved = true;
+        user.creditAccount.limit = Number(creditLimit);
+        await user.save();
+
+        // 4. Fire the "Bank of TGR" Twilio SMS
+        const messageText = `🏦 Welcome to the Bank of TGR! Good news: your monthly credit account has been approved. Your credit limit is $${creditLimit}. You can now bypass upfront checkout fees—just order what you need, and we'll keep a running tab. We will send you a consolidated invoice on the last day of the month. Please pay it promptly so our driver doesn't have to eat ramen for dinner. 🍜 Shop now: tobermorygroceryrun.ca`;
+        
+        
+        const twilio = require('twilio')(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
+        await twilio.messages.create({
+            body: messageText,
+            from: process.env.TWILIO_PHONE_NUMBER,
+            to: phone
+        });
+        
+
+        // Temporary console log so it doesn't crash if Twilio isn't active yet
+        console.log(`[TWILIO SMS FIRED TO ${phone}]: ${messageText}`);
+
+        res.json({ ok: true, message: "Credit approved, Square linked, and SMS sent!" });
+    } catch (e) { 
+        res.status(500).json({ ok: false, error: String(e) }); 
+    }
+});
+
+
+
+
   // --- SNIPER MEGAPHONE LOGIC ---
   qs("megaBtn").addEventListener("click", async () => {
       const rk = qs("megaRunKey").value.trim();
@@ -2081,6 +2166,34 @@ app.get("/admin", requireLogin, requireAdmin, async (_req, res) => {
       } catch(e) { toast("Network error"); }
       finally { btn.textContent = "Blast SMS Message"; btn.disabled = false; }
   });
+
+// --- BANK OF TGR LOGIC ---
+  qs("approveCreditBtn").addEventListener("click", async () => {
+      const email = qs("creditEmail").value.trim();
+      const phone = qs("creditPhone").value.trim();
+      const limit = qs("creditLimit").value.trim();
+
+      if(!email || !phone || !limit) return toast("Enter email, phone, and limit.");
+      if(!confirm("Approve $" + limit + " for " + email + " and fire the welcome SMS?")) return;
+
+      const btn = qs("approveCreditBtn"); btn.textContent = "Processing..."; btn.disabled = true;
+      try {
+          const r = await fetch("/api/admin/approve-credit", {
+              method: "POST", headers: { "Content-Type": "application/json" }, credentials: "include",
+              body: JSON.stringify({ targetEmail: email, phone: phone, creditLimit: limit })
+          });
+          const d = await r.json();
+          if(d.ok) {
+              toast("Credit Approved & Welcome SMS Fired! 🏦");
+              qs("creditEmail").value = "";
+              qs("creditPhone").value = "";
+              qs("creditLimit").value = "";
+          } else toast(d.error || "Failed to approve");
+      } catch(e) { toast("Network error"); }
+      finally { btn.textContent = "Approve Credit & Send Welcome SMS"; btn.disabled = false; }
+  });
+
+
 
   qs("closeModal").addEventListener("click", ()=> openModal(false)); 
   qs("searchBtn").addEventListener("click", search); 
