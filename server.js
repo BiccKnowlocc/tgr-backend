@@ -1697,7 +1697,7 @@ app.get("/admin", requireLogin, requireAdmin, async (_req, res) => {
        <button class="nav-btn" onclick="switchTab('tracking')">📍 GPS Broadcasting</button>
 	<button class="nav-btn" onclick="switchTab('gemini')">🧠 AI Co-Pilot</button>
        <div class="hr" style="margin: 10px 0;"></div>
-       <a class="nav-btn" href="www.tobermorygroceryrun.ca/">🌐 Back to Live Site</a>
+       <a class="nav-btn" href="https://www.tobermorygroceryrun.ca/">🌐 Back to Live Site</a>
        <a class="nav-btn" href="/logout" style="color: var(--red-2);">🚪 Secure Log Out</a>
     </div>
 
