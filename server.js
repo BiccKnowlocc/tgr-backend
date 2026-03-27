@@ -1626,6 +1626,124 @@ app.post("/api/admin/approve-credit", requireLogin, requireAdmin, async (req, re
 });
 
 
+// --- END OF MONTH INVOICE BLAST (AUTO-CHARGE + FALLBACK) ---
+app.post("/api/admin/billing/run-invoices", requireLogin, requireAdmin, async (req, res) => {
+    try {
+        if (!squareClient) return res.status(500).json({ ok: false, error: "Square SDK not initialized." });
+
+        // 1. Find everyone who owes you money
+        const usersToBill = await User.find({ "creditAccount.balanceOwed": { $gt: 0 } });
+        if (usersToBill.length === 0) return res.json({ ok: true, chargedCount: 0, emailedCount: 0, message: "Nobody owes you money!" });
+
+        let chargedCount = 0;
+        let emailedCount = 0;
+
+        for (const u of usersToBill) {
+            const amountCents = Math.round(u.creditAccount.balanceOwed * 100);
+            const firstName = (u.name || "there").split(' ')[0];
+            let paymentSuccessful = false;
+
+            // 2. ATTEMPT AUTO-CHARGE: Ask Square if they have a card on file
+            if (u.squareCustomerId) {
+                try {
+                    const cardsRes = await squareClient.cardsApi.listCards(undefined, u.squareCustomerId);
+                    const cards = cardsRes.result.cards || [];
+                    
+                    if (cards.length > 0) {
+                        // Grab their first vaulted card
+                        const cardId = cards[0].id;
+                        
+                        // Attempt to extract the funds!
+                        const payRes = await squareClient.paymentsApi.createPayment({
+                            idempotencyKey: require('crypto').randomUUID(),
+                            sourceId: cardId,
+                            customerId: u.squareCustomerId,
+                            amountMoney: { amount: amountCents, currency: "CAD" },
+                            autocomplete: true,
+                            locationId: SQUARE_LOCATION_ID,
+                            note: "TGR Monthly Grocery Tab Auto-Charge"
+                        });
+
+                        if (payRes.result.payment.status === "COMPLETED" || payRes.result.payment.status === "APPROVED") {
+                            paymentSuccessful = true;
+                            chargedCount++;
+                            
+                            // Zero out their balance in the database!
+                            const amountPaid = u.creditAccount.balanceOwed;
+                            u.creditAccount.balanceOwed = 0;
+                            await u.save();
+
+                            // Send a "Paid Receipt" Email
+                            const receiptHtml = `
+                                <div style="font-family: sans-serif; max-width: 600px; margin: 0 auto; padding: 20px; border: 1px solid #e0e0e0; border-radius: 12px;">
+                                    <h1 style="color: #4caf50; text-align: center;">Tab Settled ✅</h1>
+                                    <p>Hi ${firstName},</p>
+                                    <p>We successfully charged your saved card for your monthly grocery tab. Your balance is now $0.00!</p>
+                                    <div style="background: #f9f9f9; padding: 15px; border-radius: 8px; text-align: center; font-size: 24px; font-weight: bold; color: #333;">
+                                        Amount Paid: $${amountPaid.toFixed(2)}
+                                    </div>
+                                    <p style="font-size: 14px; color: #666; text-align: center; margin-top: 20px;">Thanks for running with us!<br>- Nick @ Tobermory Grocery Run</p>
+                                </div>
+                            `;
+                            await pmSend(u.email, "Receipt: TGR Monthly Tab Paid", receiptHtml);
+                        }
+                    }
+                } catch (chargeErr) {
+                    console.log(`Auto-charge failed for ${u.email}:`, chargeErr.message);
+                    // Silently fails and drops down to the fallback logic below
+                }
+            }
+
+            // 3. FALLBACK LOGIC: If they have no card, or the card declined
+            if (!paymentSuccessful) {
+                const linkRes = await squareClient.checkoutApi.createPaymentLink({
+                    idempotencyKey: require('crypto').randomUUID(),
+                    quickPay: {
+                        name: "TGR Monthly Grocery Tab",
+                        priceMoney: { amount: amountCents, currency: "CAD" },
+                        locationId: SQUARE_LOCATION_ID
+                    },
+                    checkoutOptions: { askForShippingAddress: false, merchantSupportEmail: "billing@tobermorygroceryrun.ca" }
+                });
+                
+                const securePayUrl = linkRes.result.paymentLink.url;
+
+                const invoiceHtml = `
+                    <div style="font-family: sans-serif; max-width: 600px; margin: 0 auto; padding: 20px; border: 1px solid #e0e0e0; border-radius: 12px;">
+                        <h1 style="color: #e3342f; text-align: center; margin: 0;">Bank of TGR 🏦</h1>
+                        <p style="color: #666; text-align: center; margin-top: 4px;">Action Required</p>
+                        
+                        <p>Hi ${firstName},</p>
+                        <p>It’s that time of the month! We attempted to charge your card on file for your monthly tab, but we need you to update your payment info or process it manually.</p>
+                        
+                        <div style="background-color: #f9f9f9; border: 1px solid #eee; border-radius: 8px; padding: 20px; text-align: center; margin: 25px 0;">
+                            <div style="font-size: 14px; color: #666; text-transform: uppercase; font-weight: bold;">Total Balance Owed</div>
+                            <div style="font-size: 36px; font-weight: 900; color: #e3342f; margin: 10px 0;">$${u.creditAccount.balanceOwed.toFixed(2)}</div>
+                            <a href="${securePayUrl}" style="display: inline-block; background: linear-gradient(180deg, #ff4a44, #e3342f); color: #ffffff; text-decoration: none; font-size: 16px; font-weight: bold; padding: 14px 30px; border-radius: 99px; margin-top: 10px;">Settle My Tab</a>
+                        </div>
+                        <p style="font-size: 12px; color: #999; text-align: center;">Clicking the button above will take you to our secure Square checkout. You can also e-transfer directly to <strong>nickb@tobermorygroceryrun.ca</strong>.<br><br>- Nick @ Tobermory Grocery Run</p>
+                    </div>
+                `;
+
+                // Fire the custom email
+                await pmSend(u.email, "Action Required: Your TGR Monthly Invoice", invoiceHtml);
+
+                // Fire the funny SMS if they have a phone number on file
+                if (u.profile && u.profile.phone) {
+                    const smsText = `Hey ${firstName}, Nick @ TGR here! 🚙💨 Our system tried to process your monthly grocery tab, but your card either played hide-and-seek or went on vacation! I just emailed you a secure link to settle up. If you prefer, you can also e-transfer directly to nickb@tobermorygroceryrun.ca. Thanks for keeping the Jeep fueled up! ⛽`;
+                    await sendSms(u.profile.phone, smsText);
+                }
+
+                emailedCount++;
+            }
+        }
+
+        res.json({ ok: true, chargedCount, emailedCount });
+    } catch (e) { 
+        console.error("Invoice Engine Error:", e);
+        res.status(500).json({ ok: false, error: String(e) }); 
+    }
+});
 
 
 
