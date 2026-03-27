@@ -2371,8 +2371,7 @@ app.get("/admin", requireLogin, requireAdmin, async (_req, res) => {
 
 window.optimizeRoute = async function() {
       if(dispatchOrders.length < 2) return toast("Need at least 2 orders to optimize.");
-      if(dispatchOrders.length > 12) return toast("Mapbox limit is 12 stops.");
-
+      
       const btn = qs("btnOptimize");
       const origText = btn.innerHTML;
       btn.innerHTML = "⏳ Sequencing...";
@@ -2380,20 +2379,25 @@ window.optimizeRoute = async function() {
 
       try {
           let coords = [];
+          let validOrders = [];
+
           for(let i = 0; i < dispatchOrders.length; i++) {
               const o = dispatchOrders[i];
-              if(!geoCache[o.orderId]) throw new Error("GPS missing for " + o.orderId);
-              
-              // Mapbox expects EXACTLY Longitude,Latitude with no spaces
-              const lng = Number(geoCache[o.orderId][0]).toFixed(6);
-              const lat = Number(geoCache[o.orderId][1]).toFixed(6);
-              coords.push(lng + "," + lat);
+              // SAFETY CHECK: Ensure the order exists and we have a GPS fix for it
+              if(o && o.orderId && geoCache[o.orderId]) {
+                  const lng = Number(geoCache[o.orderId][0]).toFixed(6);
+                  const lat = Number(geoCache[o.orderId][1]).toFixed(6);
+                  coords.push(lng + "," + lat);
+                  validOrders.push(o);
+              } else {
+                  console.warn("Skipping order from optimization (no GPS fix):", o ? o.orderId : "Unknown");
+              }
           }
 
+          if(coords.length < 2) throw new Error("Not enough orders with valid GPS fixes to optimize.");
+          if(coords.length > 12) throw new Error("Mapbox limit is 12 stops. You have " + coords.length + " valid stops.");
+
           const coordStr = coords.join(";");
-          
-          // Using the most basic, high-compatibility profile:
-          // We removed source=first and destination=any to force a simple optimized loop
           const url = "https://api.mapbox.com/optimized-trips/v1/mapbox/driving/" + coordStr + 
                       "?overview=full&steps=true&geometries=geojson&access_token=" + mapboxgl.accessToken;
 
@@ -2402,20 +2406,26 @@ window.optimizeRoute = async function() {
 
           if(d.code !== "Ok") {
               console.error("Mapbox Rejection:", d);
-              throw new Error("Mapbox says: " + (d.message || "Request Not Supported"));
+              throw new Error("Mapbox error: " + (d.message || "Invalid Request"));
           }
 
-          // Mapbox returns waypoints in the order they should be visited
-          // location_index is the original position in our dispatchOrders array
+          // Mapbox returns waypoints relative to the "validOrders" we sent it
           const optimizedSequence = d.waypoints
               .sort((a, b) => a.waypoint_index - b.waypoint_index)
-              .map(wp => dispatchOrders[wp.location_index]);
+              .map(wp => validOrders[wp.location_index]);
 
-          dispatchOrders = optimizedSequence;
+          // Re-insert any orders we skipped at the very end so they don't disappear
+          const skippedOrders = dispatchOrders.filter(o => !validOrders.includes(o));
+          dispatchOrders = optimizedSequence.concat(skippedOrders);
+
           renderDispatchList();
           await updateDispatchMap();
           
-          toast("Route Optimized! ⚡");
+          if(skippedOrders.length > 0) {
+              toast("Optimized " + validOrders.length + " stops. " + skippedOrders.length + " skipped (no GPS).");
+          } else {
+              toast("Route Optimized! ⚡");
+          }
       } catch(e) {
           console.error("Logistics Error:", e);
           toast(e.message || "Optimization failed");
