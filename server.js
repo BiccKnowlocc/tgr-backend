@@ -686,7 +686,7 @@ app.get("/logout", (req, res) => { req.session.destroy(() => res.redirect(String
 // =========================
 // API: ME + PROFILE
 // =========================
-app.get("/api/me", (req, res) => { const u = req.user; res.json({ ok: true, loggedIn: !!u, email: u?.email || null, name: u?.name || "", photo: u?.photo || "", membershipLevel: u?.membershipLevel || "none", membershipStatus: u?.membershipStatus || "inactive", effectiveMembershipTier: getEffectiveMemberTierForUser(u) || "", renewalDate: u?.renewalDate || null, profileComplete: isProfileComplete(u?.profile || {}), isAdmin: !!u?.email && isAdminEmail(u.email) }); });
+app.get("/api/me", (req, res) => { const u = req.user; res.json({ ok: true, loggedIn: !!u, email: u?.email || null, name: u?.name || "", photo: u?.photo || "", membershipLevel: u?.membershipLevel || "none", membershipStatus: u?.membershipStatus || "inactive", effectiveMembershipTier: getEffectiveMemberTierForUser(u) || "", renewalDate: u?.renewalDate || null, profileComplete: isProfileComplete(u?.profile || {}), isAdmin: !!u?.email && isAdminEmail(u.email), creditAccount: u?.creditAccount || { approved: false, limit: 0, balanceOwed: 0 } }); });
 app.get("/api/profile", requireLogin, async (req, res) => { const u = await User.findById(req.user._id).lean(); res.json({ ok: true, profile: u?.profile || {}, profileComplete: isProfileComplete(u?.profile || {}), email: u?.email || "", name: u?.name || "", photo: u?.photo || "" }); });
 
 app.post("/api/profile", requireLogin, async (req, res) => {
