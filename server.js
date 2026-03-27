@@ -1535,6 +1535,45 @@ app.post("/api/admin/megaphone", requireLogin, requireAdmin, async (req, res) =>
 });
 
 
+// --- GEMINI AI CO-PILOT ENGINE ---
+const { GoogleGenerativeAI } = require("@google/generative-ai");
+app.post("/api/admin/gemini", requireLogin, requireAdmin, async (req, res) => {
+    try {
+        const { prompt, includeOrders } = req.body;
+        if (!process.env.GEMINI_API_KEY) {
+            return res.status(400).json({ ok: false, error: "Missing GEMINI_API_KEY in Render Environment Variables." });
+        }
+        
+        const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
+        // Using the ultra-fast Flash model (Free Tier)
+        const model = genAI.getGenerativeModel({ model: "gemini-2.5-flash" }); 
+
+        let context = "";
+        if (includeOrders) {
+            // Pull all active orders to feed into the AI's brain
+            const activeOrders = await Order.find({ "status.state": { $in: ["submitted", "confirmed", "shopping", "packed"] } })
+                                            .select("orderId runKey runType customer.fullName address.town list.groceryListText addOns")
+                                            .lean();
+            context = "\n\n--- CURRENT ACTIVE ORDERS CONTEXT ---\n" + JSON.stringify(activeOrders, null, 2);
+        }
+
+        const systemInstructions = "\n\n--- INSTRUCTIONS ---\nYou are the built-in AI co-pilot for 'Tobermory Grocery Run' (TGR). You live inside the Admin God Mode dashboard. The owner and driver is Nick. Keep your answers incredibly concise, highly analytical, and format them nicely with bullet points. Analyze the provided order data if asked.";
+        
+        const finalPrompt = prompt + context + systemInstructions;
+        
+        const result = await model.generateContent(finalPrompt);
+        const response = await result.response;
+        
+        res.json({ ok: true, text: response.text() });
+    } catch (e) {
+        res.status(500).json({ ok: false, error: String(e) });
+    }
+});
+
+
+
+
+
 // --- BANK OF TGR: CREDIT APPROVAL & TWILIO SMS ---
 app.post("/api/admin/approve-credit", requireLogin, requireAdmin, async (req, res) => {
     try {
