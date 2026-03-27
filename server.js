@@ -2371,64 +2371,59 @@ app.get("/admin", requireLogin, requireAdmin, async (_req, res) => {
 
 window.optimizeRoute = async function() {
       if(dispatchOrders.length < 2) return toast("Need at least 2 orders to optimize.");
-      if(dispatchOrders.length > 12) return toast("Optimization limit is 12 stops. Please split your route.");
+      if(dispatchOrders.length > 12) return toast("Mapbox limit is 12 stops.");
 
       const btn = qs("btnOptimize");
       const origText = btn.innerHTML;
-      btn.innerHTML = "⏳ Sequencing Route...";
+      btn.innerHTML = "⏳ Sequencing...";
       btn.disabled = true;
 
       try {
-          // 1. Build the coordinate string Mapbox wants (Longitude,Latitude)
           let coords = [];
           for(let i = 0; i < dispatchOrders.length; i++) {
               const o = dispatchOrders[i];
-              if(!geoCache[o.orderId]) {
-                  throw new Error("GPS coordinates missing for " + o.orderId);
-              }
-              // Force clean numbers and ensure Longitude is first
-              const lng = parseFloat(geoCache[o.orderId][0]);
-              const lat = parseFloat(geoCache[o.orderId][1]);
+              if(!geoCache[o.orderId]) throw new Error("GPS missing for " + o.orderId);
+              
+              // Mapbox expects EXACTLY Longitude,Latitude with no spaces
+              const lng = Number(geoCache[o.orderId][0]).toFixed(6);
+              const lat = Number(geoCache[o.orderId][1]).toFixed(6);
               coords.push(lng + "," + lat);
           }
 
           const coordStr = coords.join(";");
           
-          // 2. We use 'roundtrip=false' because you aren't ending where you started
-          // and 'source=first' to keep your current first stop as the start of the trip.
+          // Using the most basic, high-compatibility profile:
+          // We removed source=first and destination=any to force a simple optimized loop
           const url = "https://api.mapbox.com/optimized-trips/v1/mapbox/driving/" + coordStr + 
-                      "?source=first&destination=any&roundtrip=false&access_token=" + mapboxgl.accessToken;
+                      "?overview=full&steps=true&geometries=geojson&access_token=" + mapboxgl.accessToken;
 
           const r = await fetch(url);
           const d = await r.json();
 
-          // Handle the "Not Supported" or other API errors
           if(d.code !== "Ok") {
-              console.error("Mapbox Error:", d);
-              throw new Error(d.message || "Request not supported by Mapbox");
+              console.error("Mapbox Rejection:", d);
+              throw new Error("Mapbox says: " + (d.message || "Request Not Supported"));
           }
 
-          // 3. Re-order our dispatchOrders array based on the Mapbox waypoints
-          // location_index tells us which original coordinate this waypoint refers to
+          // Mapbox returns waypoints in the order they should be visited
+          // location_index is the original position in our dispatchOrders array
           const optimizedSequence = d.waypoints
               .sort((a, b) => a.waypoint_index - b.waypoint_index)
               .map(wp => dispatchOrders[wp.location_index]);
 
-          // Update global state and redraw
           dispatchOrders = optimizedSequence;
           renderDispatchList();
           await updateDispatchMap();
           
-          toast("Route Optimized! Sequence is now the fastest possible. ⚡");
+          toast("Route Optimized! ⚡");
       } catch(e) {
-          console.error("Optimization script error:", e);
+          console.error("Logistics Error:", e);
           toast(e.message || "Optimization failed");
       } finally {
           btn.innerHTML = origText;
           btn.disabled = false;
       }
   };
-
 
 
 
