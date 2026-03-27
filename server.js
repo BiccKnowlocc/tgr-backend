@@ -2368,68 +2368,64 @@ app.get("/admin", requireLogin, requireAdmin, async (_req, res) => {
 
 
 // --- DYNAMIC ROUTE OPTIMIZATION (THE BRAIN) ---
-  window.optimizeRoute = async function() {
-      if(dispatchOrders.length < 2) return toast("Need at least 2 orders to optimize.");
-      if(dispatchOrders.length > 12) return toast("Mapbox limit is 12 stops.");
+window.optimizeRoute = async function() {
+    if(dispatchOrders.length < 2) return toast("Need at least 2 orders to optimize.");
+    if(dispatchOrders.length > 12) return toast("Mapbox limit is 12 stops.");
 
-      const btn = qs("btnOptimize");
-      const origText = btn.innerHTML;
-      btn.innerHTML = "⏳ Sequencing...";
-      btn.disabled = true;
+    const btn = qs("btnOptimize");
+    const origText = btn.innerHTML;
+    btn.innerHTML = "⏳ Sequencing...";
+    btn.disabled = true;
 
-      try {
-          let coords = [];
-          let validOrders = [];
+    try {
+        let coords = [];
+        let validOrders = [];
 
-          for(let i = 0; i < dispatchOrders.length; i++) {
-              const o = dispatchOrders[i];
-              if(!o) continue;
+        for(let i = 0; i < dispatchOrders.length; i++) {
+            const o = dispatchOrders[i];
+            if(!o) continue;
 
-              // Fallback: Check GPS by orderId OR by physical address string
-              const addrKey = o.address ? (o.address.streetAddress + ", " + o.address.town) : null;
-              const gps = geoCache[o.orderId] || geoCache[addrKey];
+            const addrKey = o.address ? (o.address.streetAddress + ", " + o.address.town) : null;
+            const gps = geoCache[o.orderId] || geoCache[addrKey];
 
-              if(gps) {
-                  const lng = Number(gps[0]).toFixed(6);
-                  const lat = Number(gps[1]).toFixed(6);
-                  coords.push(lng + "," + lat);
-                  validOrders.push(o);
-              }
-          }
+            if(gps) {
+                const lng = Number(gps[0]).toFixed(6);
+                const lat = Number(gps[1]).toFixed(6);
+                coords.push(lng + "," + lat);
+                validOrders.push(o);
+            }
+        }
 
-          if(coords.length < 2) throw new Error("GPS markers not ready yet. Please wait for the map to load.");
+        if(coords.length < 2) throw new Error("GPS markers not ready yet. Please wait for the map to load.");
 
-          const coordStr = coords.join(";");
-          const url = "https://api.mapbox.com/optimized-trips/v1/mapbox/driving/" + coordStr + "?overview=full&steps=true&geometries=geojson&access_token=" + mapboxgl.accessToken;
+        const coordStr = coords.join(";");
+        const url = "https://api.mapbox.com/optimized-trips/v1/mapbox/driving/" + coordStr + "?overview=full&steps=true&geometries=geojson&access_token=" + mapboxgl.accessToken;
 
-          const r = await fetch(url);
-          const d = await r.json();
+        const r = await fetch(url);
+        const d = await r.json();
 
-          if(d.code !== "Ok") throw new Error("Mapbox says: " + (d.message || "Request Error"));
+        if(d.code !== "Ok") throw new Error("Mapbox says: " + (d.message || "Request Error"));
 
-          // Map results back to our valid order objects based on visit order
-          const optimizedSequence = d.waypoints
-              .sort((a, b) => a.waypoint_index - b.waypoint_index)
-              .map(wp => validOrders[wp.location_index]);
+        const optimizedSequence = d.waypoints
+            .sort((a, b) => a.waypoint_index - b.waypoint_index)
+            .map(wp => validOrders[wp.location_index]);
 
-          // Re-insert skipped/invalid orders at the end so they don't disappear
-          const optimizedIds = new Set(optimizedSequence.map(x => x.orderId));
-          const skipped = dispatchOrders.filter(o => o && !optimizedIds.has(o.orderId));
-          
-          dispatchOrders = optimizedSequence.concat(skipped);
+        const optimizedIds = new Set(optimizedSequence.map(x => x.orderId));
+        const skipped = dispatchOrders.filter(o => o && !optimizedIds.has(o.orderId));
+        
+        dispatchOrders = optimizedSequence.concat(skipped);
 
-          renderDispatchList();
-          await updateDispatchMap();
-          toast("Route Optimized! ⚡ Sequence updated.");
-      } catch(e) {
-          console.error("Optimization failed:", e);
-          toast(e.message || "Optimization failed");
-      } finally {
-          btn.innerHTML = origText;
-          btn.disabled = false;
-      }
-  };
-
+        renderDispatchList();
+        await updateDispatchMap();
+        toast("Route Optimized! ⚡ Sequence updated.");
+    } catch(e) {
+        console.error("Optimization failed:", e);
+        toast(e.message || "Optimization failed");
+    } finally {
+        btn.innerHTML = origText;
+        btn.disabled = false;
+    }
+};
 
 
 
