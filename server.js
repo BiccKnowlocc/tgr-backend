@@ -1746,6 +1746,62 @@ app.post("/api/admin/billing/run-invoices", requireLogin, requireAdmin, async (r
 });
 
 
+// --- LIVE DISPATCH & ORDER STATUS ENGINE ---
+app.post("/api/admin/orders/:id/dispatch", requireLogin, requireAdmin, async (req, res) => {
+    try {
+        const orderId = req.params.id;
+        const { status, notifyCustomer } = req.body;
+        
+        // 1. Find the order
+        const order = await Order.findById(orderId);
+        if (!order) return res.status(404).json({ ok: false, error: "Order not found" });
+        
+        // 2. Update the database
+        order.status = status;
+        await order.save();
+        
+        // 3. Craft the personalized messages
+        let smsMsg = "";
+        let emailSubject = "";
+        let emailBody = "";
+        
+        if (status === "shopping") {
+            smsMsg = "🛒 TGR Update: Nick is starting your shop! We'll let you know when we are checking out.";
+            emailSubject = "TGR Update: We're shopping your order!";
+            emailBody = "Great news! Nick has arrived at the store and is currently shopping for your items.";
+        } else if (status === "checkout") {
+            smsMsg = "💳 TGR Update: Nick is at the checkout! We are packing up the Jeep and heading your way soon.";
+            emailSubject = "TGR Update: Checking out now!";
+            emailBody = "We've got all your items and are checking out now. Next stop: delivery!";
+        } else if (status === "delivery") {
+            smsMsg = "🚙💨 TGR Update: We are out for delivery! The Jeep is loaded and heading to your drop-off point.";
+            emailSubject = "TGR Update: Out for Delivery!";
+            emailBody = "The Jeep is loaded and we are officially out for delivery. See you soon!";
+        } else if (status === "completed") {
+            smsMsg = "✅ TGR Update: Your order has been delivered! Thanks for trusting us with your run.";
+            emailSubject = "TGR Update: Order Delivered!";
+            emailBody = "Your order has been successfully dropped off. Thank you for using Tobermory Grocery Run!";
+        }
+
+        // 4. Fire Notifications (if requested and if we have their contact info)
+        if (notifyCustomer && smsMsg) {
+            if (order.phone) await sendSms(order.phone, smsMsg);
+            if (order.email) {
+                const html = `<div style="font-family: sans-serif; max-width: 600px; margin: 0 auto; padding: 20px; border: 1px solid #e0e0e0; border-radius: 12px;"><h1 style="color: #e3342f; text-align: center;">Live Dispatch 📡</h1><p style="font-size: 16px;">Hi ${order.fullName.split(' ')[0]},</p><p style="font-size: 16px;">${emailBody}</p><p style="color: #666; font-size: 14px; text-align: center; margin-top: 30px;">- Nick @ TGR</p></div>`;
+                await pmSend(order.email, emailSubject, html);
+            }
+        }
+
+        res.json({ ok: true, status: order.status });
+    } catch (e) {
+        console.error("Dispatch Error:", e);
+        res.status(500).json({ ok: false, error: String(e) });
+    }
+});
+
+
+
+
 
 // FULL SCREEN ADMIN GOD MODE
 app.get("/admin", requireLogin, requireAdmin, async (_req, res) => {
@@ -2116,6 +2172,19 @@ app.get("/admin", requireLogin, requireAdmin, async (_req, res) => {
           <button class="btn primary" id="m_captureBtn" style="width: 100%;">Charge Card & Dispatch</button>
         </div>
 
+	
+	<div class="hr"></div>
+            <div style="font-weight: 900; font-size: 14px; margin-bottom: 8px; color: var(--red-2);">Live Dispatch Notifications</div>
+            <div class="row" style="gap: 8px;">
+                <button class="btn small secondary" onclick="if(modalOrder) setOrderStatus(modalOrder.orderId, 'shopping', this)">🛒 Shopping</button>
+                <button class="btn small secondary" onclick="if(modalOrder) setOrderStatus(modalOrder.orderId, 'checkout', this)">💳 Checkout</button>
+                <button class="btn small primary" onclick="if(modalOrder) setOrderStatus(modalOrder.orderId, 'delivery', this)">🚙 Out for Delivery</button>
+                <button class="btn small ghost" onclick="if(modalOrder) setOrderStatus(modalOrder.orderId, 'completed', this)">✅ Delivered</button>
+            </div>
+
+
+
+
         <div class="k" style="margin-top: 20px;">Manual Status Override</div>
         <div class="row">
            <select id="m_state" style="max-width:200px;"><option>submitted</option><option>confirmed</option><option>shopping</option><option>packed</option><option>out_for_delivery</option><option>delivered</option><option>issue</option><option>cancelled</option></select>
@@ -2416,6 +2485,36 @@ app.get("/admin", requireLogin, requireAdmin, async (_req, res) => {
       }
   });
 
+
+	// --- LIVE DISPATCH FUNCTION ---
+  window.setOrderStatus = async function(orderId, status, btnElement) {
+      if(!confirm(`Send "${status.toUpperCase()}" dispatch notification to this customer?`)) return;
+      
+      const originalText = btnElement.textContent;
+      btnElement.textContent = "Sending...";
+      btnElement.disabled = true;
+      
+      try {
+          const r = await fetch(`/api/admin/orders/${orderId}/dispatch`, {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ status: status, notifyCustomer: true })
+          });
+          const d = await r.json();
+          if(d.ok) {
+              toast(`Dispatch sent! 📡 Customer notified.`);
+              await search(); // Refresh the order list in the background
+              qs("m_state").value = status; // Update the dropdown in the modal
+          } else { 
+              toast(d.error || "Failed to update status"); 
+          }
+      } catch(e) {
+          toast("Network error.");
+      } finally {
+          btnElement.textContent = originalText;
+          btnElement.disabled = false;
+      }
+  };
 
 
 
