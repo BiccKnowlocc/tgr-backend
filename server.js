@@ -2404,7 +2404,7 @@ app.get("/admin", requireLogin, requireAdmin, async (_req, res) => {
           const r = await fetch("/api/admin/billing/run-invoices", { method: "POST", credentials: "include" });
           const d = await r.json();
           if(d.ok) {
-              toast(`Blast Complete! 🚀 Auto-charged ${d.chargedCount} accounts. Emailed ${d.emailedCount} manual invoices.`);
+              toast("Blast Complete! 🚀 Auto-charged " + d.chargedCount + " accounts. Emailed " + d.emailedCount + " manual invoices.");
           } else { 
               toast(d.error || "Failed to run invoices");
           }
