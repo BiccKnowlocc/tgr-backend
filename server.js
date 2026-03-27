@@ -1695,6 +1695,7 @@ app.get("/admin", requireLogin, requireAdmin, async (_req, res) => {
        <button class="nav-btn" onclick="switchTab('dispatch')">🗺️ Dispatch Board</button>
        <button class="nav-btn" onclick="switchTab('feedback')">📬 Feedback Inbox</button>
        <button class="nav-btn" onclick="switchTab('tracking')">📍 GPS Broadcasting</button>
+	<button class="nav-btn" onclick="switchTab('gemini')">🧠 AI Co-Pilot</button>
        <div class="hr" style="margin: 10px 0;"></div>
        <a class="nav-btn" href="/">🌐 Back to Live Site</a>
        <a class="nav-btn" href="/logout" style="color: var(--red-2);">🚪 Secure Log Out</a>
@@ -1877,6 +1878,37 @@ app.get("/admin", requireLogin, requireAdmin, async (_req, res) => {
         </div>
     </div>
 </div>
+
+<div id="tab_gemini" class="tab-pane" style="display:none;">
+           <h2 style="margin-top:0; font-size: 28px;">🧠 AI Co-Pilot</h2>
+           <p class="muted" style="margin-bottom: 24px;">Chat with Gemini 2.5 Flash. Analyze your orders, generate SMS templates, or ask for operational advice.</p>
+           
+           <div class="card" style="box-shadow:none; display: flex; flex-direction: column; height: 65vh; padding: 0; overflow: hidden; border: 1px solid var(--line);">
+               <div id="gemini_chat" style="flex: 1; overflow-y: auto; padding: 20px; display: flex; flex-direction: column; gap: 16px; background: rgba(0,0,0,0.2);">
+                   <div style="background: rgba(255,255,255,0.05); padding: 14px; border-radius: 12px; border-left: 4px solid #2196f3; max-width: 85%;">
+                       <div style="font-weight: 900; color: #2196f3; margin-bottom: 4px;">Gemini</div>
+                       <div style="line-height: 1.5;">Commander. I am online and connected to the TGR mainframe. What do you need?</div>
+                   </div>
+               </div>
+               
+               <div style="padding: 16px; background: rgba(15,15,16,0.95); border-top: 1px solid var(--line);">
+                   <div style="margin-bottom: 10px;">
+                       <label style="display: flex; align-items: center; gap: 8px; cursor: pointer; width: fit-content;">
+                           <input type="checkbox" id="gemini_include_orders" style="width: 18px; height: 18px; accent-color: #2196f3;">
+                           <span class="muted small">Attach live active orders database to prompt</span>
+                       </label>
+                   </div>
+                   <div class="row">
+                       <input id="gemini_prompt" placeholder="e.g., Which orders have bulky items? Or write an SMS apology for being 10 mins late..." style="flex: 1; background: rgba(0,0,0,0.5);" autocomplete="off" />
+                       <button class="btn primary" id="gemini_btn" style="background: linear-gradient(180deg, #2196f3, #1976d2); border-color: #0d47a1;">Ask Gemini</button>
+                   </div>
+               </div>
+           </div>
+        </div>
+
+
+
+
 
 <div class="modalBack" id="conciergeModal">
   <div class="modal" style="max-width: 600px;">
@@ -2235,11 +2267,62 @@ app.get("/admin", requireLogin, requireAdmin, async (_req, res) => {
   qs("clearBtn").addEventListener("click", ()=>{ qs("q").value=""; qs("runKey").value=""; qs("state").value=""; search(); }); 
   qs("m_saveState").addEventListener("click", saveStatus);
   
+
+// --- GEMINI CO-PILOT LOGIC ---
+  qs("gemini_btn").addEventListener("click", async () => {
+      const input = qs("gemini_prompt");
+      const prompt = input.value.trim();
+      const includeOrders = qs("gemini_include_orders").checked;
+      if (!prompt) return;
+
+      const chat = qs("gemini_chat");
+      
+      // Render your message
+      chat.insertAdjacentHTML('beforeend', `<div style="background: rgba(227,52,47,0.1); padding: 14px; border-radius: 12px; border-right: 4px solid var(--red-2); max-width: 85%; align-self: flex-end;"><div style="font-weight: 900; color: var(--red-2); margin-bottom: 4px; text-align: right;">You</div><div style="line-height: 1.5; white-space: pre-wrap; text-align: right;">${esc(prompt)}</div></div>`);
+      
+      input.value = "";
+      const btn = qs("gemini_btn");
+      btn.textContent = "Thinking...";
+      btn.disabled = true;
+      chat.scrollTop = chat.scrollHeight;
+
+      try {
+          const r = await fetch("/api/admin/gemini", {
+              method: "POST", headers: { "Content-Type": "application/json" }, credentials: "include",
+              body: JSON.stringify({ prompt, includeOrders })
+          });
+          const d = await r.json();
+          
+          if (d.ok) {
+              // Quick markdown bolding parser
+              let formattedText = esc(d.text).replace(/\*\*(.*?)\*\*/g, '<strong style="color:#fff;">$1</strong>');
+              chat.insertAdjacentHTML('beforeend', `<div style="background: rgba(255,255,255,0.05); padding: 14px; border-radius: 12px; border-left: 4px solid #2196f3; max-width: 85%;"><div style="font-weight: 900; color: #2196f3; margin-bottom: 4px;">Gemini</div><div style="line-height: 1.5; white-space: pre-wrap; font-size: 15px;">${formattedText}</div></div>`);
+          } else {
+              chat.insertAdjacentHTML('beforeend', `<div style="color: var(--red-2); padding: 14px;">Error: ${esc(d.error)}</div>`);
+          }
+      } catch (e) {
+          chat.insertAdjacentHTML('beforeend', `<div style="color: var(--red-2); padding: 14px;">Network Error: ${esc(String(e))}</div>`);
+      } finally {
+          btn.textContent = "Ask Gemini";
+          btn.disabled = false;
+          chat.scrollTop = chat.scrollHeight;
+      }
+  });
+
+  qs("gemini_prompt").addEventListener("keypress", (e) => {
+      if (e.key === "Enter") qs("gemini_btn").click();
+  });
+
+
+
+
   loadDashboardMetrics();
 </script>
 </body>
 </html>`);
 });
+
+
 // ROUTIFIC EXPORT
 app.get("/api/admin/routific/export-csv", requireLogin, requireAdmin, async (req, res) => {
   try {
