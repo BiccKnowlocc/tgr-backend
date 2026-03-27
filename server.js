@@ -116,7 +116,7 @@ app.set("trust proxy", 1);
 app.use(session({ name: "tgr.sid", secret: SESSION_SECRET, resave: false, saveUninitialized: false, rolling: true, proxy: true, store: MongoStore.create({ mongoUrl: MONGODB_URI, ttl: 60 * 60 * 24 * 14 }), cookie: { httpOnly: true, secure: SESSION_COOKIE_SECURE, sameSite: "lax", maxAge: 1000 * 60 * 60 * 24 * 14 } }));
 
 // Serve static frontend files from the /public folder
-app.use(express.static(path.join(__dirname, "public")));
+app.use(express.static(path.join(__dirname, "APP")));
 const upload = multer({ dest: "uploads/", limits: { fileSize: 15 * 1024 * 1024 } });
 
 // Rate Limiter for Order Submissions
