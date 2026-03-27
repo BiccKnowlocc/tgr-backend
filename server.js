@@ -2486,23 +2486,23 @@ app.get("/admin", requireLogin, requireAdmin, async (_req, res) => {
   });
 
 
-	// --- LIVE DISPATCH FUNCTION ---
+// --- LIVE DISPATCH FUNCTION ---
   window.setOrderStatus = async function(orderId, status, btnElement) {
-      if(!confirm(`Send "${status.toUpperCase()}" dispatch notification to this customer?`)) return;
+      if(!confirm("Send '" + status.toUpperCase() + "' dispatch notification to this customer?")) return;
       
       const originalText = btnElement.textContent;
       btnElement.textContent = "Sending...";
       btnElement.disabled = true;
       
       try {
-          const r = await fetch(`/api/admin/orders/${orderId}/dispatch`, {
+          const r = await fetch("/api/admin/orders/" + orderId + "/dispatch", {
               method: "POST",
               headers: { "Content-Type": "application/json" },
               body: JSON.stringify({ status: status, notifyCustomer: true })
           });
           const d = await r.json();
           if(d.ok) {
-              toast(`Dispatch sent! 📡 Customer notified.`);
+              toast("Dispatch sent! 📡 Customer notified.");
               await search(); // Refresh the order list in the background
               qs("m_state").value = status; // Update the dropdown in the modal
           } else { 
@@ -2515,7 +2515,6 @@ app.get("/admin", requireLogin, requireAdmin, async (_req, res) => {
           btnElement.disabled = false;
       }
   };
-
 
 
 
