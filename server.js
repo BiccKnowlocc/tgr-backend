@@ -1916,6 +1916,18 @@ app.get("/admin", requireLogin, requireAdmin, async (_req, res) => {
         <div id="tab_users" class="tab-pane" style="display:none;">
            <h2 style="margin-top:0; font-size: 28px;">Customer Database</h2>
            <p class="muted" style="margin-bottom: 24px;">View registered users, assign tiers, and manage internal Bank of TGR wallets.</p>
+
+		<div class="card" style="box-shadow:none; border: 1px solid var(--red-2); background: rgba(227,52,47,.05); margin-bottom: 20px;">
+               <div class="row" style="justify-content: space-between; align-items: center;">
+                   <div>
+                       <div style="font-weight:1000; font-size: 18px; color: var(--red-2);">🚨 End of Month Billing Blast</div>
+                       <div class="muted small" style="margin-top: 4px;">Instantly generates Square payment links and emails a custom HTML invoice to EVERY customer with a balance > $0.00.</div>
+                   </div>
+                   <button class="btn primary" id="btnRunInvoices" style="background: linear-gradient(180deg, #ff4a44, #e3342f);">Fire Invoices</button>
+               </div>
+           </div>
+
+
            <div class="card" style="padding: 0;">
              <table>
                <thead style="background: rgba(255,255,255,.05);"><tr><th>Name / Contact</th><th>Tier & Status</th><th>Bank of TGR</th><th>Actions</th></tr></thead>
@@ -2379,6 +2391,34 @@ app.get("/admin", requireLogin, requireAdmin, async (_req, res) => {
   qs("clearBtn").addEventListener("click", ()=>{ qs("q").value=""; qs("runKey").value=""; qs("state").value=""; search(); }); 
   qs("m_saveState").addEventListener("click", saveStatus);
   
+
+// --- END OF MONTH INVOICE BLAST ---
+  qs("btnRunInvoices").addEventListener("click", async () => {
+      if(!confirm("Are you absolutely sure? This will instantly attempt to charge saved cards and email invoices to EVERY customer with a balance over $0.00.")) return;
+      
+      const btn = qs("btnRunInvoices"); 
+      btn.textContent = "Processing Billing..."; 
+      btn.disabled = true;
+      
+      try {
+          const r = await fetch("/api/admin/billing/run-invoices", { method: "POST", credentials: "include" });
+          const d = await r.json();
+          if(d.ok) {
+              toast(`Blast Complete! 🚀 Auto-charged ${d.chargedCount} accounts. Emailed ${d.emailedCount} manual invoices.`);
+          } else { 
+              toast(d.error || "Failed to run invoices");
+          }
+      } catch(e) { 
+          toast("Network error"); 
+      } finally { 
+          btn.textContent = "Fire Invoices"; 
+          btn.disabled = false; 
+      }
+  });
+
+
+
+
 
 // --- GEMINI CO-PILOT LOGIC ---
   qs("gemini_btn").addEventListener("click", async () => {
