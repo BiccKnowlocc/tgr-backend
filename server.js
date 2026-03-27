@@ -2277,8 +2277,8 @@ app.get("/admin", requireLogin, requireAdmin, async (_req, res) => {
 
       const chat = qs("gemini_chat");
       
-      // Render your message
-      chat.insertAdjacentHTML('beforeend', `<div style="background: rgba(227,52,47,0.1); padding: 14px; border-radius: 12px; border-right: 4px solid var(--red-2); max-width: 85%; align-self: flex-end;"><div style="font-weight: 900; color: var(--red-2); margin-bottom: 4px; text-align: right;">You</div><div style="line-height: 1.5; white-space: pre-wrap; text-align: right;">${esc(prompt)}</div></div>`);
+      // Render your message (Using standard quotes and + signs to prevent string breaking!)
+      chat.insertAdjacentHTML('beforeend', '<div style="background: rgba(227,52,47,0.1); padding: 14px; border-radius: 12px; border-right: 4px solid var(--red-2); max-width: 85%; align-self: flex-end;"><div style="font-weight: 900; color: var(--red-2); margin-bottom: 4px; text-align: right;">You</div><div style="line-height: 1.5; white-space: pre-wrap; text-align: right;">' + esc(prompt) + '</div></div>');
       
       input.value = "";
       const btn = qs("gemini_btn");
@@ -2296,12 +2296,12 @@ app.get("/admin", requireLogin, requireAdmin, async (_req, res) => {
           if (d.ok) {
               // Quick markdown bolding parser
               let formattedText = esc(d.text).replace(/\*\*(.*?)\*\*/g, '<strong style="color:#fff;">$1</strong>');
-              chat.insertAdjacentHTML('beforeend', `<div style="background: rgba(255,255,255,0.05); padding: 14px; border-radius: 12px; border-left: 4px solid #2196f3; max-width: 85%;"><div style="font-weight: 900; color: #2196f3; margin-bottom: 4px;">Gemini</div><div style="line-height: 1.5; white-space: pre-wrap; font-size: 15px;">${formattedText}</div></div>`);
+              chat.insertAdjacentHTML('beforeend', '<div style="background: rgba(255,255,255,0.05); padding: 14px; border-radius: 12px; border-left: 4px solid #2196f3; max-width: 85%;"><div style="font-weight: 900; color: #2196f3; margin-bottom: 4px;">Gemini</div><div style="line-height: 1.5; white-space: pre-wrap; font-size: 15px;">' + formattedText + '</div></div>');
           } else {
-              chat.insertAdjacentHTML('beforeend', `<div style="color: var(--red-2); padding: 14px;">Error: ${esc(d.error)}</div>`);
+              chat.insertAdjacentHTML('beforeend', '<div style="color: var(--red-2); padding: 14px;">Error: ' + esc(d.error) + '</div>');
           }
       } catch (e) {
-          chat.insertAdjacentHTML('beforeend', `<div style="color: var(--red-2); padding: 14px;">Network Error: ${esc(String(e))}</div>`);
+          chat.insertAdjacentHTML('beforeend', '<div style="color: var(--red-2); padding: 14px;">Network Error: ' + esc(String(e)) + '</div>');
       } finally {
           btn.textContent = "Ask Gemini";
           btn.disabled = false;
@@ -2312,7 +2312,6 @@ app.get("/admin", requireLogin, requireAdmin, async (_req, res) => {
   qs("gemini_prompt").addEventListener("keypress", (e) => {
       if (e.key === "Enter") qs("gemini_btn").click();
   });
-
 
 
 
