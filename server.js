@@ -2036,6 +2036,10 @@ app.get("/admin", requireLogin, requireAdmin, async (_req, res) => {
                        <div class="muted small" style="text-align:center; padding:20px;">Load a run key to start routing.</div>
                    </div>
 
+
+<button class="btn secondary" id="btnOptimize" onclick="optimizeRoute()" style="width:100%; margin-top:20px; font-size:16px; padding:14px; background: rgba(33, 150, 243, 0.1); border-color: #2196f3; color: #2196f3; font-weight:900;">✨ Auto-Optimize Best Route</button>
+
+
                    <button class="btn primary" onclick="sendToGoogleMaps()" style="width:100%; margin-top:20px; font-size:16px; padding:14px; background: linear-gradient(180deg, #4caf50, #388e3c);">🚙 Send Route to Google Maps</button>
                </div>
            </div>
@@ -2363,6 +2367,67 @@ app.get("/admin", requireLogin, requireAdmin, async (_req, res) => {
   function renderDispatchList() { const container = qs("dispatch_list"); container.innerHTML = dispatchOrders.map((o, index) => \`<div class="card" draggable="true" ondragstart="dragStart(event, \${index})" ondragover="dragOver(event)" ondrop="drop(event, \${index})" style="cursor:grab; padding:12px; margin-bottom:0; background:rgba(255,255,255,.05); border:1px solid rgba(255,255,255,.2); transition: transform 0.1s;"><div style="font-weight:900; color:var(--white); display:flex; align-items:center; gap:10px;"><div style="background:var(--red); color:#fff; width:24px; height:24px; border-radius:50%; display:flex; align-items:center; justify-content:center; font-size:12px;">\${index + 1}</div>\${esc(o.customer.fullName)}</div><div class="muted small" style="margin-top:6px; padding-left: 34px;">\${esc(o.address.streetAddress)}, \${esc(o.address.town)}</div></div>\`).join(""); }
   let draggedIndex = null; window.dragStart = function(e, index) { draggedIndex = index; e.dataTransfer.effectAllowed = "move"; }; window.dragOver = function(e) { e.preventDefault(); e.dataTransfer.dropEffect = "move"; }; window.drop = async function(e, targetIndex) { e.preventDefault(); if(draggedIndex === null || draggedIndex === targetIndex) return; const item = dispatchOrders.splice(draggedIndex, 1)[0]; dispatchOrders.splice(targetIndex, 0, item); renderDispatchList(); await updateDispatchMap(); };
   async function updateDispatchMap() { await ensureMapboxAdmin(); const conf = await fetch("/api/public/config").then(r=>r.json()); mapboxgl.accessToken = conf.mapboxPublicToken; if(!dispatchMap) { dispatchMap = new mapboxgl.Map({ container: 'dispatch_map', style: 'mapbox://styles/mapbox/dark-v11', center: [-81.3, 44.8], zoom: 8 }); } dispatchMarkers.forEach(m => m.remove()); dispatchMarkers = []; const bounds = new mapboxgl.LngLatBounds(); let hasBounds = false; for(let i=0; i<dispatchOrders.length; i++) { const o = dispatchOrders[i]; const query = \`\${o.address.streetAddress}, \${o.address.town}, ON, Canada\`; if (!geoCache[o.orderId]) { const geo = await fetch(\`https://api.mapbox.com/geocoding/v5/mapbox.places/\${encodeURIComponent(query)}.json?access_token=\${mapboxgl.accessToken}\`).then(r=>r.json()); if(geo.features && geo.features.length > 0) { geoCache[o.orderId] = geo.features[0].center; } } if (geoCache[o.orderId]) { const [lng, lat] = geoCache[o.orderId]; const el = document.createElement('div'); el.style.backgroundColor = '#e3342f'; el.style.color = '#fff'; el.style.width = '24px'; el.style.height = '24px'; el.style.borderRadius = '50%'; el.style.display = 'flex'; el.style.alignItems = 'center'; el.style.justifyContent = 'center'; el.style.fontWeight = 'bold'; el.innerText = i + 1; el.style.boxShadow = '0 0 10px rgba(0,0,0,0.5)'; const marker = new mapboxgl.Marker(el).setLngLat([lng, lat]).addTo(dispatchMap); dispatchMarkers.push(marker); bounds.extend([lng, lat]); hasBounds = true; } } if(hasBounds) dispatchMap.fitBounds(bounds, { padding: 40 }); }
+
+
+window.optimizeRoute = async function() {
+      if(dispatchOrders.length < 2) return toast("Need at least 2 orders to optimize.");
+      if(dispatchOrders.length > 12) return toast("Optimization limit is 12 stops. Please reduce list size.");
+
+      const btn = qs("btnOptimize");
+      const origText = btn.innerHTML;
+      btn.innerHTML = "⏳ Solving Logistics Engine...";
+      btn.disabled = true;
+
+      try {
+          // 1. Gather all coordinates from the map markers we already have
+          let coords = [];
+          for(let i = 0; i < dispatchOrders.length; i++) {
+              const o = dispatchOrders[i];
+              if(!geoCache[o.orderId]) {
+                  throw new Error("Still resolving GPS for " + o.orderId + "... Wait a second and try again.");
+              }
+              coords.push(geoCache[o.orderId][0] + "," + geoCache[o.orderId][1]);
+          }
+
+          const coordStr = coords.join(";");
+          // This calls the Mapbox Optimization API to find the fastest trip
+          const url = "https://api.mapbox.com/optimized-trips/v1/mapbox/driving/" + coordStr + "?source=any&destination=any&roundtrip=false&access_token=" + mapboxgl.accessToken;
+
+          const r = await fetch(url);
+          const d = await r.json();
+
+          if(d.code !== "Ok") throw new Error(d.message || "Failed to calculate route");
+
+          // 2. Mapbox returns the waypoints in the new 'optimal' order
+          // waypoint_index tells us which original order goes in which slot
+          let optimizedSequence = [];
+          
+          // Sort the waypoints by their trip index to get the sequence
+          const sortedWaypoints = d.waypoints.sort((a, b) => a.waypoint_index - b.waypoint_index);
+          
+          for (let i = 0; i < sortedWaypoints.length; i++) {
+              // Get the original index from the optimization result
+              let originalIndex = sortedWaypoints[i].location_index;
+              optimizedSequence.push(dispatchOrders[originalIndex]);
+          }
+
+          // 3. Update our global list and refresh the screen
+          dispatchOrders = optimizedSequence;
+          renderDispatchList();
+          await updateDispatchMap();
+          
+          toast("Route Optimized! Fast-track sequence is set. ⚡");
+      } catch(e) {
+          toast(e.message || "Optimization failed");
+      } finally {
+          btn.innerHTML = origText;
+          btn.disabled = false;
+      }
+  };
+
+
+
+
   window.sendToGoogleMaps = function() { if(dispatchOrders.length === 0) return toast("No orders to route!"); if(dispatchOrders.length > 10) return toast("Google Maps max limit is 10 stops. Please split your route."); const addresses = dispatchOrders.map(o => \`\${o.address.streetAddress}, \${o.address.town}, ON\`); const dest = addresses.pop(); const waypoints = addresses.join('|'); let url = \`https://www.google.com/maps/dir/?api=1&destination=\${encodeURIComponent(dest)}\`; if(waypoints) url += \`&waypoints=\${encodeURIComponent(waypoints)}\`; window.open(url, '_blank'); };
 
   // FEEDBACK
