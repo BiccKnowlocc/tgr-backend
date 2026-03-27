@@ -2364,74 +2364,87 @@ app.get("/admin", requireLogin, requireAdmin, async (_req, res) => {
   let dispatchMap = null; let dispatchMarkers = []; let dispatchOrders = []; const geoCache = {};
   async function ensureMapboxAdmin() { if (window.mapboxgl) return; const css = document.createElement("link"); css.rel = "stylesheet"; css.href = "https://api.mapbox.com/mapbox-gl-js/v2.15.0/mapbox-gl.css"; document.head.appendChild(css); const s = document.createElement("script"); s.src = "https://api.mapbox.com/mapbox-gl-js/v2.15.0/mapbox-gl.js"; await new Promise((res) => { s.onload = res; document.head.appendChild(s); }); }
   async function loadDispatchOrders() { const rk = qs("dispatch_runKey").value.trim(); if(!rk) return toast("Enter a run key first."); qs("dispatch_list").innerHTML = '<div class="muted" style="text-align:center; padding:20px;">Loading route data...</div>'; try { const r = await fetch("/api/admin/orders?limit=100&runKey=" + encodeURIComponent(rk), {credentials:"include"}); const d = await r.json(); dispatchOrders = d.items.filter(o => ["submitted", "confirmed", "shopping", "packed", "out_for_delivery"].includes(o.status.state)); if(dispatchOrders.length === 0) { qs("dispatch_list").innerHTML = '<div class="muted small" style="text-align:center; padding:20px;">No active orders found for this run.</div>'; return; } renderDispatchList(); await updateDispatchMap(); toast("Route loaded! Drag to sort."); } catch(e) { toast("Failed to load orders."); } }
-  function renderDispatchList() { const container = qs("dispatch_list"); container.innerHTML = dispatchOrders.map((o, index) => \`<div class="card" draggable="true" ondragstart="dragStart(event, \${index})" ondragover="dragOver(event)" ondrop="drop(event, \${index})" style="cursor:grab; padding:12px; margin-bottom:0; background:rgba(255,255,255,.05); border:1px solid rgba(255,255,255,.2); transition: transform 0.1s;"><div style="font-weight:900; color:var(--white); display:flex; align-items:center; gap:10px;"><div style="background:var(--red); color:#fff; width:24px; height:24px; border-radius:50%; display:flex; align-items:center; justify-content:center; font-size:12px;">\${index + 1}</div>\${esc(o.customer.fullName)}</div><div class="muted small" style="margin-top:6px; padding-left: 34px;">\${esc(o.address.streetAddress)}, \${esc(o.address.town)}</div></div>\`).join(""); }
+  function renderDispatchList() {
+      const container = qs("dispatch_list");
+      if (!dispatchOrders.length) {
+          container.innerHTML = '<div class="muted small" style="text-align:center; padding:20px;">No active orders found.</div>';
+          return;
+      }
+      container.innerHTML = dispatchOrders.map((o, index) => {
+          if (!o || !o.customer) return "";
+          return `<div class="card" draggable="true" ondragstart="dragStart(event, ${index})" ondragover="dragOver(event)" ondrop="drop(event, ${index})" style="cursor:grab; padding:12px; margin-bottom:8px; background:rgba(255,255,255,.05); border:1px solid rgba(255,255,255,.2); transition: transform 0.1s;">
+              <div style="font-weight:900; color:var(--white); display:flex; align-items:center; gap:10px;">
+                  <div style="background:var(--red); color:#fff; width:24px; height:24px; border-radius:50%; display:flex; align-items:center; justify-content:center; font-size:12px;">${index + 1}</div>
+                  ${esc(o.customer.fullName)}
+              </div>
+              <div class="muted small" style="margin-top:6px; padding-left: 34px;">${esc(o.address.streetAddress)}, ${esc(o.address.town)}</div>
+          </div>`;
+      }).join("");
+  }
 
+  // --- DRAG & DROP LOGIC ---
+  let draggedItemIndex = null;
+  window.dragStart = function(event, index) { draggedItemIndex = index; event.dataTransfer.effectAllowed = 'move'; };
+  window.dragOver = function(event) { event.preventDefault(); event.dataTransfer.dropEffect = 'move'; };
+  window.drop = function(event, index) {
+      event.preventDefault();
+      const movedItem = dispatchOrders.splice(draggedItemIndex, 1)[0];
+      dispatchOrders.splice(index, 0, movedItem);
+      renderDispatchList();
+      updateDispatchMap();
+  };
 
-// --- DYNAMIC ROUTE OPTIMIZATION (THE BRAIN) ---
-window.optimizeRoute = async function() {
-    if(dispatchOrders.length < 2) return toast("Need at least 2 orders to optimize.");
-    if(dispatchOrders.length > 12) return toast("Mapbox limit is 12 stops.");
+  // --- DYNAMIC ROUTE OPTIMIZATION (THE BRAIN) ---
+  window.optimizeRoute = async function() {
+      if(dispatchOrders.length < 2) return toast("Need at least 2 orders to optimize.");
+      const btn = qs("btnOptimize");
+      const origText = btn.innerHTML;
+      btn.innerHTML = "⏳ Sequencing...";
+      btn.disabled = true;
 
-    const btn = qs("btnOptimize");
-    const origText = btn.innerHTML;
-    btn.innerHTML = "⏳ Sequencing...";
-    btn.disabled = true;
+      try {
+          let coords = [];
+          let validOrders = [];
+          for(let i = 0; i < dispatchOrders.length; i++) {
+              const o = dispatchOrders[i];
+              if(!o) continue;
+              const addrKey = o.address ? (o.address.streetAddress + ", " + o.address.town) : null;
+              const gps = geoCache[o.orderId] || geoCache[addrKey];
+              if(gps) {
+                  coords.push(Number(gps[0]).toFixed(6) + "," + Number(gps[1]).toFixed(6));
+                  validOrders.push(o);
+              }
+          }
+          if(coords.length < 2) throw new Error("GPS markers not ready. Wait for map pins.");
+          const url = "https://api.mapbox.com/optimized-trips/v1/mapbox/driving/" + coords.join(";") + "?overview=full&steps=true&geometries=geojson&access_token=" + mapboxgl.accessToken;
+          const r = await fetch(url);
+          const d = await r.json();
+          if(d.code !== "Ok") throw new Error("Mapbox Error: " + (d.message || "Unresponsive"));
+          const optimizedSequence = d.waypoints.sort((a, b) => a.waypoint_index - b.waypoint_index).map(wp => validOrders[wp.location_index]);
+          const optimizedIds = new Set(optimizedSequence.map(x => x.orderId));
+          const skipped = dispatchOrders.filter(o => o && !optimizedIds.has(o.orderId));
+          dispatchOrders = optimizedSequence.concat(skipped);
+          renderDispatchList();
+          await updateDispatchMap();
+          toast("Route Optimized! ⚡");
+      } catch(e) {
+          toast(e.message || "Optimization failed");
+      } finally {
+          btn.innerHTML = origText;
+          btn.disabled = false;
+      }
+  };
 
-    try {
-        let coords = [];
-        let validOrders = [];
-
-        for(let i = 0; i < dispatchOrders.length; i++) {
-            const o = dispatchOrders[i];
-            if(!o) continue;
-
-            const addrKey = o.address ? (o.address.streetAddress + ", " + o.address.town) : null;
-            const gps = geoCache[o.orderId] || geoCache[addrKey];
-
-            if(gps) {
-                const lng = Number(gps[0]).toFixed(6);
-                const lat = Number(gps[1]).toFixed(6);
-                coords.push(lng + "," + lat);
-                validOrders.push(o);
-            }
-        }
-
-        if(coords.length < 2) throw new Error("GPS markers not ready yet. Please wait for the map to load.");
-
-        const coordStr = coords.join(";");
-        const url = "https://api.mapbox.com/optimized-trips/v1/mapbox/driving/" + coordStr + "?overview=full&steps=true&geometries=geojson&access_token=" + mapboxgl.accessToken;
-
-        const r = await fetch(url);
-        const d = await r.json();
-
-        if(d.code !== "Ok") throw new Error("Mapbox says: " + (d.message || "Request Error"));
-
-        const optimizedSequence = d.waypoints
-            .sort((a, b) => a.waypoint_index - b.waypoint_index)
-            .map(wp => validOrders[wp.location_index]);
-
-        const optimizedIds = new Set(optimizedSequence.map(x => x.orderId));
-        const skipped = dispatchOrders.filter(o => o && !optimizedIds.has(o.orderId));
-        
-        dispatchOrders = optimizedSequence.concat(skipped);
-
-        renderDispatchList();
-        await updateDispatchMap();
-        toast("Route Optimized! ⚡ Sequence updated.");
-    } catch(e) {
-        console.error("Optimization failed:", e);
-        toast(e.message || "Optimization failed");
-    } finally {
-        btn.innerHTML = origText;
-        btn.disabled = false;
-    }
-};
-
-
-
-
-     
-  window.sendToGoogleMaps = function() { if(dispatchOrders.length === 0) return toast("No orders to route!"); if(dispatchOrders.length > 10) return toast("Google Maps max limit is 10 stops. Please split your route."); const addresses = dispatchOrders.map(o => \`\${o.address.streetAddress}, \${o.address.town}, ON\`); const dest = addresses.pop(); const waypoints = addresses.join('|'); let url = \`https://www.google.com/maps/dir/?api=1&destination=\${encodeURIComponent(dest)}\`; if(waypoints) url += \`&waypoints=\${encodeURIComponent(waypoints)}\`; window.open(url, '_blank'); };
+  window.sendToGoogleMaps = function() {
+      if(!dispatchOrders.length) return toast("No orders to route!");
+      if(dispatchOrders.length > 10) return toast("Google limit is 10 stops.");
+      const addresses = dispatchOrders.map(o => `${o.address.streetAddress}, ${o.address.town}, ON`);
+      const dest = addresses.pop();
+      const waypoints = addresses.join('|');
+      let url = `https://www.google.com/maps/dir/?api=1&destination=${encodeURIComponent(dest)}`;
+      if(waypoints) url += `&waypoints=${encodeURIComponent(waypoints)}`;
+      window.open(url, '_blank');
+  };
 
   // FEEDBACK
   async function loadFeedbackAdmin() { const container = qs("feedback_list"); container.innerHTML = '<div class="muted" style="text-align:center; padding: 30px;">Loading inbox...</div>'; try { const r = await fetch("/api/admin/feedback", {credentials:"include"}); const d = await r.json(); if(!d.items || d.items.length === 0) { container.innerHTML = '<div class="card" style="text-align:center; padding:40px; color:var(--muted); font-size: 18px;">No new messages. Inbox Zero! 🎉</div>'; return; } container.innerHTML = d.items.map(f => \`<div class="card" style="box-shadow:none; background: rgba(255,255,255,.05); border-left: 4px solid var(--red-2);"><div class="row" style="justify-content:space-between; margin-bottom:10px;"><div><span class="pill">\${esc(f.type)}</span><span style="font-weight:bold; margin-left:10px; color:white;">\${esc(f.name)}</span><span class="muted small" style="margin-left:10px;">\${esc(f.email)} • \${esc(f.phone || 'No phone')}</span></div><div class="muted small">\${new Date(f.createdAt).toLocaleString()}</div></div><div style="background: rgba(0,0,0,.3); padding: 14px; border-radius: 8px; margin-bottom: 14px; white-space: pre-wrap; font-size: 15px;">\${esc(f.message)}</div><div class="row"><textarea id="reply_\${f._id}" placeholder="Type your reply to \${esc(f.name)}..." style="flex:1; padding:10px; border-radius:8px; min-height:40px; background:rgba(0,0,0,.5); color:white; border:1px solid rgba(255,255,255,.2); font-family:inherit;"></textarea><button class="btn primary" onclick="sendFeedbackReply('\${f._id}')">Send Reply & Archive</button><button class="btn ghost small" style="color:var(--muted);" onclick="dismissFeedback('\${f._id}')">Dismiss</button></div></div>\`).join(""); } catch(e) { container.innerHTML = '<div style="color:var(--red-2); padding: 20px;">Error loading inbox.</div>'; } }
