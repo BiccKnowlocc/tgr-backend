@@ -2364,21 +2364,24 @@ app.get("/admin", requireLogin, requireAdmin, async (_req, res) => {
   let dispatchMap = null; let dispatchMarkers = []; let dispatchOrders = []; const geoCache = {};
   async function ensureMapboxAdmin() { if (window.mapboxgl) return; const css = document.createElement("link"); css.rel = "stylesheet"; css.href = "https://api.mapbox.com/mapbox-gl-js/v2.15.0/mapbox-gl.css"; document.head.appendChild(css); const s = document.createElement("script"); s.src = "https://api.mapbox.com/mapbox-gl-js/v2.15.0/mapbox-gl.js"; await new Promise((res) => { s.onload = res; document.head.appendChild(s); }); }
   async function loadDispatchOrders() { const rk = qs("dispatch_runKey").value.trim(); if(!rk) return toast("Enter a run key first."); qs("dispatch_list").innerHTML = '<div class="muted" style="text-align:center; padding:20px;">Loading route data...</div>'; try { const r = await fetch("/api/admin/orders?limit=100&runKey=" + encodeURIComponent(rk), {credentials:"include"}); const d = await r.json(); dispatchOrders = d.items.filter(o => ["submitted", "confirmed", "shopping", "packed", "out_for_delivery"].includes(o.status.state)); if(dispatchOrders.length === 0) { qs("dispatch_list").innerHTML = '<div class="muted small" style="text-align:center; padding:20px;">No active orders found for this run.</div>'; return; } renderDispatchList(); await updateDispatchMap(); toast("Route loaded! Drag to sort."); } catch(e) { toast("Failed to load orders."); } }
-  function renderDispatchList() {
+ function renderDispatchList() {
       const container = qs("dispatch_list");
-      if (!dispatchOrders.length) {
+      if (!dispatchOrders || !dispatchOrders.length) {
           container.innerHTML = '<div class="muted small" style="text-align:center; padding:20px;">No active orders found.</div>';
           return;
       }
       container.innerHTML = dispatchOrders.map((o, index) => {
           if (!o || !o.customer) return "";
-          return `<div class="card" draggable="true" ondragstart="dragStart(event, ${index})" ondragover="dragOver(event)" ondrop="drop(event, ${index})" style="cursor:grab; padding:12px; margin-bottom:8px; background:rgba(255,255,255,.05); border:1px solid rgba(255,255,255,.2); transition: transform 0.1s;">
-              <div style="font-weight:900; color:var(--white); display:flex; align-items:center; gap:10px;">
-                  <div style="background:var(--red); color:#fff; width:24px; height:24px; border-radius:50%; display:flex; align-items:center; justify-content:center; font-size:12px;">${index + 1}</div>
-                  ${esc(o.customer.fullName)}
-              </div>
-              <div class="muted small" style="margin-top:6px; padding-left: 34px;">${esc(o.address.streetAddress)}, ${esc(o.address.town)}</div>
-          </div>`;
+          
+          // Using standard string concatenation (+) to avoid template literal errors
+          let html = '<div class="card" draggable="true" ondragstart="dragStart(event, ' + index + ')" ondragover="dragOver(event)" ondrop="drop(event, ' + index + ')" style="cursor:grab; padding:12px; margin-bottom:8px; background:rgba(255,255,255,.05); border:1px solid rgba(255,255,255,.2); transition: transform 0.1s;">';
+          html += '<div style="font-weight:900; color:var(--white); display:flex; align-items:center; gap:10px;">';
+          html += '<div style="background:var(--red); color:#fff; width:24px; height:24px; border-radius:50%; display:flex; align-items:center; justify-content:center; font-size:12px;">' + (index + 1) + '</div>';
+          html += esc(o.customer.fullName) + '</div>';
+          html += '<div class="muted small" style="margin-top:6px; padding-left: 34px;">' + esc(o.address.streetAddress) + ', ' + esc(o.address.town) + '</div>';
+          html += '</div>';
+          
+          return html;
       }).join("");
   }
 
