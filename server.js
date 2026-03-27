@@ -2371,53 +2371,57 @@ app.get("/admin", requireLogin, requireAdmin, async (_req, res) => {
 
 window.optimizeRoute = async function() {
       if(dispatchOrders.length < 2) return toast("Need at least 2 orders to optimize.");
-      if(dispatchOrders.length > 12) return toast("Optimization limit is 12 stops. Please reduce list size.");
+      if(dispatchOrders.length > 12) return toast("Optimization limit is 12 stops. Please split your route.");
 
       const btn = qs("btnOptimize");
       const origText = btn.innerHTML;
-      btn.innerHTML = "⏳ Solving Logistics Engine...";
+      btn.innerHTML = "⏳ Sequencing Route...";
       btn.disabled = true;
 
       try {
-          // 1. Gather all coordinates from the map markers we already have
+          // 1. Build the coordinate string Mapbox wants (Longitude,Latitude)
           let coords = [];
           for(let i = 0; i < dispatchOrders.length; i++) {
               const o = dispatchOrders[i];
               if(!geoCache[o.orderId]) {
-                  throw new Error("Still resolving GPS for " + o.orderId + "... Wait a second and try again.");
+                  throw new Error("GPS coordinates missing for " + o.orderId);
               }
-              coords.push(geoCache[o.orderId][0] + "," + geoCache[o.orderId][1]);
+              // Force clean numbers and ensure Longitude is first
+              const lng = parseFloat(geoCache[o.orderId][0]);
+              const lat = parseFloat(geoCache[o.orderId][1]);
+              coords.push(lng + "," + lat);
           }
 
           const coordStr = coords.join(";");
-          // This calls the Mapbox Optimization API to find the fastest trip
-          const url = "https://api.mapbox.com/optimized-trips/v1/mapbox/driving/" + coordStr + "?source=any&destination=any&roundtrip=false&access_token=" + mapboxgl.accessToken;
+          
+          // 2. We use 'roundtrip=false' because you aren't ending where you started
+          // and 'source=first' to keep your current first stop as the start of the trip.
+          const url = "https://api.mapbox.com/optimized-trips/v1/mapbox/driving/" + coordStr + 
+                      "?source=first&destination=any&roundtrip=false&access_token=" + mapboxgl.accessToken;
 
           const r = await fetch(url);
           const d = await r.json();
 
-          if(d.code !== "Ok") throw new Error(d.message || "Failed to calculate route");
-
-          // 2. Mapbox returns the waypoints in the new 'optimal' order
-          // waypoint_index tells us which original order goes in which slot
-          let optimizedSequence = [];
-          
-          // Sort the waypoints by their trip index to get the sequence
-          const sortedWaypoints = d.waypoints.sort((a, b) => a.waypoint_index - b.waypoint_index);
-          
-          for (let i = 0; i < sortedWaypoints.length; i++) {
-              // Get the original index from the optimization result
-              let originalIndex = sortedWaypoints[i].location_index;
-              optimizedSequence.push(dispatchOrders[originalIndex]);
+          // Handle the "Not Supported" or other API errors
+          if(d.code !== "Ok") {
+              console.error("Mapbox Error:", d);
+              throw new Error(d.message || "Request not supported by Mapbox");
           }
 
-          // 3. Update our global list and refresh the screen
+          // 3. Re-order our dispatchOrders array based on the Mapbox waypoints
+          // location_index tells us which original coordinate this waypoint refers to
+          const optimizedSequence = d.waypoints
+              .sort((a, b) => a.waypoint_index - b.waypoint_index)
+              .map(wp => dispatchOrders[wp.location_index]);
+
+          // Update global state and redraw
           dispatchOrders = optimizedSequence;
           renderDispatchList();
           await updateDispatchMap();
           
-          toast("Route Optimized! Fast-track sequence is set. ⚡");
+          toast("Route Optimized! Sequence is now the fastest possible. ⚡");
       } catch(e) {
+          console.error("Optimization script error:", e);
           toast(e.message || "Optimization failed");
       } finally {
           btn.innerHTML = origText;
