@@ -1863,7 +1863,7 @@ app.get("/admin", requireLogin, requireAdmin, async (_req, res) => {
            </div>
         </div>
 
-        <div id="tab_tracking" class="tab-pane" style="display:none;">
+       <div id="tab_tracking" class="tab-pane" style="display:none;">
            <h2 style="margin-top:0; font-size: 28px;">📍 GPS Broadcasting</h2>
            <div class="muted" style="margin-bottom: 24px;">Use this on your phone while driving to broadcast your live location to customers.</div>
            <div class="card" style="box-shadow:none; max-width: 600px;">
@@ -1876,10 +1876,8 @@ app.get("/admin", requireLogin, requireAdmin, async (_req, res) => {
              <div class="card" style="margin-top:20px; background: rgba(0,0,0,0.4); border: 1px solid rgba(255,255,255,0.1);" id="track_status">⚪ GPS is currently inactive.</div>
            </div>
         </div>
-    </div>
-</div>
 
-<div id="tab_gemini" class="tab-pane" style="display:none;">
+        <div id="tab_gemini" class="tab-pane" style="display:none;">
            <h2 style="margin-top:0; font-size: 28px;">🧠 AI Co-Pilot</h2>
            <p class="muted" style="margin-bottom: 24px;">Chat with Gemini 2.5 Flash. Analyze your orders, generate SMS templates, or ask for operational advice.</p>
            
@@ -1899,18 +1897,14 @@ app.get("/admin", requireLogin, requireAdmin, async (_req, res) => {
                        </label>
                    </div>
                    <div class="row">
-                       <input id="gemini_prompt" placeholder="e.g., Which orders have bulky items? Or write an SMS apology for being 10 mins late..." style="flex: 1; background: rgba(0,0,0,0.5);" autocomplete="off" />
+                       <input id="gemini_prompt" placeholder="e.g., Which orders have bulky items?..." style="flex: 1; background: rgba(0,0,0,0.5);" autocomplete="off" />
                        <button class="btn primary" id="gemini_btn" style="background: linear-gradient(180deg, #2196f3, #1976d2); border-color: #0d47a1;">Ask Gemini</button>
                    </div>
                </div>
            </div>
         </div>
 
-
-
-
-
-<div class="modalBack" id="conciergeModal">
+    </div> </div> <div class="modalBack" id="conciergeModal">
   <div class="modal" style="max-width: 600px;">
     <div class="row" style="justify-content:space-between;"><div style="font-weight:1000;font-size:22px;">📞 Concierge Booking</div><button class="btn ghost" onclick="document.getElementById('conciergeModal').style.display='none'">Close</button></div>
     <div class="muted small" style="margin-bottom: 20px;">Manually inject an offline order into the system. Bypasses the credit card checkout. Collect cash/e-transfer at the door.</div>
