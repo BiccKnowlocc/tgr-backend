@@ -2395,7 +2395,40 @@ window.optimizeRoute = async function() {
                   validOrders.push(o);
               }
           }
-	}
+
+          if(coords.length < 2) throw new Error("GPS not found for these orders. Wait for map markers to appear.");
+
+          const coordStr = coords.join(";");
+          const url = "https://api.mapbox.com/optimized-trips/v1/mapbox/driving/" + coordStr + 
+                      "?overview=full&steps=true&geometries=geojson&access_token=" + mapboxgl.accessToken;
+
+          const r = await fetch(url);
+          const d = await r.json();
+
+          if(d.code !== "Ok") throw new Error("Mapbox: " + (d.message || "Request Error"));
+
+          // Map the results back to our valid order objects
+          const optimizedSequence = d.waypoints
+              .sort((a, b) => a.waypoint_index - b.waypoint_index)
+              .map(wp => validOrders[wp.location_index]);
+
+          // Re-insert skipped/invalid orders at the end so we don't get 'undefined' errors
+          const optimizedIds = new Set(optimizedSequence.map(x => x.orderId));
+          const skipped = dispatchOrders.filter(o => o && !optimizedIds.has(o.orderId));
+          
+          dispatchOrders = optimizedSequence.concat(skipped);
+
+          renderDispatchList();
+          await updateDispatchMap();
+          toast("Route Optimized! ⚡");
+      } catch(e) {
+          console.error("Optimization failed:", e);
+          toast(e.message || "Optimization failed");
+      } finally {
+          btn.innerHTML = origText;
+          btn.disabled = false;
+      }
+  };
 
           if(coords.length < 2) throw new Error("GPS not found for these orders. Wait for map markers to appear.");
 
